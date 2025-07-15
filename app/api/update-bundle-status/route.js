@@ -1,4 +1,4 @@
-export default async function handler(req, res) {
+export async function GET(request) {
     const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
     const API_TOKEN = process.env.SHOPIFY_API_TOKEN;
     const BASE_URL = `https://${SHOPIFY_STORE}/admin/api/2024-04`;
@@ -58,6 +58,9 @@ export default async function handler(req, res) {
       await updateMetafield(bundle.id, understocked ? 'understocked' : 'in_stock');
     }
   
-    res.status(200).json({ success: true, message: 'All bundles checked and updated.' });
+    return new Response(JSON.stringify({ success: true, message: 'All bundles checked and updated.' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
   }
   
