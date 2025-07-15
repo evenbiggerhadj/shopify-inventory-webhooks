@@ -58,40 +58,44 @@ export async function GET() {
         }
   
         if (shouldNotify) {
-          await fetch("https://a.klaviyo.com/api/events/", {
-            method: "POST",
-            headers: {
-              Authorization: "Klaviyo-API-Key " + process.env.KLAVIYO_API_KEY,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              data: {
-                type: "event",
-                attributes: {
-                  properties: {
-                    product: product.handle,
-                  },
-                  metric: {
-                    data: {
-                      type: "metric",
-                      attributes: {
-                        name: "Restock Notification",
-                      },
-                    },
-                  },
-                  profile: {
-                    data: {
-                      type: "profile",
-                      attributes: {
-                        email: "jndubisi79@gmail.com",
-                      },
-                    },
-                  },
-                  unique_id: Date.now().toString(), // Makes each call unique
+            await fetch("https://a.klaviyo.com/api/events/", {
+                method: "POST",
+                headers: {
+                  "Authorization": "Klaviyo-API-Key YOUR_PRIVATE_API_KEY",
+                  "Content-Type": "application/json",
+                  "revision": "2023-02-22"
                 },
-              },
-            }),
-          });
+                body: JSON.stringify({
+                  data: {
+                    type: "event",
+                    attributes: {
+                      properties: {
+                        action: "Restock Notification",
+                        product: "Test Product"
+                      },
+                      metric: {
+                        data: {
+                          type: "metric",
+                          attributes: {
+                            name: "Restock Notification"
+                          }
+                        }
+                      },
+                      profile: {
+                        data: {
+                          type: "profile",
+                          attributes: {
+                            email: "jndubisi79@gmail.com"
+                          }
+                        }
+                      },
+                      time: new Date().toISOString(),
+                      unique_id: crypto.randomUUID()
+                    }
+                  }
+                }),
+              });
+              
         }
       }
   
