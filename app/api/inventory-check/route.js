@@ -26,6 +26,8 @@ export async function GET() {
         );
   
         const metafieldsData = await metafieldsResponse.json();
+        console.log("Raw metafields response:", metafieldsData);
+
         const componentsField = metafieldsData.metafields.find(
           (m) => m.namespace === "custom" && m.key === "bundle_structure"
         );
