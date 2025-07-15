@@ -1,22 +1,23 @@
 export async function GET() {
     try {
-      // 1️⃣ Fetch all products with the tag 'bundle'
-      const bundlesResponse = await fetch(`https://${process.env.SHOPIFY_STORE}/admin/api/2023-01/products.json?limit=250&fields=id,title,handle,tags`, {
-        headers: {
-          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_API_KEY,
-          "Content-Type": "application/json",
-        },
-      });
-      const bundlesData = await bundlesResponse.json();
+      const bundleComponents = [
+        { variant_id: "41703520862392", required_quantity: 4 },
+        { variant_id: "41703520895160", required_quantity: 4 },
+        { variant_id: "41703520927928", required_quantity: 4 },
+        { variant_id: "41728396296376", required_quantity: 2 },
+        { variant_id: "41728396329144", required_quantity: 2 },
+        { variant_id: "41728396361912", required_quantity: 2 },
+        { variant_id: "41728423297208", required_quantity: 4 },
+        { variant_id: "41728423329976", required_quantity: 4 },
+        { variant_id: "41728423362744", required_quantity: 4 },
+        { variant_id: "7173378244792", required_quantity: 2 },
+      ];
   
-      const bundleProducts = bundlesData.products.filter((p) =>
-        p.tags.toLowerCase().includes('bundle')
-      );
+      let shouldNotify = true;
   
-      for (const product of bundleProducts) {
-        // 2️⃣ Get bundle metafields
-        const metafieldsResponse = await fetch(
-          `https://${process.env.SHOPIFY_STORE}/admin/api/2023-01/products/${product.id}/metafields.json`,
+      for (const component of bundleComponents) {
+        const variantResponse = await fetch(
+          `https://${process.env.SHOPIFY_STORE}/admin/api/2023-01/variants/${component.variant_id}.json`,
           {
             headers: {
               "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_API_KEY,
@@ -25,60 +26,34 @@ export async function GET() {
           }
         );
   
-        const metafieldsData = await metafieldsResponse.json();
-        console.log("Raw metafields response:", metafieldsData);
-
-        const componentsField = metafieldsData.metafields.find(
-          (m) => m.namespace === "custom" && m.key === "bundle_structure"
-        );
+        const variantData = await variantResponse.json();
+        const inventoryQty = variantData.variant.inventory_quantity;
   
-        if (!componentsField) continue;
-  
-        const bundleComponents = JSON.parse(componentsField.value);
-        let shouldNotify = true;
-  
-        // 3️⃣ Check inventory for all components
-        for (const component of bundleComponents) {
-          const variantResponse = await fetch(
-            `https://${process.env.SHOPIFY_STORE}/admin/api/2023-01/variants/${component.variant_id}.json`,
-            {
-              headers: {
-                "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_API_KEY,
-                "Content-Type": "application/json",
-              },
-            }
-          );
-  
-          const variantData = await variantResponse.json();
-          const inventoryQty = variantData.variant.inventory_quantity;
-  
-          if (inventoryQty < component.required_quantity) {
-            shouldNotify = false;
-            break;
-          }
+        if (inventoryQty < component.required_quantity) {
+          shouldNotify = false;
+          break;
         }
+      }
   
-        // 4️⃣ Notify Klaviyo if bundle is buildable
-        if (shouldNotify) {
-          await fetch("https://a.klaviyo.com/api/events/", {
-            method: "POST",
-            headers: {
-              "Authorization": "Klaviyo-API-Key " + process.env.KLAVIYO_API_KEY,
-              "Content-Type": "application/json",
+      if (shouldNotify) {
+        await fetch("https://a.klaviyo.com/api/events/", {
+          method: "POST",
+          headers: {
+            "Authorization": "Klaviyo-API-Key " + process.env.KLAVIYO_API_KEY,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            data: {
+              type: "event",
+              attributes: {
+                profile: { email: "test@example.com" }, // Replace when you connect real Klaviyo form
+                metric: { name: "Restock Notification" },
+                properties: { product: "manual-product-handle" },
+                time: new Date().toISOString(),
+              },
             },
-            body: JSON.stringify({
-              data: {
-                type: "event",
-                attributes: {
-                  profile: { email: "test@example.com" }, // 🔴 You MUST replace this dynamically
-                  metric: { name: "Restock Notification" },
-                  properties: { product: product.handle },
-                  time: new Date().toISOString(),
-                },
-              },
-            }),
-          });
-        }
+          }),
+        });
       }
   
       return new Response(JSON.stringify({ success: true }), { status: 200 });
