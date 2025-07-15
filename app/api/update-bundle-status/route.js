@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 
-const SHOPIFY_DOMAIN = process.env.SHOPIFY_DOMAIN;
+const SHOPIFY_DOMAIN = process.env.SHOPIFY_STORE;
 const ADMIN_API_KEY = process.env.SHOPIFY_ADMIN_API_KEY;
 
 const shopifyHeaders = {
@@ -73,6 +73,6 @@ export async function GET() {
     return NextResponse.json({ success: true });
   } catch (error) {
     console.error(error);
-    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
+    return NextResponse.json({ success: false, error: error.message });
   }
 }
