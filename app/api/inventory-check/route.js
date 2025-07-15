@@ -72,7 +72,7 @@ export async function GET() {
               data: {
                 type: "event",
                 attributes: {
-                  profile: { email: "test@example.com" }, // Replace with real captured email per bundle
+                  profile: { email: "jndubisi79@gmail.com" }, // Replace with real captured email per bundle
                   metric: { name: "Restock Notification" },
                   properties: { product: product.handle },
                   time: new Date().toISOString(),
