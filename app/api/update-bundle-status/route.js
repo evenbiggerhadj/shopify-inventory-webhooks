@@ -1,84 +1,63 @@
-export async function GET() {
-    try {
-      // 🔍 Fetch all bundles
-      const bundlesResponse = await fetch(`https://${process.env.SHOPIFY_STORE}/admin/api/2023-01/products.json?limit=250&fields=id,tags`, {
+export default async function handler(req, res) {
+    const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
+    const API_TOKEN = process.env.SHOPIFY_API_TOKEN;
+    const BASE_URL = `https://${SHOPIFY_STORE}/admin/api/2024-04`;
+  
+    async function shopifyFetch(path) {
+      const response = await fetch(`${BASE_URL}${path}`, {
         headers: {
-          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_API_KEY,
-          "Content-Type": "application/json",
+          'X-Shopify-Access-Token': API_TOKEN,
+          'Content-Type': 'application/json',
         },
       });
-      const bundlesData = await bundlesResponse.json();
-      const bundleProducts = bundlesData.products.filter((p) =>
-        p.tags.toLowerCase().includes('bundle')
-      );
+      return response.json();
+    }
   
-      for (const product of bundleProducts) {
-        // 🔍 Fetch metafields for bundle components
-        const metafieldsResponse = await fetch(
-          `https://${process.env.SHOPIFY_STORE}/admin/api/2023-01/products/${product.id}/metafields.json`,
-          {
-            headers: {
-              "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_API_KEY,
-              "Content-Type": "application/json",
-            },
-          }
-        );
-  
-        const metafieldsData = await metafieldsResponse.json();
-        const componentsField = metafieldsData.metafields?.find(
-          (m) => m.namespace === "custom" && m.key === "bundle_structure"
-        );
-  
-        if (!componentsField) continue;
-  
-        const bundleComponents = JSON.parse(componentsField.value);
-        let isUnderstocked = false;
-  
-        for (const component of bundleComponents) {
-          const variantResponse = await fetch(
-            `https://${process.env.SHOPIFY_STORE}/admin/api/2023-01/variants/${component.variant_id}.json`,
-            {
-              headers: {
-                "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_API_KEY,
-                "Content-Type": "application/json",
-              },
-            }
-          );
-          const variantData = await variantResponse.json();
-          const inventoryQty = variantData.variant?.inventory_quantity ?? 0;
-  
-          if (inventoryQty < component.required_quantity) {
-            isUnderstocked = true;
-            break;
-          }
-        }
-  
-        const status = isUnderstocked ? "understocked" : "in_stock";
-  
-        // 🔧 Update bundle_stock_status metafield
-        await fetch(`https://${process.env.SHOPIFY_STORE}/admin/api/2023-01/metafields.json`, {
-          method: "POST",
-          headers: {
-            "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_API_KEY,
-            "Content-Type": "application/json",
+    async function updateMetafield(productId, status) {
+      await fetch(`${BASE_URL}/products/${productId}/metafields.json`, {
+        method: 'POST',
+        headers: {
+          'X-Shopify-Access-Token': API_TOKEN,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          metafield: {
+            namespace: 'custom',
+            key: 'bundle_stock_status',
+            type: 'single_line_text_field',
+            value: status,
           },
-          body: JSON.stringify({
-            metafield: {
-              namespace: "custom",
-              key: "bundle_stock_status",
-              type: "single_line_text_field",
-              value: status,
-              owner_resource: "product",
-              owner_id: product.id,
-            },
-          }),
-        });
+        }),
+      });
+    }
+  
+    const taggedProducts = await shopifyFetch('/products.json?limit=250&fields=id,tags');
+    const bundles = taggedProducts.products.filter(p => p.tags.includes('bundles'));
+  
+    for (const bundle of bundles) {
+      const metafieldsRes = await shopifyFetch(`/products/${bundle.id}/metafields.json`);
+      const metafield = metafieldsRes.metafields.find(mf => mf.namespace === 'custom' && mf.key === 'bundle_components');
+      if (!metafield) continue;
+  
+      const components = JSON.parse(metafield.value);
+      let understocked = false;
+  
+      for (const component of components) {
+        const productId = component.product_id.split('/').pop();
+        const productData = await shopifyFetch(`/products/${productId}.json`);
+        const inventoryId = productData.product.variants[0].inventory_item_id;
+        const inventoryRes = await shopifyFetch(`/inventory_levels.json?inventory_item_ids=${inventoryId}`);
+        const available = inventoryRes.inventory_levels[0]?.available || 0;
+  
+        if (available < component.quantity) {
+          understocked = true;
+          break;
+        }
       }
   
-      return new Response(JSON.stringify({ success: true }), { status: 200 });
-    } catch (error) {
-      console.error(error);
-      return new Response(JSON.stringify({ success: false, error: error.message }), { status: 500 });
+      await updateMetafield(bundle.id, understocked ? 'understocked' : 'in_stock');
     }
+  
+    res.status(200).json({ success: true, message: 'All bundles checked and updated.' });
   }
   
