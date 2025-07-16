@@ -1,18 +1,30 @@
 import { NextResponse } from 'next/server';
 
-export async function OPTIONS() {
-  return new NextResponse(null, {
-    status: 204,
-    headers: {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    },
-  });
-}
-
 export async function POST(req) {
   const body = await req.json();
+  const { email, phone, bundle_handle, bundle_url, components } = body;
+
+  const klaviyoPayload = {
+    data: {
+      type: "event",
+      attributes: {
+        profile: {
+          email: email,
+          phone_number: phone
+        },
+        metric: {
+          name: "Back-in-Stock Request"
+        },
+        properties: {
+          bundle_handle,
+          bundle_url,
+          components
+        },
+        time: new Date().toISOString()
+      }
+    }
+  };
+
   try {
     const klaviyoRes = await fetch('https://a.klaviyo.com/api/events/', {
       method: 'POST',
@@ -20,31 +32,15 @@ export async function POST(req) {
         'Content-Type': 'application/json',
         'Authorization': `Klaviyo-API-Key ${process.env.KLAVIYO_API_KEY}`,
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(klaviyoPayload),
     });
-    if (!klaviyoRes.ok) {
-        const errorText = await klaviyoRes.text();
-        return new NextResponse(JSON.stringify({ success: false, error: errorText }), {
-          status: klaviyoRes.status,
-          headers: {
-            'Access-Control-Allow-Origin': '*',
-          },
-        });
-      }
-      const data = await klaviyoRes.json();
-      return new NextResponse(JSON.stringify(data), {
-        status: 200,
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-        },
-      });
-      
+
+    return new NextResponse(null, {
+      status: klaviyoRes.ok ? 200 : 500,
+    });
   } catch (error) {
     return new NextResponse(JSON.stringify({ success: false, error: error.message }), {
       status: 500,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-      },
     });
   }
 }
