@@ -1,5 +1,16 @@
 import { NextResponse } from 'next/server';
 
+export async function OPTIONS() {
+  return new NextResponse(null, {
+    status: 204,
+    headers: {
+      'Access-Control-Allow-Origin': 'https://armadillotough.com',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    },
+  });
+}
+
 export async function POST(req) {
   try {
     const { email, phone, bundle_handle, bundle_url, components } = await req.json();
@@ -33,20 +44,26 @@ export async function POST(req) {
     });
 
     const data = await klaviyoRes.json();
-    return NextResponse.json(data);
+    return new NextResponse(JSON.stringify(data), {
+      status: 200,
+      headers: {
+        'Access-Control-Allow-Origin': 'https://armadillotough.com',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      },
+    });
   } catch (error) {
     console.error('Klaviyo API Error:', error);
-    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
+    return new NextResponse(
+      JSON.stringify({ success: false, error: error.message }),
+      {
+        status: 500,
+        headers: {
+          'Access-Control-Allow-Origin': 'https://armadillotough.com',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        },
+      }
+    );
   }
-}
-
-export async function OPTIONS() {
-  return new NextResponse(null, {
-    status: 204,
-    headers: {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    },
-  });
 }
