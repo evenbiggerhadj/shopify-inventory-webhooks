@@ -13,7 +13,8 @@ export async function OPTIONS() {
 
 export async function POST(req) {
   try {
-    const { email, phone, bundle_handle, bundle_url, components } = await req.json();
+    const body = await req.json();
+    const { email, phone, variant_id, variant_title, product_handle } = body;
 
     const klaviyoRes = await fetch('https://a.klaviyo.com/api/events/', {
       method: 'POST',
@@ -33,9 +34,9 @@ export async function POST(req) {
               name: 'Back-in-Stock Request',
             },
             properties: {
-              bundle_handle,
-              bundle_url,
-              components,
+              variant_id,
+              variant_title,
+              product_handle,
             },
             time: new Date().toISOString(),
           },
