@@ -22,13 +22,23 @@ export async function POST(req) {
       },
       body: JSON.stringify(body),
     });
-    const data = await klaviyoRes.json();
-    return new NextResponse(JSON.stringify(data), {
-      status: 200,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-      },
-    });
+    if (!klaviyoRes.ok) {
+        const errorText = await klaviyoRes.text();
+        return new NextResponse(JSON.stringify({ success: false, error: errorText }), {
+          status: klaviyoRes.status,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+          },
+        });
+      }
+      const data = await klaviyoRes.json();
+      return new NextResponse(JSON.stringify(data), {
+        status: 200,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+        },
+      });
+      
   } catch (error) {
     return new NextResponse(JSON.stringify({ success: false, error: error.message }), {
       status: 500,
