@@ -3,7 +3,6 @@ import { NextResponse } from 'next/server';
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
 const ADMIN_API_TOKEN = process.env.SHOPIFY_ADMIN_API_KEY;
 
-
 async function fetchFromShopify(endpoint, method = 'GET', body = null) {
   const headers = {
     'X-Shopify-Access-Token': ADMIN_API_TOKEN,
@@ -22,6 +21,7 @@ async function getProductsTaggedBundle() {
 
 async function getProductMetafields(productId) {
   const res = await fetchFromShopify(`products/${productId}/metafields.json`);
+  if (!res || !Array.isArray(res.metafields)) return null;
   return res.metafields.find(
     (m) => m.namespace === 'custom' && m.key === 'bundle_structure'
   );
@@ -54,12 +54,16 @@ async function auditBundles() {
   const bundles = await getProductsTaggedBundle();
   for (const bundle of bundles) {
     const metafield = await getProductMetafields(bundle.id);
-    if (!metafield || !metafield.value) continue;
+    if (!metafield || !metafield.value) {
+      console.log(`${bundle.title} → skipped (no bundle_structure metafield)`);
+      continue;
+    }
 
     let components;
     try {
       components = JSON.parse(metafield.value);
     } catch {
+      console.error(`Invalid JSON in bundle_structure for ${bundle.title}`);
       continue;
     }
 
@@ -68,14 +72,18 @@ async function auditBundles() {
 
     for (const component of components) {
       const currentQty = await getInventoryLevel(component.variant_id);
-      if (currentQty === 0) outOfStock.push(component.variant_id);
-      else if (currentQty < component.required_quantity) understocked.push(component.variant_id);
+      if (currentQty === 0) {
+        outOfStock.push(component.variant_id);
+      } else if (currentQty < component.required_quantity) {
+        understocked.push(component.variant_id);
+      }
     }
 
     let status = 'ok';
     if (outOfStock.length > 0) status = 'out-of-stock';
     else if (understocked.length > 0) status = 'understocked';
 
+    console.log(`${bundle.title} → ${status}`);
     await updateProductTags(bundle.id, bundle.tags.split(','), status);
   }
 }
