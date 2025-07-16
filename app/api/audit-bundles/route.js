@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server';
 
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
-const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN;
+const ADMIN_API_TOKEN = process.env.SHOPIFY_ADMIN_API_KEY;
+
 
 async function fetchFromShopify(endpoint, method = 'GET', body = null) {
   const headers = {
