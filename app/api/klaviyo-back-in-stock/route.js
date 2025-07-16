@@ -1,24 +1,40 @@
-// app/api/klaviyo-back-in-stock/route.js
 import { NextResponse } from 'next/server';
 
+export async function OPTIONS() {
+  return new NextResponse(null, {
+    status: 204,
+    headers: {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    },
+  });
+}
+
 export async function POST(req) {
+  const body = await req.json();
   try {
-    const body = await req.json();
-
-    const klaviyoRes = await fetch("https://a.klaviyo.com/api/events/", {
-      method: "POST",
+    const klaviyoRes = await fetch('https://a.klaviyo.com/api/events/', {
+      method: 'POST',
       headers: {
-        "Content-Type": "application/json",
-        Authorization: `Klaviyo-API-Key ${process.env.KLAVIYO_API_KEY}`
+        'Content-Type': 'application/json',
+        'Authorization': `Klaviyo-API-Key ${process.env.KLAVIYO_API_KEY}`,
       },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
     });
-
-    const result = await klaviyoRes.json();
-
-    return NextResponse.json({ success: true, result });
+    const data = await klaviyoRes.json();
+    return new NextResponse(JSON.stringify(data), {
+      status: 200,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+      },
+    });
   } catch (error) {
-    console.error(error);
-    return NextResponse.json({ success: false, error: error.message });
+    return new NextResponse(JSON.stringify({ success: false, error: error.message }), {
+      status: 500,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+      },
+    });
   }
 }
