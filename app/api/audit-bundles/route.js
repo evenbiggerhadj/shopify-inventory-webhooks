@@ -1,5 +1,10 @@
 import { NextResponse } from 'next/server';
-import { kv } from '@vercel/kv';
+import { Redis } from '@upstash/redis';
+
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
 
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
 const ADMIN_API_TOKEN = process.env.SHOPIFY_ADMIN_API_KEY;
@@ -54,21 +59,21 @@ async function updateProductTags(productId, currentTags, status) {
   });
 }
 
-// === KV Helpers ===
+// === Redis Helpers ===
 async function getBundleStatus(productId) {
-  return (await kv.get(`status:${productId}`)) || null;
+  return (await redis.get(`status:${productId}`)) || null;
 }
 
 async function setBundleStatus(productId, prevStatus, currStatus) {
-  await kv.set(`status:${productId}`, { previous: prevStatus, current: currStatus });
+  await redis.set(`status:${productId}`, { previous: prevStatus, current: currStatus });
 }
 
 async function getSubscribers(productId) {
-  return (await kv.get(`subscribers:${productId}`)) || [];
+  return (await redis.get(`subscribers:${productId}`)) || [];
 }
 
 async function setSubscribers(productId, subs) {
-  await kv.set(`subscribers:${productId}`, subs);
+  await redis.set(`subscribers:${productId}`, subs);
 }
 
 // === Klaviyo Event Sender ===
