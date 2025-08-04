@@ -1,8 +1,11 @@
 import { NextResponse } from 'next/server';
+import { kv } from '@vercel/kv';
 
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
 const ADMIN_API_TOKEN = process.env.SHOPIFY_ADMIN_API_KEY;
+const KLAVIYO_API_KEY = process.env.KLAVIYO_PRIVATE_API_KEY;
 
+// === Helpers for Shopify ===
 async function fetchFromShopify(endpoint, method = 'GET', body = null) {
   const headers = {
     'X-Shopify-Access-Token': ADMIN_API_TOKEN,
@@ -15,7 +18,8 @@ async function fetchFromShopify(endpoint, method = 'GET', body = null) {
 }
 
 async function getProductsTaggedBundle() {
-  const res = await fetchFromShopify('products.json?fields=id,title,tags&limit=250');
+  // Add "handle" to the fields!
+  const res = await fetchFromShopify('products.json?fields=id,title,tags,handle&limit=250');
   return res.products.filter((p) => p.tags.includes('bundle'));
 }
 
@@ -50,6 +54,53 @@ async function updateProductTags(productId, currentTags, status) {
   });
 }
 
+// === KV Helpers ===
+async function getBundleStatus(productId) {
+  return (await kv.get(`status:${productId}`)) || null;
+}
+
+async function setBundleStatus(productId, prevStatus, currStatus) {
+  await kv.set(`status:${productId}`, { previous: prevStatus, current: currStatus });
+}
+
+async function getSubscribers(productId) {
+  return (await kv.get(`subscribers:${productId}`)) || [];
+}
+
+async function setSubscribers(productId, subs) {
+  await kv.set(`subscribers:${productId}`, subs);
+}
+
+// === Klaviyo Event Sender ===
+async function sendKlaviyoBackInStockEvent(email, productName, productUrl) {
+  const resp = await fetch('https://a.klaviyo.com/api/events/', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+      'Content-Type': 'application/json',
+      'revision': '2024-10-15'
+    },
+    body: JSON.stringify({
+      data: {
+        type: 'event',
+        attributes: {
+          properties: {
+            ProductName: productName,
+            ProductURL: productUrl,
+          },
+          metric: { data: { type: 'metric', attributes: { name: 'Back in Stock' } } },
+          profile: { data: { type: 'profile', attributes: { email } } }
+        }
+      }
+    })
+  });
+  if (!resp.ok) {
+    const err = await resp.text();
+    console.error('Klaviyo error:', err);
+  }
+}
+
+// === Main Audit Script ===
 async function auditBundles() {
   const bundles = await getProductsTaggedBundle();
   for (const bundle of bundles) {
@@ -82,6 +133,27 @@ async function auditBundles() {
     let status = 'ok';
     if (outOfStock.length > 0) status = 'out-of-stock';
     else if (understocked.length > 0) status = 'understocked';
+
+    // === STATUS HISTORY ===
+    const prevStatusObj = await getBundleStatus(bundle.id);
+    const prevStatus = prevStatusObj ? prevStatusObj.current : null;
+    await setBundleStatus(bundle.id, prevStatus, status);
+
+    // === NOTIFY SUBSCRIBERS IF BUNDLE NOW "ok" ===
+    if (
+      (prevStatus === 'understocked' || prevStatus === 'out-of-stock') &&
+      status === 'ok'
+    ) {
+      const subs = await getSubscribers(bundle.id);
+      const productUrl = `https://${SHOPIFY_STORE.replace('.myshopify.com', '')}.com/products/${bundle.handle}`;
+      for (let sub of subs) {
+        if (!sub.notified) {
+          await sendKlaviyoBackInStockEvent(sub.email, bundle.title, productUrl);
+          sub.notified = true;
+        }
+      }
+      await setSubscribers(bundle.id, subs);
+    }
 
     console.log(`${bundle.title} → ${status}`);
     await updateProductTags(bundle.id, bundle.tags.split(','), status);
