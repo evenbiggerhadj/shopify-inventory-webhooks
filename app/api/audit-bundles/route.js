@@ -12,8 +12,10 @@ const KLAVIYO_API_KEY = process.env.KLAVIYO_PRIVATE_API_KEY;
 
 // === Shopify Helpers ===
 async function fetchFromShopify(endpoint, method = 'GET', body = null) {
-  if (!endpoint) throw new Error('fetchFromShopify called with empty endpoint!');
-  console.log('Shopify API fetch:', endpoint);
+  if (!endpoint || typeof endpoint !== 'string' || endpoint[0] === "/") {
+    throw new Error(`fetchFromShopify called with invalid endpoint: "${endpoint}"`);
+  }
+  console.log('Shopify API fetch:', endpoint); // Add this for debugging
   const headers = {
     'X-Shopify-Access-Token': ADMIN_API_TOKEN,
     'Content-Type': 'application/json',
