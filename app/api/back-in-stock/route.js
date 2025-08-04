@@ -7,9 +7,15 @@ const redis = new Redis({
 
 export async function POST(req) {
   const { email, product_id } = await req.json();
+  if (!email || !product_id) {
+    return Response.json({ success: false, error: 'Missing email or product_id' }, { status: 400 });
+  }
   const key = `subscribers:${product_id}`;
   let subscribers = (await redis.get(key)) || [];
-  subscribers.push({ email, notified: false });
-  await redis.set(key, subscribers);
+  // Prevent duplicate
+  if (!subscribers.some(sub => sub.email === email)) {
+    subscribers.push({ email, notified: false });
+    await redis.set(key, subscribers);
+  }
   return Response.json({ success: true });
 }

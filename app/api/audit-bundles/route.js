@@ -10,8 +10,10 @@ const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
 const ADMIN_API_TOKEN = process.env.SHOPIFY_ADMIN_API_KEY;
 const KLAVIYO_API_KEY = process.env.KLAVIYO_PRIVATE_API_KEY;
 
-// === Helpers for Shopify ===
+// === Shopify Helpers ===
 async function fetchFromShopify(endpoint, method = 'GET', body = null) {
+  if (!endpoint) throw new Error('fetchFromShopify called with empty endpoint!');
+  console.log('Shopify API fetch:', endpoint);
   const headers = {
     'X-Shopify-Access-Token': ADMIN_API_TOKEN,
     'Content-Type': 'application/json',
@@ -23,7 +25,6 @@ async function fetchFromShopify(endpoint, method = 'GET', body = null) {
 }
 
 async function getProductsTaggedBundle() {
-  // Add "handle" to the fields!
   const res = await fetchFromShopify('products.json?fields=id,title,tags,handle&limit=250');
   return res.products.filter((p) => p.tags.includes('bundle'));
 }
@@ -37,6 +38,10 @@ async function getProductMetafields(productId) {
 }
 
 async function getInventoryLevel(variantId) {
+  if (!variantId) {
+    console.error('Missing variant_id for getInventoryLevel');
+    return 0;
+  }
   const res = await fetchFromShopify(`variants/${variantId}.json`);
   return res.variant.inventory_quantity;
 }
@@ -127,6 +132,10 @@ async function auditBundles() {
     let outOfStock = [];
 
     for (const component of components) {
+      if (!component.variant_id) {
+        console.error('Skipping component with missing variant_id:', component);
+        continue;
+      }
       const currentQty = await getInventoryLevel(component.variant_id);
       if (currentQty === 0) {
         outOfStock.push(component.variant_id);
