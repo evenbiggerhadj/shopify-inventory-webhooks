@@ -1,19 +1,18 @@
-// app/api/back-in-stock/route.js - CORRECTED for your Upstash setup
+// app/api/back-in-stock/route.js - Main subscription handler
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
-// Initialize Redis with explicit configuration
+// Use YOUR actual environment variable names
 const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN,
-  // Add these options for better reliability
+  url: process.env.KV_REST_API_URL,           // Using KV_REST_API_URL
+  token: process.env.KV_REST_API_TOKEN,       // Using KV_REST_API_TOKEN
   retry: {
     retries: 3,
     retryDelayOnFailover: 100,
   }
 });
 
-const KLAVIYO_API_KEY = process.env.KLAVIYO_PRIVATE_API_KEY;
+const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
 
 // Handle CORS preflight requests
 export async function OPTIONS(request) {
@@ -131,7 +130,7 @@ export async function POST(request) {
       // Add new subscriber
       const newSubscriber = {
         email: email,
-        product_id: product_id.toString(), // Ensure it's a string
+        product_id: product_id.toString(),
         product_title: product_title || 'Unknown Product',
         product_handle: product_handle || '',
         first_name: first_name || '',

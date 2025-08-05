@@ -1,15 +1,16 @@
-// app/api/audit-bundles/route.js - FIXED Next.js App Router format
+// app/api/audit-bundles/route.js - Bundle audit and notification system
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
+// Use YOUR actual environment variable names
 const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+  url: process.env.KV_REST_API_URL,      // Changed from UPSTASH_REDIS_REST_URL
+  token: process.env.KV_REST_API_TOKEN,  // Changed from UPSTASH_REDIS_REST_TOKEN
 });
 
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
 const ADMIN_API_TOKEN = process.env.SHOPIFY_ADMIN_API_KEY;
-const KLAVIYO_API_KEY = process.env.KLAVIYO_PRIVATE_API_KEY;
+const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
 
 // === FIXED Shopify Helper - NO MORE "/pipeline" ERRORS ===
 async function fetchFromShopify(endpoint, method = 'GET', body = null) {
@@ -100,7 +101,19 @@ async function setBundleStatus(productId, prevStatus, currStatus) {
 }
 
 async function getSubscribers(productId) {
-  return (await redis.get(`subscribers:${productId}`)) || [];
+  const result = await redis.get(`subscribers:${productId}`);
+  if (!result) return [];
+  
+  // Handle different return types
+  if (typeof result === 'string') {
+    try {
+      return JSON.parse(result);
+    } catch {
+      return [];
+    }
+  }
+  
+  return Array.isArray(result) ? result : [];
 }
 
 async function setSubscribers(productId, subs) {
@@ -110,7 +123,7 @@ async function setSubscribers(productId, subs) {
 // === Enhanced Klaviyo Event Sender ===
 async function sendKlaviyoBackInStockEvent(email, productName, productUrl) {
   if (!KLAVIYO_API_KEY) {
-    console.error('❌ KLAVIYO_PRIVATE_API_KEY not set - skipping notification');
+    console.error('❌ KLAVIYO_API_KEY not set - skipping notification');
     return false;
   }
 
@@ -234,7 +247,7 @@ async function auditBundles() {
         console.log(`📧 Found ${subs.length} subscribers for ${bundle.title}`);
         
         for (let sub of subs) {
-          if (!sub.notified) {
+          if (sub && !sub.notified) {
             const success = await sendKlaviyoBackInStockEvent(sub.email, bundle.title, productUrl);
             if (success) {
               sub.notified = true;
