@@ -1,10 +1,16 @@
-// app/api/back-in-stock/route.js - CORRECT Next.js App Router format
+// app/api/back-in-stock/route.js - CORRECTED for your Upstash setup
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
+// Initialize Redis with explicit configuration
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
+  // Add these options for better reliability
+  retry: {
+    retries: 3,
+    retryDelayOnFailover: 100,
+  }
 });
 
 const KLAVIYO_API_KEY = process.env.KLAVIYO_PRIVATE_API_KEY;
@@ -59,14 +65,56 @@ export async function POST(request) {
       });
     }
 
+    // Test Redis connection first
+    try {
+      console.log('🔍 Testing Redis connection...');
+      await redis.ping();
+      console.log('✅ Redis connection successful');
+    } catch (redisTestError) {
+      console.error('❌ Redis connection test failed:', redisTestError);
+      return NextResponse.json({
+        success: false,
+        error: 'Database connection failed. Please try again.',
+        details: redisTestError.message
+      }, { 
+        status: 500,
+        headers: { 'Access-Control-Allow-Origin': '*' }
+      });
+    }
+
     try {
       const key = `subscribers:${product_id}`;
-      let subscribers = (await redis.get(key)) || [];
+      console.log(`📊 Getting subscribers for key: ${key}`);
+      
+      // Get existing subscribers with error handling
+      let subscribers;
+      try {
+        subscribers = await redis.get(key);
+        // Handle different possible return types
+        if (!subscribers) {
+          subscribers = [];
+        } else if (typeof subscribers === 'string') {
+          // If Redis returns string, try to parse it
+          try {
+            subscribers = JSON.parse(subscribers);
+          } catch (parseError) {
+            console.log('⚠️ Could not parse subscribers, starting fresh:', parseError);
+            subscribers = [];
+          }
+        } else if (!Array.isArray(subscribers)) {
+          // If it's not an array, start fresh
+          console.log('⚠️ Subscribers not in array format, starting fresh');
+          subscribers = [];
+        }
+      } catch (getError) {
+        console.log('⚠️ Error getting subscribers, starting fresh:', getError);
+        subscribers = [];
+      }
       
       console.log(`📊 Current subscribers for product ${product_id}:`, subscribers.length);
       
       // Check if user is already subscribed
-      const existingSubscriber = subscribers.find(sub => sub.email === email);
+      const existingSubscriber = subscribers.find(sub => sub && sub.email === email);
       
       if (existingSubscriber) {
         console.log(`ℹ️ User ${email} already subscribed to product ${product_id}`);
@@ -83,7 +131,7 @@ export async function POST(request) {
       // Add new subscriber
       const newSubscriber = {
         email: email,
-        product_id: product_id,
+        product_id: product_id.toString(), // Ensure it's a string
         product_title: product_title || 'Unknown Product',
         product_handle: product_handle || '',
         first_name: first_name || '',
@@ -95,7 +143,22 @@ export async function POST(request) {
       };
 
       subscribers.push(newSubscriber);
-      await redis.set(key, subscribers);
+      
+      // Save to Redis with error handling
+      try {
+        await redis.set(key, subscribers, { ex: 30 * 24 * 60 * 60 }); // 30 days expiry
+        console.log(`✅ Saved ${subscribers.length} subscribers to Redis for product ${product_id}`);
+      } catch (setError) {
+        console.error('❌ Error saving to Redis:', setError);
+        return NextResponse.json({
+          success: false,
+          error: 'Failed to save subscription. Please try again.',
+          details: setError.message
+        }, { 
+          status: 500,
+          headers: { 'Access-Control-Allow-Origin': '*' }
+        });
+      }
 
       console.log(`✅ Added subscriber ${email} for product ${product_id}. Total subscribers: ${subscribers.length}`);
 
@@ -117,10 +180,11 @@ export async function POST(request) {
       });
 
     } catch (redisError) {
-      console.error('❌ Redis error:', redisError);
+      console.error('❌ Redis operation error:', redisError);
       return NextResponse.json({
         success: false,
-        error: 'Database error. Please try again.'
+        error: 'Database error. Please try again.',
+        details: redisError.message
       }, { 
         status: 500,
         headers: { 'Access-Control-Allow-Origin': '*' }
@@ -131,7 +195,8 @@ export async function POST(request) {
     console.error('❌ Back-in-stock subscription error:', error);
     return NextResponse.json({ 
       success: false, 
-      error: error.message 
+      error: 'Server error. Please try again.',
+      details: error.message
     }, { 
       status: 500,
       headers: { 'Access-Control-Allow-Origin': '*' }
@@ -157,10 +222,25 @@ export async function GET(request) {
     }
 
     try {
-      const key = `subscribers:${product_id}`;
-      const subscribers = (await redis.get(key)) || [];
+      // Test Redis connection
+      await redis.ping();
       
-      const subscription = subscribers.find(sub => sub.email === email);
+      const key = `subscribers:${product_id}`;
+      let subscribers = await redis.get(key) || [];
+      
+      // Handle different return types
+      if (typeof subscribers === 'string') {
+        try {
+          subscribers = JSON.parse(subscribers);
+        } catch {
+          subscribers = [];
+        }
+      }
+      if (!Array.isArray(subscribers)) {
+        subscribers = [];
+      }
+      
+      const subscription = subscribers.find(sub => sub && sub.email === email);
       const isSubscribed = !!subscription;
 
       return NextResponse.json({ 
@@ -178,7 +258,8 @@ export async function GET(request) {
       console.error('❌ Check subscription error:', error);
       return NextResponse.json({
         success: false,
-        error: 'Database error'
+        error: 'Database error',
+        details: error.message
       }, { 
         status: 500,
         headers: { 'Access-Control-Allow-Origin': '*' }
@@ -187,73 +268,6 @@ export async function GET(request) {
 
   } catch (error) {
     console.error('❌ GET request error:', error);
-    return NextResponse.json({ 
-      success: false, 
-      error: error.message 
-    }, { 
-      status: 500,
-      headers: { 'Access-Control-Allow-Origin': '*' }
-    });
-  }
-}
-
-// Handle unsubscribe requests
-export async function DELETE(request) {
-  try {
-    const body = await request.json();
-    const { email, product_id } = body;
-
-    if (!email || !product_id) {
-      return NextResponse.json({ 
-        success: false, 
-        error: 'Missing email or product_id' 
-      }, { 
-        status: 400,
-        headers: { 'Access-Control-Allow-Origin': '*' }
-      });
-    }
-
-    try {
-      const key = `subscribers:${product_id}`;
-      let subscribers = (await redis.get(key)) || [];
-      
-      const initialCount = subscribers.length;
-      subscribers = subscribers.filter(sub => sub.email !== email);
-      
-      if (subscribers.length === initialCount) {
-        return NextResponse.json({ 
-          success: false, 
-          error: 'Subscription not found' 
-        }, { 
-          status: 404,
-          headers: { 'Access-Control-Allow-Origin': '*' }
-        });
-      }
-
-      await redis.set(key, subscribers);
-
-      console.log(`🗑️ Removed subscriber ${email} from product ${product_id}`);
-
-      return NextResponse.json({ 
-        success: true,
-        message: 'Successfully unsubscribed',
-        remaining_subscribers: subscribers.length
-      }, {
-        headers: { 'Access-Control-Allow-Origin': '*' }
-      });
-    } catch (error) {
-      console.error('❌ Unsubscribe error:', error);
-      return NextResponse.json({
-        success: false,
-        error: 'Database error'
-      }, { 
-        status: 500,
-        headers: { 'Access-Control-Allow-Origin': '*' }
-      });
-    }
-
-  } catch (error) {
-    console.error('❌ DELETE request error:', error);
     return NextResponse.json({ 
       success: false, 
       error: error.message 
