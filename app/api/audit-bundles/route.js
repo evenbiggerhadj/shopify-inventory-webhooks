@@ -1,3 +1,4 @@
+// app/api/audit-bundles/route.js - FIXED Next.js App Router format
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
@@ -10,14 +11,14 @@ const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
 const ADMIN_API_TOKEN = process.env.SHOPIFY_ADMIN_API_KEY;
 const KLAVIYO_API_KEY = process.env.KLAVIYO_PRIVATE_API_KEY;
 
-// === Fixed Shopify Helper ===
+// === FIXED Shopify Helper - NO MORE "/pipeline" ERRORS ===
 async function fetchFromShopify(endpoint, method = 'GET', body = null) {
-  // FIXED: Remove the problematic validation that was causing the "/pipeline" error
+  // REMOVED the problematic validation that caused "/pipeline" errors
   if (!endpoint || typeof endpoint !== 'string') {
     throw new Error(`fetchFromShopify called with invalid endpoint: "${endpoint}"`);
   }
   
-  console.log('Shopify API fetch:', endpoint);
+  console.log('🔍 Shopify API fetch:', endpoint);
   
   const headers = {
     'X-Shopify-Access-Token': ADMIN_API_TOKEN,
@@ -32,12 +33,12 @@ async function fetchFromShopify(endpoint, method = 'GET', body = null) {
   if (endpoint.startsWith('http://') || endpoint.startsWith('https://')) {
     url = endpoint;
   } else {
-    // Remove leading slash if present, then add it back consistently
+    // Remove leading slash if present, then construct URL properly
     const cleanEndpoint = endpoint.startsWith('/') ? endpoint.slice(1) : endpoint;
     url = `https://${SHOPIFY_STORE}/admin/api/2024-04/${cleanEndpoint}`;
   }
   
-  console.log('Final URL:', url);
+  console.log('🌐 Final URL:', url);
   
   const res = await fetch(url, options);
   
@@ -64,7 +65,7 @@ async function getProductMetafields(productId) {
 
 async function getInventoryLevel(variantId) {
   if (!variantId) {
-    console.error('Missing variant_id for getInventoryLevel');
+    console.error('❌ Missing variant_id for getInventoryLevel');
     return 0;
   }
   const res = await fetchFromShopify(`variants/${variantId}.json`);
@@ -109,7 +110,7 @@ async function setSubscribers(productId, subs) {
 // === Enhanced Klaviyo Event Sender ===
 async function sendKlaviyoBackInStockEvent(email, productName, productUrl) {
   if (!KLAVIYO_API_KEY) {
-    console.error('KLAVIYO_PRIVATE_API_KEY not set - skipping notification');
+    console.error('❌ KLAVIYO_PRIVATE_API_KEY not set - skipping notification');
     return false;
   }
 
@@ -150,7 +151,7 @@ async function sendKlaviyoBackInStockEvent(email, productName, productUrl) {
 
     if (!resp.ok) {
       const err = await resp.text();
-      console.error('Klaviyo error:', resp.status, err);
+      console.error('❌ Klaviyo error:', resp.status, err);
       return false;
     }
 
@@ -158,7 +159,7 @@ async function sendKlaviyoBackInStockEvent(email, productName, productUrl) {
     return true;
 
   } catch (error) {
-    console.error('Failed to send Klaviyo notification:', error);
+    console.error('❌ Failed to send Klaviyo notification:', error);
     return false;
   }
 }
@@ -168,18 +169,20 @@ async function auditBundles() {
   console.log('🔍 Starting bundle audit process...');
   
   const bundles = await getProductsTaggedBundle();
-  console.log(`Found ${bundles.length} bundles to audit`);
+  console.log(`📦 Found ${bundles.length} bundles to audit`);
   
   let notificationsSent = 0;
   let notificationErrors = 0;
+  let bundlesProcessed = 0;
 
   for (const bundle of bundles) {
     try {
       console.log(`\n📦 Processing bundle: ${bundle.title}`);
+      bundlesProcessed++;
       
       const metafield = await getProductMetafields(bundle.id);
       if (!metafield || !metafield.value) {
-        console.log(`${bundle.title} → skipped (no bundle_structure metafield)`);
+        console.log(`⚠️ ${bundle.title} → skipped (no bundle_structure metafield)`);
         continue;
       }
 
@@ -187,7 +190,7 @@ async function auditBundles() {
       try {
         components = JSON.parse(metafield.value);
       } catch {
-        console.error(`Invalid JSON in bundle_structure for ${bundle.title}`);
+        console.error(`❌ Invalid JSON in bundle_structure for ${bundle.title}`);
         continue;
       }
 
@@ -196,7 +199,7 @@ async function auditBundles() {
 
       for (const component of components) {
         if (!component.variant_id) {
-          console.error('Skipping component with missing variant_id:', component);
+          console.error('⚠️ Skipping component with missing variant_id:', component);
           continue;
         }
         const currentQty = await getInventoryLevel(component.variant_id);
@@ -216,7 +219,7 @@ async function auditBundles() {
       const prevStatus = prevStatusObj ? prevStatusObj.current : null;
       await setBundleStatus(bundle.id, prevStatus, status);
 
-      console.log(`${bundle.title} → ${prevStatus || 'unknown'} → ${status}`);
+      console.log(`📊 ${bundle.title} → ${prevStatus || 'unknown'} → ${status}`);
 
       // === NOTIFY SUBSCRIBERS IF BUNDLE NOW "ok" ===
       if (
@@ -228,7 +231,7 @@ async function auditBundles() {
         const subs = await getSubscribers(bundle.id);
         const productUrl = `https://${SHOPIFY_STORE.replace('.myshopify.com', '')}.com/products/${bundle.handle}`;
         
-        console.log(`Found ${subs.length} subscribers for ${bundle.title}`);
+        console.log(`📧 Found ${subs.length} subscribers for ${bundle.title}`);
         
         for (let sub of subs) {
           if (!sub.notified) {
@@ -247,20 +250,29 @@ async function auditBundles() {
       await updateProductTags(bundle.id, bundle.tags.split(','), status);
 
     } catch (error) {
-      console.error(`Error processing bundle ${bundle.title}:`, error);
+      console.error(`❌ Error processing bundle ${bundle.title}:`, error);
+      // Continue processing other bundles even if one fails
     }
   }
 
   console.log(`\n✅ Audit complete!`);
+  console.log(`📦 Bundles processed: ${bundlesProcessed}`);
   console.log(`📧 Notifications sent: ${notificationsSent}`);
   console.log(`❌ Notification errors: ${notificationErrors}`);
   
-  return { notificationsSent, notificationErrors, bundlesProcessed: bundles.length };
+  return { 
+    bundlesProcessed, 
+    notificationsSent, 
+    notificationErrors,
+    timestamp: new Date().toISOString()
+  };
 }
 
 export async function GET() {
   try {
+    console.log('🚀 Starting bundle audit...');
     const results = await auditBundles();
+    
     return NextResponse.json({ 
       success: true, 
       message: 'Audit complete and tags updated.',
