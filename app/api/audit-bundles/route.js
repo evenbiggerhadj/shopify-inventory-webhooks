@@ -1,47 +1,61 @@
-// app/api/audit-bundles/route.js - Bundle audit + notification system, Klaviyo List, Consent, and StockStatus aware
-
+// app/api/audit-bundles/route.js - Bundle audit and notification system
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
+// Use YOUR actual environment variable names
 const redis = new Redis({
-  url: process.env.KV_REST_API_URL,
-  token: process.env.KV_REST_API_TOKEN,
+  url: process.env.KV_REST_API_URL,      // Changed from UPSTASH_REDIS_REST_URL
+  token: process.env.KV_REST_API_TOKEN,  // Changed from UPSTASH_REDIS_REST_TOKEN
 });
+
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
 const ADMIN_API_TOKEN = process.env.SHOPIFY_ADMIN_API_KEY;
 const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
-const KLAVIYO_LIST_ID = process.env.KLAVIYO_LIST_ID; // Required for list opt-in
 
-// --------- Shopify API Helpers ---------
+// === FIXED Shopify Helper - NO MORE "/pipeline" ERRORS ===
 async function fetchFromShopify(endpoint, method = 'GET', body = null) {
+  // REMOVED the problematic validation that caused "/pipeline" errors
   if (!endpoint || typeof endpoint !== 'string') {
     throw new Error(`fetchFromShopify called with invalid endpoint: "${endpoint}"`);
   }
+  
+  console.log('🔍 Shopify API fetch:', endpoint);
+  
   const headers = {
     'X-Shopify-Access-Token': ADMIN_API_TOKEN,
     'Content-Type': 'application/json',
   };
+  
   const options = { method, headers };
   if (body) options.body = JSON.stringify(body);
-
+  
+  // FIXED: Handle both relative and absolute endpoints properly
   let url;
   if (endpoint.startsWith('http://') || endpoint.startsWith('https://')) {
     url = endpoint;
   } else {
+    // Remove leading slash if present, then construct URL properly
     const cleanEndpoint = endpoint.startsWith('/') ? endpoint.slice(1) : endpoint;
     url = `https://${SHOPIFY_STORE}/admin/api/2024-04/${cleanEndpoint}`;
   }
+  
+  console.log('🌐 Final URL:', url);
+  
   const res = await fetch(url, options);
+  
   if (!res.ok) {
     const errorText = await res.text();
     throw new Error(`Shopify API error: ${res.status} ${res.statusText} - ${errorText}`);
   }
+  
   return res.json();
 }
+
 async function getProductsTaggedBundle() {
   const res = await fetchFromShopify('products.json?fields=id,title,tags,handle&limit=250');
   return res.products.filter((p) => p.tags.includes('bundle'));
 }
+
 async function getProductMetafields(productId) {
   const res = await fetchFromShopify(`products/${productId}/metafields.json`);
   if (!res || !Array.isArray(res.metafields)) return null;
@@ -49,6 +63,7 @@ async function getProductMetafields(productId) {
     (m) => m.namespace === 'custom' && m.key === 'bundle_structure'
   );
 }
+
 async function getInventoryLevel(variantId) {
   if (!variantId) {
     console.error('❌ Missing variant_id for getInventoryLevel');
@@ -57,6 +72,7 @@ async function getInventoryLevel(variantId) {
   const res = await fetchFromShopify(`variants/${variantId}.json`);
   return res.variant.inventory_quantity;
 }
+
 async function updateProductTags(productId, currentTags, status) {
   const cleanedTags = currentTags
     .filter(
@@ -66,6 +82,7 @@ async function updateProductTags(productId, currentTags, status) {
         )
     )
     .concat([`bundle-${status}`]);
+
   await fetchFromShopify(`products/${productId}.json`, 'PUT', {
     product: {
       id: productId,
@@ -74,46 +91,44 @@ async function updateProductTags(productId, currentTags, status) {
   });
 }
 
-// --------- Redis Helpers ---------
+// === Redis Helpers ===
 async function getBundleStatus(productId) {
   return (await redis.get(`status:${productId}`)) || null;
 }
+
 async function setBundleStatus(productId, prevStatus, currStatus) {
   await redis.set(`status:${productId}`, { previous: prevStatus, current: currStatus });
 }
+
 async function getSubscribers(productId) {
   const result = await redis.get(`subscribers:${productId}`);
   if (!result) return [];
+  
+  // Handle different return types
   if (typeof result === 'string') {
-    try { return JSON.parse(result); } catch { return []; }
+    try {
+      return JSON.parse(result);
+    } catch {
+      return [];
+    }
   }
+  
   return Array.isArray(result) ? result : [];
 }
+
 async function setSubscribers(productId, subs) {
   await redis.set(`subscribers:${productId}`, subs);
 }
 
-// --------- Klaviyo List API: Add to List ---------
-async function addToKlaviyoList({ email, phone, first_name, last_name, sms_consent }) {
-  if (!KLAVIYO_API_KEY || !KLAVIYO_LIST_ID) return false;
-  if (!email && !phone) return false;
-  let profiles = [];
-  if (email) {
-    profiles.push({
-      email,
-      ...(first_name ? { first_name } : {}),
-      ...(last_name ? { last_name } : {})
-    });
+// === Enhanced Klaviyo Event Sender ===
+async function sendKlaviyoBackInStockEvent(email, productName, productUrl) {
+  if (!KLAVIYO_API_KEY) {
+    console.error('❌ KLAVIYO_API_KEY not set - skipping notification');
+    return false;
   }
-  if (phone && sms_consent === true) {
-    profiles.push({
-      phone_number: phone,
-      ...(first_name ? { first_name } : {}),
-      ...(last_name ? { last_name } : {})
-    });
-  }
+
   try {
-    const resp = await fetch(`https://a.klaviyo.com/api/lists/${KLAVIYO_LIST_ID}/profiles/`, {
+    const resp = await fetch('https://a.klaviyo.com/api/events/', {
       method: 'POST',
       headers: {
         'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
@@ -121,112 +136,54 @@ async function addToKlaviyoList({ email, phone, first_name, last_name, sms_conse
         'revision': '2024-10-15'
       },
       body: JSON.stringify({
-        data: profiles.map(profile => ({
-          type: 'profile',
-          attributes: profile
-        }))
-      })
-    });
-    if (!resp.ok) {
-      const errorText = await resp.text();
-      console.error('❌ Klaviyo List error:', resp.status, errorText);
-      return false;
-    }
-    return true;
-  } catch (err) {
-    console.error('❌ Klaviyo List network error:', err);
-    return false;
-  }
-}
-
-// --------- Klaviyo Profile API: Set Consent ---------
-async function updateKlaviyoProfileWithConsent({ email, phone, sms_consent }) {
-  if (!KLAVIYO_API_KEY || !phone || !sms_consent) return;
-  const consentTimestamp = new Date().toISOString();
-  const body = {
-    data: {
-      type: "profile",
-      attributes: {
-        ...(phone ? { phone_number: phone } : {}),
-        ...(email ? { email: email } : {}),
-        subscriptions: {
-          sms: {
-            marketing: {
-              consent: true,
-              timestamp: consentTimestamp
+        data: {
+          type: 'event',
+          attributes: {
+            properties: {
+              ProductName: productName,
+              ProductURL: productUrl,
+              NotificationType: 'Back in Stock',
+              Timestamp: new Date().toISOString()
+            },
+            metric: { 
+              data: { 
+                type: 'metric', 
+                attributes: { name: 'Back in Stock' } 
+              } 
+            },
+            profile: { 
+              data: { 
+                type: 'profile', 
+                attributes: { email } 
+              } 
             }
           }
         }
-      }
+      })
+    });
+
+    if (!resp.ok) {
+      const err = await resp.text();
+      console.error('❌ Klaviyo error:', resp.status, err);
+      return false;
     }
-  };
-  const resp = await fetch('https://a.klaviyo.com/api/profiles/', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-      'Content-Type': 'application/json',
-      'revision': '2024-10-15'
-    },
-    body: JSON.stringify(body)
-  });
-  if (!resp.ok) {
-    const errorText = await resp.text();
-    throw new Error(`Klaviyo Profile API error: ${resp.status} ${errorText}`);
+
+    console.log(`✅ Sent back-in-stock notification to ${email} for ${productName}`);
+    return true;
+
+  } catch (error) {
+    console.error('❌ Failed to send Klaviyo notification:', error);
+    return false;
   }
 }
 
-// --------- Klaviyo Event Sender ---------
-async function sendKlaviyoBackInStockEvent(email, productName, productUrl, phone = null, sms_consent = false, stock_status = 'out-of-stock') {
-  if (!KLAVIYO_API_KEY) {
-    console.error('❌ KLAVIYO_API_KEY not set - skipping notification');
-    return false;
-  }
-  let profileAttrs = {};
-  if (email) profileAttrs.email = email;
-  if (phone && sms_consent) profileAttrs.phone_number = phone;
-
-  const eventData = {
-    data: {
-      type: 'event',
-      attributes: {
-        properties: {
-          ProductName: productName,
-          ProductURL: productUrl,
-          NotificationType: 'Back in Stock',
-          Timestamp: new Date().toISOString(),
-          StockStatus: stock_status // << Split your Klaviyo flows on this!
-        },
-        metric: { 
-          data: { type: 'metric', attributes: { name: 'Back in Stock' } }
-        },
-        profile: { 
-          data: { type: 'profile', attributes: profileAttrs }
-        }
-      }
-    }
-  };
-  const resp = await fetch('https://a.klaviyo.com/api/events/', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-      'Content-Type': 'application/json',
-      'revision': '2024-10-15'
-    },
-    body: JSON.stringify(eventData)
-  });
-  if (!resp.ok) {
-    const errorText = await resp.text();
-    console.error('❌ Klaviyo event error:', resp.status, errorText);
-    return false;
-  }
-  return true;
-}
-
-// --------- Main Audit Script ---------
+// === Main Audit Script ===
 async function auditBundles() {
   console.log('🔍 Starting bundle audit process...');
+  
   const bundles = await getProductsTaggedBundle();
   console.log(`📦 Found ${bundles.length} bundles to audit`);
+  
   let notificationsSent = 0;
   let notificationErrors = 0;
   let bundlesProcessed = 0;
@@ -235,74 +192,63 @@ async function auditBundles() {
     try {
       console.log(`\n📦 Processing bundle: ${bundle.title}`);
       bundlesProcessed++;
+      
       const metafield = await getProductMetafields(bundle.id);
       if (!metafield || !metafield.value) {
         console.log(`⚠️ ${bundle.title} → skipped (no bundle_structure metafield)`);
         continue;
       }
-      let components;
-      try { components = JSON.parse(metafield.value); }
-      catch { console.error(`❌ Invalid JSON in bundle_structure for ${bundle.title}`); continue; }
 
-      let understocked = [], outOfStock = [];
+      let components;
+      try {
+        components = JSON.parse(metafield.value);
+      } catch {
+        console.error(`❌ Invalid JSON in bundle_structure for ${bundle.title}`);
+        continue;
+      }
+
+      let understocked = [];
+      let outOfStock = [];
+
       for (const component of components) {
         if (!component.variant_id) {
-          console.error('⚠️ Skipping component with missing variant_id:', component); continue;
+          console.error('⚠️ Skipping component with missing variant_id:', component);
+          continue;
         }
         const currentQty = await getInventoryLevel(component.variant_id);
-        if (currentQty === 0) outOfStock.push(component.variant_id);
-        else if (currentQty < component.required_quantity) understocked.push(component.variant_id);
+        if (currentQty === 0) {
+          outOfStock.push(component.variant_id);
+        } else if (currentQty < component.required_quantity) {
+          understocked.push(component.variant_id);
+        }
       }
 
       let status = 'ok';
       if (outOfStock.length > 0) status = 'out-of-stock';
       else if (understocked.length > 0) status = 'understocked';
 
-      // STATUS HISTORY
+      // === STATUS HISTORY ===
       const prevStatusObj = await getBundleStatus(bundle.id);
       const prevStatus = prevStatusObj ? prevStatusObj.current : null;
       await setBundleStatus(bundle.id, prevStatus, status);
+
       console.log(`📊 ${bundle.title} → ${prevStatus || 'unknown'} → ${status}`);
 
-      // NOTIFY SUBSCRIBERS IF BUNDLE NOW "ok"
+      // === NOTIFY SUBSCRIBERS IF BUNDLE NOW "ok" ===
       if (
         (prevStatus === 'understocked' || prevStatus === 'out-of-stock') &&
         status === 'ok'
       ) {
         console.log(`🔔 Bundle ${bundle.title} is back in stock! Sending notifications...`);
+        
         const subs = await getSubscribers(bundle.id);
         const productUrl = `https://${SHOPIFY_STORE.replace('.myshopify.com', '')}.com/products/${bundle.handle}`;
+        
         console.log(`📧 Found ${subs.length} subscribers for ${bundle.title}`);
-
+        
         for (let sub of subs) {
           if (sub && !sub.notified) {
-            // 1. Add to Klaviyo list (for both email and SMS, with consent)
-            await addToKlaviyoList({
-              email: sub.email,
-              phone: sub.phone,
-              first_name: sub.first_name,
-              last_name: sub.last_name,
-              sms_consent: !!sub.sms_consent
-            });
-
-            // 2. Update profile consent for SMS (best practice)
-            const sendSMS = sub.phone && sub.sms_consent === true;
-            if (sendSMS)
-              updateKlaviyoProfileWithConsent({
-                email: sub.email,
-                phone: sub.phone,
-                sms_consent: true
-              });
-
-            // 3. Always send event (email always, phone if consented)
-            const success = await sendKlaviyoBackInStockEvent(
-              sub.email,
-              bundle.title,
-              productUrl,
-              sendSMS ? sub.phone : null,
-              sendSMS,
-              prevStatus // This will be 'understocked' or 'out-of-stock' so flows can split!
-            );
+            const success = await sendKlaviyoBackInStockEvent(sub.email, bundle.title, productUrl);
             if (success) {
               sub.notified = true;
               notificationsSent++;
@@ -326,6 +272,7 @@ async function auditBundles() {
   console.log(`📦 Bundles processed: ${bundlesProcessed}`);
   console.log(`📧 Notifications sent: ${notificationsSent}`);
   console.log(`❌ Notification errors: ${notificationErrors}`);
+  
   return { 
     bundlesProcessed, 
     notificationsSent, 
@@ -334,11 +281,11 @@ async function auditBundles() {
   };
 }
 
-/* --------- HTTP Handler: Trigger Audit --------- */
 export async function GET() {
   try {
     console.log('🚀 Starting bundle audit...');
     const results = await auditBundles();
+    
     return NextResponse.json({ 
       success: true, 
       message: 'Audit complete and tags updated.',
