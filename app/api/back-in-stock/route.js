@@ -1,10 +1,10 @@
 // app/api/back-in-stock/route.js
-// Shopify Back-in-Stock + SMS Subscription Handler (Fully Featured)
+// Shopify Back-in-Stock + SMS Subscription Handler (Klaviyo SMS Consent Compliant)
 
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
-/* ========== ENVIRONMENT VARIABLES & REDIS SETUP ========== */
+// --- ENV VARS ---
 const redis = new Redis({
   url: process.env.KV_REST_API_URL,
   token: process.env.KV_REST_API_TOKEN,
@@ -12,7 +12,7 @@ const redis = new Redis({
 });
 const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
 
-/* ========== CORS PRE-FLIGHT ========== */
+// --- CORS PRE-FLIGHT ---
 export async function OPTIONS(request) {
   return new NextResponse(null, {
     status: 200,
@@ -24,13 +24,14 @@ export async function OPTIONS(request) {
   });
 }
 
-/* ========== POST: SUBSCRIBE TO BACK-IN-STOCK ========== */
+// --- POST: SUBSCRIBE TO BACK-IN-STOCK ---
 export async function POST(request) {
   try {
     const body = await request.json();
     const {
       email,
       phone,
+      sms_consent, // <-- from form checkbox
       product_id,
       product_title,
       product_handle,
@@ -38,20 +39,16 @@ export async function POST(request) {
       last_name
     } = body;
 
-    // 1. Validation: Required fields
-    if (!email || !product_id) {
+    // 1. Validation: require email or phone (one must be present)
+    if ((!email && !phone) || !product_id) {
       return jsonError(
-        'Missing required fields: email and product_id', 400,
-        { email: !!email, product_id: !!product_id }
+        'Provide at least one contact (email or phone) and product_id', 400
       );
     }
 
-    // 2. Email format
-    if (!isValidEmail(email)) {
+    if (email && !isValidEmail(email)) {
       return jsonError('Invalid email format', 400, { email });
     }
-
-    // 3. Phone number (optional, validate if present)
     let phoneNormalized = '';
     if (phone && phone.trim() !== '') {
       if (!isValidPhone(phone)) {
@@ -59,20 +56,23 @@ export async function POST(request) {
       }
       phoneNormalized = phone.trim();
     }
-
-    // 4. Redis connection check
-    try {
-      await redis.ping();
-    } catch (err) {
-      return jsonError('Database connection failed', 500, { details: err.message });
+    // At least one valid contact method required
+    if (!email && !phoneNormalized) {
+      return jsonError('Provide either a valid email or phone number.', 400);
     }
 
-    // 5. Find all current subscribers for this product
+    // Redis connection check
+    await redis.ping();
+
+    // Find all current subscribers for this product
     const key = `subscribers:${product_id}`;
     let subscribers = await safeGetRedisArray(key);
 
-    // 6. Prevent duplicate (same email for this product)
-    const existing = subscribers.find(sub => sub && sub.email === email);
+    // Prevent duplicate (same email or phone for this product)
+    const existing = subscribers.find(sub =>
+      (email && sub.email === email) ||
+      (phoneNormalized && sub.phone === phoneNormalized)
+    );
     if (existing) {
       return NextResponse.json({
         success: true,
@@ -82,10 +82,10 @@ export async function POST(request) {
       }, { headers: { 'Access-Control-Allow-Origin': '*' } });
     }
 
-    // 7. Build new subscriber object (including phone)
     const newSubscriber = {
-      email,
-      phone: phoneNormalized,
+      email: email || "",
+      phone: phoneNormalized || "",
+      sms_consent: !!sms_consent,
       product_id: product_id.toString(),
       product_title: product_title || 'Unknown Product',
       product_handle: product_handle || '',
@@ -97,48 +97,51 @@ export async function POST(request) {
     };
     subscribers.push(newSubscriber);
 
-    // 8. Save to Redis
-    try {
-      await redis.set(key, subscribers, { ex: 30 * 24 * 60 * 60 }); // 30 days
-    } catch (err) {
-      return jsonError('Failed to save subscription. Please try again.', 500, { details: err.message });
+    await redis.set(key, subscribers, { ex: 30 * 24 * 60 * 60 }); // 30 days
+
+    // --- 1. Update Klaviyo profile for SMS consent if provided ---
+    if (phoneNormalized && sms_consent === true) {
+      await updateKlaviyoProfileWithConsent({
+        email,
+        phone: phoneNormalized,
+        sms_consent: true
+      });
     }
 
-    // 9. Klaviyo confirmation event (non-blocking)
-    try {
-      await sendKlaviyoSubscribeEvent(newSubscriber);
-    } catch (klaviyoErr) {
-      // Log only
-      console.error('Klaviyo subscribe event error:', klaviyoErr.message);
-    }
+    // --- 2. Send Klaviyo event (phone only if consented) ---
+    await sendKlaviyoSubscribeEvent({
+      ...newSubscriber,
+      phone: (sms_consent === true ? phoneNormalized : null)
+    });
 
-    // 10. Return success
     return NextResponse.json({
       success: true,
       message: 'Successfully subscribed to back-in-stock notifications',
       subscriber_count: subscribers.length
     }, { headers: { 'Access-Control-Allow-Origin': '*' } });
-
   } catch (error) {
     return jsonError('Server error. Please try again.', 500, { details: error.message });
   }
 }
 
-/* ========== GET: CHECK SUBSCRIPTION STATUS ========== */
+// --- GET: CHECK SUBSCRIPTION STATUS ---
 export async function GET(request) {
   try {
     const { searchParams } = new URL(request.url);
     const email = searchParams.get('email');
+    const phone = searchParams.get('phone');
     const product_id = searchParams.get('product_id');
-
-    if (!email || !product_id) {
-      return jsonError('Missing email or product_id parameters', 400);
+    if ((!email && !phone) || !product_id) {
+      return jsonError('Missing email or phone or product_id parameters', 400);
     }
     await redis.ping();
     const key = `subscribers:${product_id}`;
     let subscribers = await safeGetRedisArray(key);
 
-    const subscription = subscribers.find(sub => sub && sub.email === email);
+    const subscription = subscribers.find(sub =>
+      (email && sub.email === email) ||
+      (phone && sub.phone === phone)
+    );
     const isSubscribed = !!subscription;
 
     return NextResponse.json({
@@ -148,7 +151,9 @@ export async function GET(request) {
       subscription_details: subscription ? {
         subscribed_at: subscription.subscribed_at,
         notified: subscription.notified,
-        phone: subscription.phone
+        phone: subscription.phone,
+        sms_consent: !!subscription.sms_consent,
+        email: subscription.email
       } : null
     }, { headers: { 'Access-Control-Allow-Origin': '*' } });
 
@@ -157,7 +162,7 @@ export async function GET(request) {
   }
 }
 
-/* ========== HELPERS ========== */
+// --- HELPERS ---
 function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
@@ -186,10 +191,47 @@ function jsonError(msg, status = 500, details = {}) {
   );
 }
 
-/* ========== KLAVIYO EVENT SENDER ========== */
+// --- KLAVIYO PROFILE CONSENT UPDATER ---
+async function updateKlaviyoProfileWithConsent({ email, phone, sms_consent }) {
+  if (!KLAVIYO_API_KEY || !phone || !sms_consent) return;
+  const consentTimestamp = new Date().toISOString();
+  const body = {
+    data: {
+      type: "profile",
+      attributes: {
+        ...(phone ? { phone_number: phone } : {}),
+        ...(email ? { email: email } : {}),
+        subscriptions: {
+          sms: {
+            marketing: {
+              consent: true,
+              timestamp: consentTimestamp
+            }
+          }
+        }
+      }
+    }
+  };
+  const resp = await fetch('https://a.klaviyo.com/api/profiles/', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+      'Content-Type': 'application/json',
+      'revision': '2024-10-15'
+    },
+    body: JSON.stringify(body)
+  });
+  if (!resp.ok) {
+    const errorText = await resp.text();
+    throw new Error(`Klaviyo Profile API error: ${resp.status} ${errorText}`);
+  }
+}
+
+// --- KLAVIYO EVENT SENDER ---
 async function sendKlaviyoSubscribeEvent(subscriber) {
   if (!KLAVIYO_API_KEY) return;
-  let profileAttrs = { email: subscriber.email };
+  let profileAttrs = {};
+  if (subscriber.email) profileAttrs.email = subscriber.email;
   if (subscriber.phone) profileAttrs.phone_number = subscriber.phone;
   if (subscriber.first_name) profileAttrs.first_name = subscriber.first_name;
   if (subscriber.last_name) profileAttrs.last_name = subscriber.last_name;
