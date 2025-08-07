@@ -1,4 +1,4 @@
-// app/api/audit-bundles/route.js - Bundle audit + notification system, now SMS consent-aware
+// app/api/audit-bundles/route.js - Bundle audit + notification system, Klaviyo List, Consent, and StockStatus aware
 
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
@@ -10,8 +10,9 @@ const redis = new Redis({
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
 const ADMIN_API_TOKEN = process.env.SHOPIFY_ADMIN_API_KEY;
 const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
+const KLAVIYO_LIST_ID = process.env.KLAVIYO_LIST_ID; // Required for list opt-in
 
-/* --------- Shopify API Helpers --------- */
+// --------- Shopify API Helpers ---------
 async function fetchFromShopify(endpoint, method = 'GET', body = null) {
   if (!endpoint || typeof endpoint !== 'string') {
     throw new Error(`fetchFromShopify called with invalid endpoint: "${endpoint}"`);
@@ -73,7 +74,7 @@ async function updateProductTags(productId, currentTags, status) {
   });
 }
 
-/* --------- Redis Helpers --------- */
+// --------- Redis Helpers ---------
 async function getBundleStatus(productId) {
   return (await redis.get(`status:${productId}`)) || null;
 }
@@ -92,42 +93,90 @@ async function setSubscribers(productId, subs) {
   await redis.set(`subscribers:${productId}`, subs);
 }
 
-/* --------- Klaviyo Profile API: Set Consent (optional, best practice) --------- */
-async function updateKlaviyoProfileWithConsent({ email, phone, sms_consent }) {
-  if (!KLAVIYO_API_KEY || !(email || phone)) return;
-  let profile = {};
-  if (email) profile.email = email;
-  if (phone) profile.phone_number = phone;
-  // Klaviyo expects SMS consent in the 'subscriptions.sms.marketing' object
-  if (phone && sms_consent) {
-    profile.subscriptions = {
-      sms: { marketing: { consent: true, timestamp: new Date().toISOString() } }
-    };
+// --------- Klaviyo List API: Add to List ---------
+async function addToKlaviyoList({ email, phone, first_name, last_name, sms_consent }) {
+  if (!KLAVIYO_API_KEY || !KLAVIYO_LIST_ID) return false;
+  if (!email && !phone) return false;
+  let profiles = [];
+  if (email) {
+    profiles.push({
+      email,
+      ...(first_name ? { first_name } : {}),
+      ...(last_name ? { last_name } : {})
+    });
+  }
+  if (phone && sms_consent === true) {
+    profiles.push({
+      phone_number: phone,
+      ...(first_name ? { first_name } : {}),
+      ...(last_name ? { last_name } : {})
+    });
   }
   try {
-    const res = await fetch('https://a.klaviyo.com/api/profiles/', {
+    const resp = await fetch(`https://a.klaviyo.com/api/lists/${KLAVIYO_LIST_ID}/profiles/`, {
       method: 'POST',
       headers: {
         'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
         'Content-Type': 'application/json',
         'revision': '2024-10-15'
       },
-      body: JSON.stringify({ data: { type: 'profile', attributes: profile } })
+      body: JSON.stringify({
+        data: profiles.map(profile => ({
+          type: 'profile',
+          attributes: profile
+        }))
+      })
     });
-    if (!res.ok) {
-      const errorText = await res.text();
-      console.error('❌ Klaviyo profile update error:', res.status, errorText);
+    if (!resp.ok) {
+      const errorText = await resp.text();
+      console.error('❌ Klaviyo List error:', resp.status, errorText);
       return false;
     }
     return true;
   } catch (err) {
-    console.error('❌ Klaviyo profile update network error:', err);
+    console.error('❌ Klaviyo List network error:', err);
     return false;
   }
 }
 
-/* --------- Klaviyo Event Sender (handles phone & consent) --------- */
-async function sendKlaviyoBackInStockEvent(email, productName, productUrl, phone = null, sms_consent = false) {
+// --------- Klaviyo Profile API: Set Consent ---------
+async function updateKlaviyoProfileWithConsent({ email, phone, sms_consent }) {
+  if (!KLAVIYO_API_KEY || !phone || !sms_consent) return;
+  const consentTimestamp = new Date().toISOString();
+  const body = {
+    data: {
+      type: "profile",
+      attributes: {
+        ...(phone ? { phone_number: phone } : {}),
+        ...(email ? { email: email } : {}),
+        subscriptions: {
+          sms: {
+            marketing: {
+              consent: true,
+              timestamp: consentTimestamp
+            }
+          }
+        }
+      }
+    }
+  };
+  const resp = await fetch('https://a.klaviyo.com/api/profiles/', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+      'Content-Type': 'application/json',
+      'revision': '2024-10-15'
+    },
+    body: JSON.stringify(body)
+  });
+  if (!resp.ok) {
+    const errorText = await resp.text();
+    throw new Error(`Klaviyo Profile API error: ${resp.status} ${errorText}`);
+  }
+}
+
+// --------- Klaviyo Event Sender ---------
+async function sendKlaviyoBackInStockEvent(email, productName, productUrl, phone = null, sms_consent = false, stock_status = 'out-of-stock') {
   if (!KLAVIYO_API_KEY) {
     console.error('❌ KLAVIYO_API_KEY not set - skipping notification');
     return false;
@@ -144,7 +193,8 @@ async function sendKlaviyoBackInStockEvent(email, productName, productUrl, phone
           ProductName: productName,
           ProductURL: productUrl,
           NotificationType: 'Back in Stock',
-          Timestamp: new Date().toISOString()
+          Timestamp: new Date().toISOString(),
+          StockStatus: stock_status // << Split your Klaviyo flows on this!
         },
         metric: { 
           data: { type: 'metric', attributes: { name: 'Back in Stock' } }
@@ -172,7 +222,7 @@ async function sendKlaviyoBackInStockEvent(email, productName, productUrl, phone
   return true;
 }
 
-/* --------- Main Audit Script --------- */
+// --------- Main Audit Script ---------
 async function auditBundles() {
   console.log('🔍 Starting bundle audit process...');
   const bundles = await getProductsTaggedBundle();
@@ -226,9 +276,17 @@ async function auditBundles() {
 
         for (let sub of subs) {
           if (sub && !sub.notified) {
-            // Only pass phone if consented
+            // 1. Add to Klaviyo list (for both email and SMS, with consent)
+            await addToKlaviyoList({
+              email: sub.email,
+              phone: sub.phone,
+              first_name: sub.first_name,
+              last_name: sub.last_name,
+              sms_consent: !!sub.sms_consent
+            });
+
+            // 2. Update profile consent for SMS (best practice)
             const sendSMS = sub.phone && sub.sms_consent === true;
-            // (Best practice) Update profile consent first (async, non-blocking)
             if (sendSMS)
               updateKlaviyoProfileWithConsent({
                 email: sub.email,
@@ -236,13 +294,14 @@ async function auditBundles() {
                 sms_consent: true
               });
 
-            // Always send event (email, and phone if consented)
+            // 3. Always send event (email always, phone if consented)
             const success = await sendKlaviyoBackInStockEvent(
               sub.email,
               bundle.title,
               productUrl,
               sendSMS ? sub.phone : null,
-              sendSMS
+              sendSMS,
+              prevStatus // This will be 'understocked' or 'out-of-stock' so flows can split!
             );
             if (success) {
               sub.notified = true;

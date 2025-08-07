@@ -1,4 +1,4 @@
-// Shopify Back-in-Stock + SMS Subscription Handler (Klaviyo SMS Consent & List Opt-in)
+// app/api/back-in-stock/route.js
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
@@ -7,9 +7,8 @@ const redis = new Redis({
   token: process.env.KV_REST_API_TOKEN,
   retry: { retries: 3, retryDelayOnFailover: 100 }
 });
-
 const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
-const KLAVIYO_LIST_ID = process.env.KLAVIYO_LIST_ID; // <-- SET THIS in Vercel!
+const KLAVIYO_LIST_ID = process.env.KLAVIYO_LIST_ID; // Set in Vercel
 
 export async function OPTIONS(request) {
   return new NextResponse(null, {
@@ -33,14 +32,13 @@ export async function POST(request) {
       product_title,
       product_handle,
       first_name,
-      last_name
+      last_name,
+      stock_status // Optional, pass 'understocked' or 'out-of-stock' from frontend if needed
     } = body;
 
-    // 1. Require at least one contact method and product_id
     if ((!email && !phone) || !product_id) {
       return jsonError('Provide at least one contact (email or phone) and product_id', 400);
     }
-    // 2. Validate contact fields
     if (email && !isValidEmail(email)) {
       return jsonError('Invalid email format', 400, { email });
     }
@@ -59,7 +57,6 @@ export async function POST(request) {
     const key = `subscribers:${product_id}`;
     let subscribers = await safeGetRedisArray(key);
 
-    // Prevent duplicate (by email or phone)
     const existing = subscribers.find(sub =>
       (email && sub.email === email) ||
       (phoneNormalized && sub.phone === phoneNormalized)
@@ -84,13 +81,14 @@ export async function POST(request) {
       last_name: last_name || '',
       notified: false,
       subscribed_at: new Date().toISOString(),
-      ip_address: getClientIp(request)
+      ip_address: getClientIp(request),
+      stock_status: stock_status || 'out-of-stock' // default if not passed
     };
     subscribers.push(newSubscriber);
 
     await redis.set(key, subscribers, { ex: 30 * 24 * 60 * 60 }); // 30 days
 
-    // === (1) Add to Klaviyo List (so flows trigger!) ===
+    // 1. Add to Klaviyo List (so flows trigger!) 
     await addToKlaviyoList({
       email: newSubscriber.email,
       phone: newSubscriber.phone,
@@ -99,7 +97,7 @@ export async function POST(request) {
       sms_consent: !!newSubscriber.sms_consent
     });
 
-    // === (2) Update profile for SMS consent ===
+    // 2. Update profile for SMS consent (required for SMS)
     if (phoneNormalized && sms_consent === true) {
       await updateKlaviyoProfileWithConsent({
         email,
@@ -108,7 +106,7 @@ export async function POST(request) {
       });
     }
 
-    // === (3) Send Klaviyo "Back in Stock Subscription" Event (triggers your flows) ===
+    // 3. Send Klaviyo "Back in Stock Subscription" Event (for flows)
     await sendKlaviyoSubscribeEvent({
       ...newSubscriber,
       phone: (sms_consent === true ? phoneNormalized : null)
@@ -196,7 +194,6 @@ async function addToKlaviyoList({ email, phone, first_name, last_name, sms_conse
   if (!KLAVIYO_API_KEY || !KLAVIYO_LIST_ID) return false;
   if (!email && !phone) return false;
 
-  // If SMS consent, add as SMS; else just email
   let profiles = [];
   if (email) {
     profiles.push({
@@ -212,7 +209,6 @@ async function addToKlaviyoList({ email, phone, first_name, last_name, sms_conse
       ...(last_name ? { last_name } : {})
     });
   }
-
   try {
     const resp = await fetch(`https://a.klaviyo.com/api/lists/${KLAVIYO_LIST_ID}/profiles/`, {
       method: 'POST',
@@ -294,7 +290,8 @@ async function sendKlaviyoSubscribeEvent(subscriber) {
           ProductID: subscriber.product_id,
           ProductHandle: subscriber.product_handle,
           SubscriptionDate: subscriber.subscribed_at,
-          NotificationType: 'Subscription Confirmation'
+          NotificationType: 'Subscription Confirmation',
+          StockStatus: subscriber.stock_status || 'out-of-stock' // Include for flow splits!
         },
         metric: {
           data: { type: 'metric', attributes: { name: 'Back in Stock Subscription' } }
