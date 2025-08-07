@@ -1,53 +1,47 @@
-// app/api/audit-bundles/route.js - Bundle audit and notification system
+// app/api/audit-bundles/route.js - Bundle audit and notification system, now SMS-enabled
+
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
-// Use YOUR actual environment variable names
+// ENVIRONMENT VARS
 const redis = new Redis({
-  url: process.env.KV_REST_API_URL,      // Changed from UPSTASH_REDIS_REST_URL
-  token: process.env.KV_REST_API_TOKEN,  // Changed from UPSTASH_REDIS_REST_TOKEN
+  url: process.env.KV_REST_API_URL,
+  token: process.env.KV_REST_API_TOKEN,
 });
 
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
 const ADMIN_API_TOKEN = process.env.SHOPIFY_ADMIN_API_KEY;
 const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
 
-// === FIXED Shopify Helper - NO MORE "/pipeline" ERRORS ===
+// Shopify API Helper
 async function fetchFromShopify(endpoint, method = 'GET', body = null) {
-  // REMOVED the problematic validation that caused "/pipeline" errors
   if (!endpoint || typeof endpoint !== 'string') {
     throw new Error(`fetchFromShopify called with invalid endpoint: "${endpoint}"`);
   }
-  
-  console.log('🔍 Shopify API fetch:', endpoint);
-  
+
   const headers = {
     'X-Shopify-Access-Token': ADMIN_API_TOKEN,
     'Content-Type': 'application/json',
   };
-  
+
   const options = { method, headers };
   if (body) options.body = JSON.stringify(body);
-  
-  // FIXED: Handle both relative and absolute endpoints properly
+
   let url;
   if (endpoint.startsWith('http://') || endpoint.startsWith('https://')) {
     url = endpoint;
   } else {
-    // Remove leading slash if present, then construct URL properly
     const cleanEndpoint = endpoint.startsWith('/') ? endpoint.slice(1) : endpoint;
     url = `https://${SHOPIFY_STORE}/admin/api/2024-04/${cleanEndpoint}`;
   }
-  
-  console.log('🌐 Final URL:', url);
-  
+
   const res = await fetch(url, options);
-  
+
   if (!res.ok) {
     const errorText = await res.text();
     throw new Error(`Shopify API error: ${res.status} ${res.statusText} - ${errorText}`);
   }
-  
+
   return res.json();
 }
 
@@ -91,7 +85,7 @@ async function updateProductTags(productId, currentTags, status) {
   });
 }
 
-// === Redis Helpers ===
+// Redis Helpers
 async function getBundleStatus(productId) {
   return (await redis.get(`status:${productId}`)) || null;
 }
@@ -103,8 +97,6 @@ async function setBundleStatus(productId, prevStatus, currStatus) {
 async function getSubscribers(productId) {
   const result = await redis.get(`subscribers:${productId}`);
   if (!result) return [];
-  
-  // Handle different return types
   if (typeof result === 'string') {
     try {
       return JSON.parse(result);
@@ -112,7 +104,6 @@ async function getSubscribers(productId) {
       return [];
     }
   }
-  
   return Array.isArray(result) ? result : [];
 }
 
@@ -120,14 +111,17 @@ async function setSubscribers(productId, subs) {
   await redis.set(`subscribers:${productId}`, subs);
 }
 
-// === Enhanced Klaviyo Event Sender ===
-async function sendKlaviyoBackInStockEvent(email, productName, productUrl) {
+// === Klaviyo Event Sender (now passes phone for SMS) ===
+async function sendKlaviyoBackInStockEvent(email, productName, productUrl, phone = null) {
   if (!KLAVIYO_API_KEY) {
     console.error('❌ KLAVIYO_API_KEY not set - skipping notification');
     return false;
   }
 
   try {
+    let profileAttrs = { email };
+    if (phone) profileAttrs.phone_number = phone;
+
     const resp = await fetch('https://a.klaviyo.com/api/events/', {
       method: 'POST',
       headers: {
@@ -154,7 +148,7 @@ async function sendKlaviyoBackInStockEvent(email, productName, productUrl) {
             profile: { 
               data: { 
                 type: 'profile', 
-                attributes: { email } 
+                attributes: profileAttrs
               } 
             }
           }
@@ -168,7 +162,7 @@ async function sendKlaviyoBackInStockEvent(email, productName, productUrl) {
       return false;
     }
 
-    console.log(`✅ Sent back-in-stock notification to ${email} for ${productName}`);
+    console.log(`✅ Sent back-in-stock notification to ${email} for ${productName} (SMS: ${!!phone})`);
     return true;
 
   } catch (error) {
@@ -248,7 +242,8 @@ async function auditBundles() {
         
         for (let sub of subs) {
           if (sub && !sub.notified) {
-            const success = await sendKlaviyoBackInStockEvent(sub.email, bundle.title, productUrl);
+            // PASS PHONE FOR SMS
+            const success = await sendKlaviyoBackInStockEvent(sub.email, bundle.title, productUrl, sub.phone || null);
             if (success) {
               sub.notified = true;
               notificationsSent++;
@@ -281,6 +276,7 @@ async function auditBundles() {
   };
 }
 
+// HTTP Handler: Trigger Audit
 export async function GET() {
   try {
     console.log('🚀 Starting bundle audit...');
