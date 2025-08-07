@@ -1,18 +1,16 @@
-// app/api/back-in-stock/route.js
-// Shopify Back-in-Stock + SMS Subscription Handler (Klaviyo SMS Consent Compliant)
-
+// Shopify Back-in-Stock + SMS Subscription Handler (Klaviyo SMS Consent & List Opt-in)
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
-// --- ENV VARS ---
 const redis = new Redis({
   url: process.env.KV_REST_API_URL,
   token: process.env.KV_REST_API_TOKEN,
   retry: { retries: 3, retryDelayOnFailover: 100 }
 });
-const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
 
-// --- CORS PRE-FLIGHT ---
+const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
+const KLAVIYO_LIST_ID = process.env.KLAVIYO_LIST_ID; // <-- SET THIS in Vercel!
+
 export async function OPTIONS(request) {
   return new NextResponse(null, {
     status: 200,
@@ -24,14 +22,13 @@ export async function OPTIONS(request) {
   });
 }
 
-// --- POST: SUBSCRIBE TO BACK-IN-STOCK ---
 export async function POST(request) {
   try {
     const body = await request.json();
     const {
       email,
       phone,
-      sms_consent, // <-- from form checkbox
+      sms_consent,
       product_id,
       product_title,
       product_handle,
@@ -39,13 +36,11 @@ export async function POST(request) {
       last_name
     } = body;
 
-    // 1. Validation: require email or phone (one must be present)
+    // 1. Require at least one contact method and product_id
     if ((!email && !phone) || !product_id) {
-      return jsonError(
-        'Provide at least one contact (email or phone) and product_id', 400
-      );
+      return jsonError('Provide at least one contact (email or phone) and product_id', 400);
     }
-
+    // 2. Validate contact fields
     if (email && !isValidEmail(email)) {
       return jsonError('Invalid email format', 400, { email });
     }
@@ -56,19 +51,15 @@ export async function POST(request) {
       }
       phoneNormalized = phone.trim();
     }
-    // At least one valid contact method required
     if (!email && !phoneNormalized) {
       return jsonError('Provide either a valid email or phone number.', 400);
     }
 
-    // Redis connection check
     await redis.ping();
-
-    // Find all current subscribers for this product
     const key = `subscribers:${product_id}`;
     let subscribers = await safeGetRedisArray(key);
 
-    // Prevent duplicate (same email or phone for this product)
+    // Prevent duplicate (by email or phone)
     const existing = subscribers.find(sub =>
       (email && sub.email === email) ||
       (phoneNormalized && sub.phone === phoneNormalized)
@@ -99,7 +90,16 @@ export async function POST(request) {
 
     await redis.set(key, subscribers, { ex: 30 * 24 * 60 * 60 }); // 30 days
 
-    // --- 1. Update Klaviyo profile for SMS consent if provided ---
+    // === (1) Add to Klaviyo List (so flows trigger!) ===
+    await addToKlaviyoList({
+      email: newSubscriber.email,
+      phone: newSubscriber.phone,
+      first_name: newSubscriber.first_name,
+      last_name: newSubscriber.last_name,
+      sms_consent: !!newSubscriber.sms_consent
+    });
+
+    // === (2) Update profile for SMS consent ===
     if (phoneNormalized && sms_consent === true) {
       await updateKlaviyoProfileWithConsent({
         email,
@@ -108,7 +108,7 @@ export async function POST(request) {
       });
     }
 
-    // --- 2. Send Klaviyo event (phone only if consented) ---
+    // === (3) Send Klaviyo "Back in Stock Subscription" Event (triggers your flows) ===
     await sendKlaviyoSubscribeEvent({
       ...newSubscriber,
       phone: (sms_consent === true ? phoneNormalized : null)
@@ -119,12 +119,12 @@ export async function POST(request) {
       message: 'Successfully subscribed to back-in-stock notifications',
       subscriber_count: subscribers.length
     }, { headers: { 'Access-Control-Allow-Origin': '*' } });
+
   } catch (error) {
     return jsonError('Server error. Please try again.', 500, { details: error.message });
   }
 }
 
-// --- GET: CHECK SUBSCRIPTION STATUS ---
 export async function GET(request) {
   try {
     const { searchParams } = new URL(request.url);
@@ -163,11 +163,11 @@ export async function GET(request) {
 }
 
 // --- HELPERS ---
+
 function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 function isValidPhone(phone) {
-  // E.164: +, no spaces, min 8, max 15 digits
   return /^\+?[1-9]\d{7,14}$/.test(phone.trim());
 }
 function getClientIp(request) {
@@ -191,7 +191,56 @@ function jsonError(msg, status = 500, details = {}) {
   );
 }
 
-// --- KLAVIYO PROFILE CONSENT UPDATER ---
+// --- KLAVIYO LIST OPT-IN ---
+async function addToKlaviyoList({ email, phone, first_name, last_name, sms_consent }) {
+  if (!KLAVIYO_API_KEY || !KLAVIYO_LIST_ID) return false;
+  if (!email && !phone) return false;
+
+  // If SMS consent, add as SMS; else just email
+  let profiles = [];
+  if (email) {
+    profiles.push({
+      email,
+      ...(first_name ? { first_name } : {}),
+      ...(last_name ? { last_name } : {})
+    });
+  }
+  if (phone && sms_consent === true) {
+    profiles.push({
+      phone_number: phone,
+      ...(first_name ? { first_name } : {}),
+      ...(last_name ? { last_name } : {})
+    });
+  }
+
+  try {
+    const resp = await fetch(`https://a.klaviyo.com/api/lists/${KLAVIYO_LIST_ID}/profiles/`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        'Content-Type': 'application/json',
+        'revision': '2024-10-15'
+      },
+      body: JSON.stringify({
+        data: profiles.map(profile => ({
+          type: 'profile',
+          attributes: profile
+        }))
+      })
+    });
+    if (!resp.ok) {
+      const errorText = await resp.text();
+      console.error('❌ Klaviyo List error:', resp.status, errorText);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error('❌ Klaviyo List network error:', err);
+    return false;
+  }
+}
+
+// --- KLAVIYO PROFILE SMS CONSENT ---
 async function updateKlaviyoProfileWithConsent({ email, phone, sms_consent }) {
   if (!KLAVIYO_API_KEY || !phone || !sms_consent) return;
   const consentTimestamp = new Date().toISOString();
