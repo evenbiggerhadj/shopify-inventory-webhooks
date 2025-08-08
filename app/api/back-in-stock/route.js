@@ -1,4 +1,4 @@
-// app/api/back-in-stock/route.js - Production-ready subscription handler with Subscribe Profiles
+// app/api/back-in-stock/route.js - Production-ready subscription handler with DIRECT LIST ADDITION
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
@@ -243,115 +243,223 @@ export async function GET(request) {
   }
 }
 
-// PRODUCTION-READY: Subscribe to Klaviyo using Subscribe Profiles endpoint
+// DIRECT LIST ADDITION - This should work with your full access API key
 async function subscribeToKlaviyoList(subscriber) {
   if (!KLAVIYO_API_KEY) {
-    console.log('ℹ️ No Klaviyo API key configured');
+    console.log('❌ No KLAVIYO_API_KEY found in environment variables');
     return false;
   }
 
+  console.log('🔍 Debug Info:');
+  console.log('- Klaviyo API Key exists:', !!KLAVIYO_API_KEY);
+  console.log('- List ID:', BACK_IN_STOCK_LIST_ID);
+  console.log('- Subscriber email:', subscriber.email);
+  
   try {
-    console.log(`📋 Subscribing ${subscriber.email} to Klaviyo list ${BACK_IN_STOCK_LIST_ID}...`);
+    console.log(`📋 Adding ${subscriber.email} DIRECTLY to list ${BACK_IN_STOCK_LIST_ID}...`);
 
-    // Use Subscribe Profiles endpoint - handles consent and list membership
-    const subscribeData = {
-      data: {
-        type: 'profile-subscription-bulk-create-job',
-        attributes: {
-          profiles: {
-            data: [{
-              type: 'profile',
-              attributes: {
-                email: subscriber.email,
-                phone_number: subscriber.phone || null,
-                first_name: subscriber.first_name || '',
-                last_name: subscriber.last_name || '',
-                properties: {
-                  'Back in Stock Subscriber': true,
-                  'Subscription Source': 'Bundle Notifications',
-                  'Last Subscription Date': subscriber.subscribed_at,
-                  'Product Subscribed': subscriber.product_title,
-                  'Product ID': subscriber.product_id,
-                  'Product Handle': subscriber.product_handle
-                }
-              }
-            }]
-          },
-          subscriptions: [{
-            type: 'list',
-            id: BACK_IN_STOCK_LIST_ID,
-            attributes: {
-              email: { 
-                marketing: { 
-                  consent: 'subscribed',
-                  consented_at: new Date().toISOString()
-                } 
-              }
-            }
-          }]
-        }
-      }
-    };
-
-    // Add SMS consent if phone number provided
+    // Format phone number properly
+    let formattedPhone = null;
     if (subscriber.phone && subscriber.phone.length > 0) {
-      // Ensure phone is in proper E.164 format
-      let formattedPhone = subscriber.phone.trim();
+      formattedPhone = subscriber.phone.trim();
       if (!formattedPhone.startsWith('+')) {
         // Assume US number if no country code
         formattedPhone = '+1' + formattedPhone.replace(/\D/g, '');
       }
-      
-      console.log(`📱 Adding SMS consent for ${formattedPhone}...`);
-      
-      subscribeData.data.attributes.subscriptions[0].attributes.sms = {
-        marketing: { 
-          consent: 'subscribed',
-          consented_at: new Date().toISOString()
-        }
-      };
-      
-      // Update the phone in the profile data too
-      subscribeData.data.attributes.profiles.data[0].attributes.phone_number = formattedPhone;
+      console.log(`📱 Phone formatted as: ${formattedPhone}`);
     }
 
-    const response = await fetch('https://a.klaviyo.com/api/profile-subscription-bulk-create-jobs/', {
+    // METHOD 1: Direct list addition
+    const listData = {
+      data: [{
+        type: 'profile',
+        attributes: {
+          email: subscriber.email,
+          first_name: subscriber.first_name || '',
+          last_name: subscriber.last_name || '',
+          phone_number: formattedPhone,
+          properties: {
+            'Back in Stock Subscriber': true,
+            'Subscription Source': 'Bundle Notifications',
+            'Product Subscribed': subscriber.product_title,
+            'Product ID': subscriber.product_id,
+            'Product Handle': subscriber.product_handle,
+            'Subscribed At': subscriber.subscribed_at,
+            'Direct List Addition': true
+          }
+        }
+      }]
+    };
+
+    console.log('📤 Method 1: Trying direct list addition...');
+    console.log('URL:', `https://a.klaviyo.com/api/lists/${BACK_IN_STOCK_LIST_ID}/profiles/`);
+
+    const response = await fetch(`https://a.klaviyo.com/api/lists/${BACK_IN_STOCK_LIST_ID}/profiles/`, {
       method: 'POST',
       headers: {
         'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
         'Content-Type': 'application/json',
         'revision': '2024-10-15'
       },
-      body: JSON.stringify(subscribeData)
+      body: JSON.stringify(listData)
     });
 
+    console.log('📥 Method 1 response status:', response.status);
+
     if (response.ok) {
-      const result = await response.json();
-      console.log(`✅ Klaviyo subscription job created: ${result.data.id}`);
+      console.log(`✅ Method 1 SUCCESS: ${subscriber.email} added directly to list!`);
       
-      // Send confirmation event
+      // Send confirmation event after successful list addition
       setTimeout(() => {
         sendSubscriptionEvent(subscriber).catch(err => {
           console.log('⚠️ Event send failed (non-critical):', err.message);
         });
-      }, 1000); // Delay to let profile creation complete
+      }, 500);
       
       return true;
     } else {
       const errorText = await response.text();
-      console.error(`❌ Klaviyo subscription failed (${response.status}):`, errorText);
+      console.error(`❌ Method 1 failed (${response.status}):`, errorText);
       
-      // Try fallback method
-      return await fallbackListAddition(subscriber);
+      // METHOD 2: Create profile first, then add to list
+      console.log('🔄 Trying Method 2: Create profile first, then add to list...');
+      return await alternativeListAddition(subscriber, BACK_IN_STOCK_LIST_ID);
     }
 
   } catch (error) {
-    console.error('❌ Klaviyo subscription error:', error);
-    return await fallbackListAddition(subscriber);
+    console.error('❌ Method 1 Network Error:', error.message);
+    console.log('🔄 Trying Method 2: Create profile first, then add to list...');
+    return await alternativeListAddition(subscriber, BACK_IN_STOCK_LIST_ID);
   }
 }
 
-// Send subscription confirmation event (simplified)
+// Alternative method: Add using relationships endpoint
+async function alternativeListAddition(subscriber, listId) {
+  try {
+    console.log(`🔄 Method 2: Creating profile first for ${subscriber.email}...`);
+    
+    // First create/get the profile
+    let profileId = await createOrGetProfile(subscriber);
+    
+    if (profileId) {
+      console.log(`📋 Method 2: Adding profile ${profileId} to list...`);
+      
+      // Then add to list using relationships
+      const addToListData = {
+        data: [{
+          type: 'profile',
+          id: profileId
+        }]
+      };
+
+      const listResponse = await fetch(`https://a.klaviyo.com/api/lists/${listId}/relationships/profiles/`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+          'Content-Type': 'application/json',
+          'revision': '2024-10-15'
+        },
+        body: JSON.stringify(addToListData)
+      });
+
+      console.log('📥 Method 2 list response status:', listResponse.status);
+
+      if (listResponse.ok || listResponse.status === 204) {
+        console.log(`✅ Method 2 SUCCESS: Added ${subscriber.email} to list!`);
+        return true;
+      } else {
+        const errorText = await listResponse.text();
+        console.error(`❌ Method 2 list addition failed:`, errorText);
+        return false;
+      }
+    } else {
+      console.error(`❌ Method 2: Could not create/find profile for ${subscriber.email}`);
+      return false;
+    }
+    
+  } catch (error) {
+    console.error('❌ Method 2 error:', error);
+    return false;
+  }
+}
+
+// Create or get profile ID
+async function createOrGetProfile(subscriber) {
+  try {
+    // Format phone number
+    let formattedPhone = null;
+    if (subscriber.phone && subscriber.phone.length > 0) {
+      formattedPhone = subscriber.phone.trim();
+      if (!formattedPhone.startsWith('+')) {
+        formattedPhone = '+1' + formattedPhone.replace(/\D/g, '');
+      }
+    }
+
+    // Try to create profile
+    const profileData = {
+      data: {
+        type: 'profile',
+        attributes: {
+          email: subscriber.email,
+          first_name: subscriber.first_name || '',
+          last_name: subscriber.last_name || '',
+          phone_number: formattedPhone,
+          properties: {
+            'Back in Stock Subscriber': true,
+            'Subscription Source': 'Bundle Notifications',
+            'Product Subscribed': subscriber.product_title
+          }
+        }
+      }
+    };
+
+    console.log(`📝 Method 2: Creating profile for ${subscriber.email}...`);
+
+    const profileResponse = await fetch('https://a.klaviyo.com/api/profiles/', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        'Content-Type': 'application/json',
+        'revision': '2024-10-15'
+      },
+      body: JSON.stringify(profileData)
+    });
+
+    if (profileResponse.ok) {
+      const result = await profileResponse.json();
+      console.log(`✅ Method 2: Profile created with ID ${result.data.id}`);
+      return result.data.id;
+    } else if (profileResponse.status === 409) {
+      // Profile exists, get the ID
+      console.log(`ℹ️ Method 2: Profile exists, getting ID for ${subscriber.email}...`);
+      
+      const getProfileResponse = await fetch(`https://a.klaviyo.com/api/profiles/?filter=equals(email,"${subscriber.email}")`, {
+        headers: {
+          'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+          'revision': '2024-10-15'
+        }
+      });
+
+      if (getProfileResponse.ok) {
+        const result = await getProfileResponse.json();
+        if (result.data && result.data.length > 0) {
+          console.log(`✅ Method 2: Found existing profile ID ${result.data[0].id}`);
+          return result.data[0].id;
+        }
+      }
+    } else {
+      const errorText = await profileResponse.text();
+      console.error(`❌ Method 2: Profile creation failed (${profileResponse.status}):`, errorText);
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('❌ Method 2: Profile creation error:', error);
+    return null;
+  }
+}
+
+// Send subscription confirmation event
 async function sendSubscriptionEvent(subscriber) {
   try {
     const eventData = {
