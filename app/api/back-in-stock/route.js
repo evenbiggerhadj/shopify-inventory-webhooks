@@ -294,13 +294,25 @@ async function subscribeToKlaviyoList(subscriber) {
     };
 
     // Add SMS consent if phone number provided
-    if (subscriber.phone) {
+    if (subscriber.phone && subscriber.phone.length > 0) {
+      // Ensure phone is in proper E.164 format
+      let formattedPhone = subscriber.phone.trim();
+      if (!formattedPhone.startsWith('+')) {
+        // Assume US number if no country code
+        formattedPhone = '+1' + formattedPhone.replace(/\D/g, '');
+      }
+      
+      console.log(`📱 Adding SMS consent for ${formattedPhone}...`);
+      
       subscribeData.data.attributes.subscriptions[0].attributes.sms = {
         marketing: { 
           consent: 'subscribed',
           consented_at: new Date().toISOString()
         }
       };
+      
+      // Update the phone in the profile data too
+      subscribeData.data.attributes.profiles.data[0].attributes.phone_number = formattedPhone;
     }
 
     const response = await fetch('https://a.klaviyo.com/api/profile-subscription-bulk-create-jobs/', {
@@ -339,53 +351,7 @@ async function subscribeToKlaviyoList(subscriber) {
   }
 }
 
-// Fallback: Direct list addition if subscribe fails
-async function fallbackListAddition(subscriber) {
-  try {
-    console.log(`🔄 Using fallback list addition for ${subscriber.email}...`);
-    
-    const response = await fetch(`https://a.klaviyo.com/api/lists/${BACK_IN_STOCK_LIST_ID}/profiles/`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-        'Content-Type': 'application/json',
-        'revision': '2024-10-15'
-      },
-      body: JSON.stringify({
-        data: [{
-          type: 'profile',
-          attributes: {
-            email: subscriber.email,
-            first_name: subscriber.first_name || '',
-            last_name: subscriber.last_name || '',
-            phone_number: subscriber.phone || null,
-            properties: {
-              'Back in Stock Subscriber': true,
-              'Subscription Source': 'Bundle Notifications (Fallback)',
-              'Last Subscription Date': subscriber.subscribed_at,
-              'Product Subscribed': subscriber.product_title,
-              'Product ID': subscriber.product_id
-            }
-          }
-        }]
-      })
-    });
-    
-    if (response.ok) {
-      console.log(`✅ Fallback: Added ${subscriber.email} to list successfully`);
-      return true;
-    } else {
-      const errorText = await response.text();
-      console.error(`❌ Fallback also failed (${response.status}):`, errorText);
-      return false;
-    }
-  } catch (error) {
-    console.error('❌ Fallback method error:', error);
-    return false;
-  }
-}
-
-// Send subscription confirmation event
+// Send subscription confirmation event (simplified)
 async function sendSubscriptionEvent(subscriber) {
   try {
     const eventData = {
@@ -398,7 +364,7 @@ async function sendSubscriptionEvent(subscriber) {
             ProductHandle: subscriber.product_handle,
             SubscriptionDate: subscriber.subscribed_at,
             NotificationType: 'Subscription Confirmation',
-            ListID: BACK_IN_STOCK_LIST_ID
+            Method: 'Direct List Addition'
           },
           metric: { 
             data: { 

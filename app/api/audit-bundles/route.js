@@ -223,7 +223,7 @@ async function ensureInBackInStockList(email, firstName = '', lastName = '', pho
   }
 }
 
-// === Enhanced Klaviyo Event Sender with Subscribe Profiles support ===
+// === Simplified Klaviyo Event Sender with Direct List Addition ===
 async function sendKlaviyoBackInStockEvent(email, productName, productUrl, firstName = '', lastName = '', phone = '') {
   if (!KLAVIYO_API_KEY) {
     console.error('❌ KLAVIYO_API_KEY not set - skipping notification');
@@ -235,7 +235,7 @@ async function sendKlaviyoBackInStockEvent(email, productName, productUrl, first
   try {
     console.log(`🔔 Sending back-in-stock notification to ${email}...`);
 
-    // STEP 1: Ensure profile exists and is subscribed to list
+    // STEP 1: Ensure profile is in list using simple method
     await ensureProfileInList(email, firstName, lastName, phone, BACK_IN_STOCK_LIST_ID);
 
     // STEP 2: Send the back-in-stock event
@@ -247,8 +247,7 @@ async function sendKlaviyoBackInStockEvent(email, productName, productUrl, first
             ProductName: productName,
             ProductURL: productUrl,
             NotificationType: 'Back in Stock',
-            Timestamp: new Date().toISOString(),
-            ListID: BACK_IN_STOCK_LIST_ID
+            Timestamp: new Date().toISOString()
           },
           metric: { 
             data: { 
@@ -295,87 +294,37 @@ async function sendKlaviyoBackInStockEvent(email, productName, productUrl, first
   }
 }
 
-// Ensure profile is in the back-in-stock list (production-ready)
+// Simplified: Ensure profile is in list using direct method
 async function ensureProfileInList(email, firstName, lastName, phone, listId) {
   try {
-    console.log(`📋 Ensuring ${email} is properly subscribed to list...`);
+    console.log(`📋 Ensuring ${email} is in list using direct method...`);
 
-    // Use Subscribe Profiles for robust list membership
-    const subscribeData = {
-      data: {
-        type: 'profile-subscription-bulk-create-job',
-        attributes: {
-          profiles: {
-            data: [{
-              type: 'profile',
-              attributes: {
-                email: email,
-                first_name: firstName || '',
-                last_name: lastName || '',
-                phone_number: phone || null,
-                properties: {
-                  'Back in Stock Subscriber': true,
-                  'Profile Ensured': new Date().toISOString()
-                }
-              }
-            }]
-          },
-          subscriptions: [{
-            type: 'list',
-            id: listId,
-            attributes: {
-              email: { 
-                marketing: { 
-                  consent: 'subscribed',
-                  consented_at: new Date().toISOString()
-                } 
-              }
-            }
-          }]
-        }
+    // Format phone number properly
+    let formattedPhone = null;
+    if (phone && phone.length > 0) {
+      formattedPhone = phone.trim();
+      if (!formattedPhone.startsWith('+')) {
+        formattedPhone = '+1' + formattedPhone.replace(/\D/g, '');
       }
+    }
+
+    // Use the same direct list addition method as the subscription API
+    const listData = {
+      data: [{
+        type: 'profile',
+        attributes: {
+          email,
+          first_name: firstName || '',
+          last_name: lastName || '',
+          phone_number: formattedPhone,
+          properties: {
+            'Back in Stock Subscriber': true,
+            'Profile Ensured for Notification': new Date().toISOString()
+          }
+        }
+      }]
     };
 
-    // Add SMS consent if phone provided
-    if (phone) {
-      subscribeData.data.attributes.subscriptions[0].attributes.sms = {
-        marketing: { 
-          consent: 'subscribed',
-          consented_at: new Date().toISOString()
-        }
-      };
-    }
-
-    const response = await fetch('https://a.klaviyo.com/api/profile-subscription-bulk-create-jobs/', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-        'Content-Type': 'application/json',
-        'revision': '2024-10-15'
-      },
-      body: JSON.stringify(subscribeData)
-    });
-
-    if (response.ok) {
-      console.log(`✅ Profile subscription ensured for ${email}`);
-    } else {
-      console.log(`⚠️ Profile ensure warning for ${email}: ${response.status}`);
-      // Try fallback - direct list addition
-      await fallbackEnsureInList(email, firstName, lastName, phone, listId);
-    }
-
-  } catch (error) {
-    console.error(`❌ Error ensuring profile for ${email}:`, error);
-    // Try fallback
-    await fallbackEnsureInList(email, firstName, lastName, phone, listId);
-  }
-}
-
-// Fallback method for list addition
-async function fallbackEnsureInList(email, firstName, lastName, phone, listId) {
-  try {
-    console.log(`🔄 Using fallback method to ensure ${email} in list...`);
-    
     const response = await fetch(`https://a.klaviyo.com/api/lists/${listId}/profiles/`, {
       method: 'POST',
       headers: {
@@ -383,30 +332,18 @@ async function fallbackEnsureInList(email, firstName, lastName, phone, listId) {
         'Content-Type': 'application/json',
         'revision': '2024-10-15'
       },
-      body: JSON.stringify({
-        data: [{
-          type: 'profile',
-          attributes: {
-            email,
-            first_name: firstName,
-            last_name: lastName,
-            phone_number: phone || null,
-            properties: {
-              'Back in Stock Subscriber': true,
-              'Fallback Ensured': new Date().toISOString()
-            }
-          }
-        }]
-      })
+      body: JSON.stringify(listData)
     });
-    
+
     if (response.ok) {
-      console.log(`✅ Fallback: Ensured ${email} in list`);
+      console.log(`✅ Ensured ${email} is in list successfully`);
     } else {
-      console.log(`⚠️ Fallback also had issues for ${email}: ${response.status}`);
+      console.log(`⚠️ List ensure response for ${email}: ${response.status} (may already be in list)`);
     }
+
   } catch (error) {
-    console.log(`⚠️ Fallback error for ${email}:`, error.message);
+    console.log(`⚠️ Error ensuring ${email} in list:`, error.message);
+    // Don't fail the notification - continue anyway
   }
 }
 
