@@ -294,44 +294,74 @@ async function sendKlaviyoBackInStockEvent(email, productName, productUrl, first
   }
 }
 
-// Simplified: Ensure profile is in list using direct method
-async function ensureProfileInList(email, firstName, lastName, phone, listId) {
+// Add to Back in Stock Alert list - triggers flow automatically
+async function addToBackInStockAlertList(email, firstName, lastName, phone, productName, productUrl, alertListId) {
+  if (!KLAVIYO_API_KEY) {
+    console.error('❌ KLAVIYO_API_KEY not set');
+    return false;
+  }
+
   try {
-    console.log(`📋 Ensuring ${email} is in list using working method...`);
+    console.log(`📋 Adding ${email} to back-in-stock alert list for ${productName}...`);
 
-    // Use the same working method as the subscription API
-    let profileId = await createOrGetProfileForNotification(email, firstName, lastName, phone);
-    
-    if (profileId) {
-      console.log(`📋 Adding profile ${profileId} to list ${listId}...`);
+    // Format phone number
+    let formattedPhone = null;
+    if (phone && phone.length > 0) {
+      let cleanPhone = phone.replace(/\D/g, '');
       
-      const addToListData = {
-        data: [{
-          type: 'profile',
-          id: profileId
-        }]
-      };
-
-      const listResponse = await fetch(`https://a.klaviyo.com/api/lists/${listId}/relationships/profiles/`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-          'Content-Type': 'application/json',
-          'revision': '2024-10-15'
-        },
-        body: JSON.stringify(addToListData)
-      });
-
-      if (listResponse.ok || listResponse.status === 204) {
-        console.log(`✅ Ensured ${email} is in list successfully`);
+      if (cleanPhone.startsWith('234')) {
+        formattedPhone = '+' + cleanPhone;
+      } else if (cleanPhone.startsWith('0') && cleanPhone.length === 11) {
+        formattedPhone = '+234' + cleanPhone.substring(1);
+      } else if (cleanPhone.length === 10 && (cleanPhone.startsWith('90') || cleanPhone.startsWith('80') || cleanPhone.startsWith('70'))) {
+        formattedPhone = '+234' + cleanPhone;
+      } else if (cleanPhone.length === 10) {
+        formattedPhone = '+1' + cleanPhone;
       } else {
-        console.log(`⚠️ List ensure response for ${email}: ${listResponse.status}`);
+        formattedPhone = '+' + cleanPhone;
       }
     }
 
+    // Add to alert list with product details as properties
+    const listData = {
+      data: [{
+        type: 'profile',
+        attributes: {
+          email,
+          first_name: firstName,
+          last_name: lastName,
+          properties: {
+            'ProductName': productName,
+            'ProductURL': productUrl,
+            'AlertDate': new Date().toISOString(),
+            'Phone Number': formattedPhone || ''
+          }
+        }
+      }]
+    };
+
+    const response = await fetch(`https://a.klaviyo.com/api/lists/${alertListId}/profiles/`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        'Content-Type': 'application/json',
+        'revision': '2024-10-15'
+      },
+      body: JSON.stringify(listData)
+    });
+    
+    if (response.ok) {
+      console.log(`✅ Added ${email} to back-in-stock alert list for ${productName}`);
+      return true;
+    } else {
+      const errorText = await response.text();
+      console.error(`❌ Failed to add ${email} to alert list:`, errorText);
+      return false;
+    }
+    
   } catch (error) {
-    console.log(`⚠️ Error ensuring ${email} in list:`, error.message);
-    // Don't fail the notification - continue anyway
+    console.error(`❌ Alert list error for ${email}:`, error);
+    return false;
   }
 }
 
@@ -472,23 +502,26 @@ async function auditBundles() {
         (prevStatus === 'understocked' || prevStatus === 'out-of-stock') &&
         status === 'ok'
       ) {
-        console.log(`🔔 Bundle ${bundle.title} is back in stock! Sending notifications...`);
+        console.log(`🔔 Bundle ${bundle.title} is back in stock! Adding subscribers to alert list...`);
         
         const subs = await getSubscribers(bundle.id);
-        const productUrl = `https://${SHOPIFY_STORE.replace('.myshopify.com', '')}.com/products/${bundle.handle}`;
         
         console.log(`📧 Found ${subs.length} subscribers for ${bundle.title}`);
         
+        // Use the environment variable for the alert list
+        const BACK_IN_STOCK_ALERT_LIST_ID = process.env.KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID || 'Tnz7TZ';
+        
         for (let sub of subs) {
           if (sub && !sub.notified) {
-            // Enhanced notification with Subscribe Profiles method
-            const success = await sendKlaviyoBackInStockEvent(
-              sub.email, 
-              bundle.title, 
-              productUrl,
+            // Add them to the alert list instead of sending events
+            const success = await addToBackInStockAlertList(
+              sub.email,
               sub.first_name || '',
               sub.last_name || '',
-              sub.phone || ''
+              sub.phone || '',
+              bundle.title,
+              `https://${SHOPIFY_STORE.replace('.myshopify.com', '')}.com/products/${bundle.handle}`,
+              BACK_IN_STOCK_ALERT_LIST_ID
             );
             
             if (success) {
