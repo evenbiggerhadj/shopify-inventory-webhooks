@@ -30,7 +30,7 @@ export async function OPTIONS(request) {
 export async function POST(request) {
   try {
     const body = await request.json();
-    const { email, product_id, product_title, product_handle, first_name, last_name } = body;
+    const { email, phone, product_id, product_title, product_handle, first_name, last_name } = body;
     
     console.log('📧 Processing back-in-stock subscription:', { 
       email, 
@@ -130,6 +130,7 @@ export async function POST(request) {
       // Add new subscriber
       const newSubscriber = {
         email: email,
+        phone: phone || '',
         product_id: product_id.toString(),
         product_title: product_title || 'Unknown Product',
         product_handle: product_handle || '',
@@ -277,56 +278,109 @@ export async function GET(request) {
   }
 }
 
-// Send subscription confirmation to Klaviyo
+// Enhanced sendSubscriptionConfirmation function with list addition
 async function sendSubscriptionConfirmation(subscriber) {
   if (!KLAVIYO_API_KEY) {
     console.log('ℹ️ No Klaviyo API key - skipping confirmation email');
     return;
   }
 
-  const eventData = {
-    data: {
-      type: 'event',
-      attributes: {
-        properties: {
-          ProductName: subscriber.product_title,
-          ProductID: subscriber.product_id,
-          ProductHandle: subscriber.product_handle,
-          SubscriptionDate: subscriber.subscribed_at,
-          NotificationType: 'Subscription Confirmation'
-        },
-        metric: { 
-          data: { 
-            type: 'metric', 
-            attributes: { name: 'Back in Stock Subscription' } 
-          } 
-        },
-        profile: { 
-          data: { 
-            type: 'profile', 
-            attributes: { 
-              email: subscriber.email,
-              first_name: subscriber.first_name,
-              last_name: subscriber.last_name
+  const BACK_IN_STOCK_LIST_ID = process.env.KLAVIYO_BACK_IN_STOCK_LIST_ID || 'WG9GbK';
+  
+  try {
+    // STEP 1: Add subscriber directly to Klaviyo list (this creates profile automatically)
+    console.log(`📋 Adding ${subscriber.email} to back-in-stock list ${BACK_IN_STOCK_LIST_ID}...`);
+    
+    const listData = {
+      data: [{
+        type: 'profile',
+        attributes: {
+          email: subscriber.email,
+          first_name: subscriber.first_name || '',
+          last_name: subscriber.last_name || '',
+          phone_number: subscriber.phone || '',
+          properties: {
+            'Back in Stock Subscriber': true,
+            'Subscription Source': 'Bundle Notifications',
+            'Last Subscription Date': subscriber.subscribed_at,
+            'Product Subscribed': subscriber.product_title,
+            'Product ID': subscriber.product_id
+          }
+        }
+      }]
+    };
+
+    const listResponse = await fetch(`https://a.klaviyo.com/api/lists/${BACK_IN_STOCK_LIST_ID}/profiles/`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        'Content-Type': 'application/json',
+        'revision': '2024-10-15'
+      },
+      body: JSON.stringify(listData)
+    });
+
+    if (listResponse.ok) {
+      console.log(`✅ Added ${subscriber.email} to back-in-stock list`);
+    } else {
+      const errorText = await listResponse.text();
+      console.log(`⚠️ List add response (${listResponse.status}):`, errorText);
+      // Don't fail - user might already be in list
+    }
+
+    // STEP 2: Send Subscription Confirmation Event (optional)
+    const eventData = {
+      data: {
+        type: 'event',
+        attributes: {
+          properties: {
+            ProductName: subscriber.product_title,
+            ProductID: subscriber.product_id,
+            ProductHandle: subscriber.product_handle,
+            SubscriptionDate: subscriber.subscribed_at,
+            NotificationType: 'Subscription Confirmation',
+            ListID: BACK_IN_STOCK_LIST_ID
+          },
+          metric: { 
+            data: { 
+              type: 'metric', 
+              attributes: { name: 'Back in Stock Subscription' } 
             } 
-          } 
+          },
+          profile: { 
+            data: { 
+              type: 'profile', 
+              attributes: { 
+                email: subscriber.email,
+                first_name: subscriber.first_name,
+                last_name: subscriber.last_name
+              } 
+            } 
+          }
         }
       }
+    };
+
+    const eventResponse = await fetch('https://a.klaviyo.com/api/events/', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        'Content-Type': 'application/json',
+        'revision': '2024-10-15'
+      },
+      body: JSON.stringify(eventData)
+    });
+
+    if (!eventResponse.ok) {
+      const errorText = await eventResponse.text();
+      console.log(`⚠️ Klaviyo event warning (${eventResponse.status}):`, errorText);
+      // Don't throw - list addition is more important
+    } else {
+      console.log(`📧 Klaviyo subscription event sent to ${subscriber.email}`);
     }
-  };
 
-  const response = await fetch('https://a.klaviyo.com/api/events/', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-      'Content-Type': 'application/json',
-      'revision': '2024-10-15'
-    },
-    body: JSON.stringify(eventData)
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Klaviyo API error: ${response.status} ${errorText}`);
+  } catch (error) {
+    console.error('❌ Klaviyo confirmation error:', error);
+    // Don't throw - let the subscription succeed even if Klaviyo fails
   }
 }
