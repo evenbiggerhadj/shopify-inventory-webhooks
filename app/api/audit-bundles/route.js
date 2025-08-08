@@ -223,19 +223,160 @@ async function ensureInBackInStockList(email, firstName = '', lastName = '', pho
   }
 }
 
-// === Enhanced Klaviyo Event Sender ===
-async function sendKlaviyoBackInStockEvent(email, productName, productUrl, firstName = '', lastName = '') {
+// === Enhanced Klaviyo Event Sender with Subscribe Profiles support ===
+async function sendKlaviyoBackInStockEvent(email, productName, productUrl, firstName = '', lastName = '', phone = '') {
   if (!KLAVIYO_API_KEY) {
     console.error('❌ KLAVIYO_API_KEY not set - skipping notification');
     return false;
   }
 
+  const BACK_IN_STOCK_LIST_ID = process.env.KLAVIYO_BACK_IN_STOCK_LIST_ID || 'WG9GbK';
+
   try {
-    // STEP 1: Ensure user is in the back-in-stock list
-    await ensureInBackInStockList(email, firstName, lastName);
+    console.log(`🔔 Sending back-in-stock notification to ${email}...`);
+
+    // STEP 1: Ensure profile exists and is subscribed to list
+    await ensureProfileInList(email, firstName, lastName, phone, BACK_IN_STOCK_LIST_ID);
 
     // STEP 2: Send the back-in-stock event
-    const resp = await fetch('https://a.klaviyo.com/api/events/', {
+    const eventData = {
+      data: {
+        type: 'event',
+        attributes: {
+          properties: {
+            ProductName: productName,
+            ProductURL: productUrl,
+            NotificationType: 'Back in Stock',
+            Timestamp: new Date().toISOString(),
+            ListID: BACK_IN_STOCK_LIST_ID
+          },
+          metric: { 
+            data: { 
+              type: 'metric', 
+              attributes: { name: 'Back in Stock' } 
+            } 
+          },
+          profile: { 
+            data: { 
+              type: 'profile', 
+              attributes: { 
+                email,
+                first_name: firstName,
+                last_name: lastName
+              } 
+            } 
+          }
+        }
+      }
+    };
+
+    const response = await fetch('https://a.klaviyo.com/api/events/', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        'Content-Type': 'application/json',
+        'revision': '2024-10-15'
+      },
+      body: JSON.stringify(eventData)
+    });
+
+    if (response.ok) {
+      console.log(`✅ Back-in-stock notification sent to ${email}`);
+      return true;
+    } else {
+      const errorText = await response.text();
+      console.error(`❌ Back-in-stock event failed (${response.status}):`, errorText);
+      return false;
+    }
+
+  } catch (error) {
+    console.error(`❌ Failed to send notification to ${email}:`, error);
+    return false;
+  }
+}
+
+// Ensure profile is in the back-in-stock list (production-ready)
+async function ensureProfileInList(email, firstName, lastName, phone, listId) {
+  try {
+    console.log(`📋 Ensuring ${email} is properly subscribed to list...`);
+
+    // Use Subscribe Profiles for robust list membership
+    const subscribeData = {
+      data: {
+        type: 'profile-subscription-bulk-create-job',
+        attributes: {
+          profiles: {
+            data: [{
+              type: 'profile',
+              attributes: {
+                email: email,
+                first_name: firstName || '',
+                last_name: lastName || '',
+                phone_number: phone || null,
+                properties: {
+                  'Back in Stock Subscriber': true,
+                  'Profile Ensured': new Date().toISOString()
+                }
+              }
+            }]
+          },
+          subscriptions: [{
+            type: 'list',
+            id: listId,
+            attributes: {
+              email: { 
+                marketing: { 
+                  consent: 'subscribed',
+                  consented_at: new Date().toISOString()
+                } 
+              }
+            }
+          }]
+        }
+      }
+    };
+
+    // Add SMS consent if phone provided
+    if (phone) {
+      subscribeData.data.attributes.subscriptions[0].attributes.sms = {
+        marketing: { 
+          consent: 'subscribed',
+          consented_at: new Date().toISOString()
+        }
+      };
+    }
+
+    const response = await fetch('https://a.klaviyo.com/api/profile-subscription-bulk-create-jobs/', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        'Content-Type': 'application/json',
+        'revision': '2024-10-15'
+      },
+      body: JSON.stringify(subscribeData)
+    });
+
+    if (response.ok) {
+      console.log(`✅ Profile subscription ensured for ${email}`);
+    } else {
+      console.log(`⚠️ Profile ensure warning for ${email}: ${response.status}`);
+      // Try fallback - direct list addition
+      await fallbackEnsureInList(email, firstName, lastName, phone, listId);
+    }
+
+  } catch (error) {
+    console.error(`❌ Error ensuring profile for ${email}:`, error);
+    // Try fallback
+    await fallbackEnsureInList(email, firstName, lastName, phone, listId);
+  }
+}
+
+// Fallback method for list addition
+async function fallbackEnsureInList(email, firstName, lastName, phone, listId) {
+  try {
+    console.log(`🔄 Using fallback method to ensure ${email} in list...`);
+    
+    const response = await fetch(`https://a.klaviyo.com/api/lists/${listId}/profiles/`, {
       method: 'POST',
       headers: {
         'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
@@ -243,49 +384,29 @@ async function sendKlaviyoBackInStockEvent(email, productName, productUrl, first
         'revision': '2024-10-15'
       },
       body: JSON.stringify({
-        data: {
-          type: 'event',
+        data: [{
+          type: 'profile',
           attributes: {
+            email,
+            first_name: firstName,
+            last_name: lastName,
+            phone_number: phone || null,
             properties: {
-              ProductName: productName,
-              ProductURL: productUrl,
-              NotificationType: 'Back in Stock',
-              Timestamp: new Date().toISOString(),
-              ListID: process.env.KLAVIYO_BACK_IN_STOCK_LIST_ID || 'WG9GbK'
-            },
-            metric: { 
-              data: { 
-                type: 'metric', 
-                attributes: { name: 'Back in Stock' } 
-              } 
-            },
-            profile: { 
-              data: { 
-                type: 'profile', 
-                attributes: { 
-                  email,
-                  first_name: firstName,
-                  last_name: lastName
-                } 
-              } 
+              'Back in Stock Subscriber': true,
+              'Fallback Ensured': new Date().toISOString()
             }
           }
-        }
+        }]
       })
     });
-
-    if (!resp.ok) {
-      const err = await resp.text();
-      console.error('❌ Klaviyo event error:', resp.status, err);
-      return false;
+    
+    if (response.ok) {
+      console.log(`✅ Fallback: Ensured ${email} in list`);
+    } else {
+      console.log(`⚠️ Fallback also had issues for ${email}: ${response.status}`);
     }
-
-    console.log(`✅ Sent back-in-stock notification to ${email} for ${productName}`);
-    return true;
-
   } catch (error) {
-    console.error('❌ Failed to send Klaviyo notification:', error);
-    return false;
+    console.log(`⚠️ Fallback error for ${email}:`, error.message);
   }
 }
 
@@ -360,13 +481,14 @@ async function auditBundles() {
         
         for (let sub of subs) {
           if (sub && !sub.notified) {
-            // Enhanced notification with list management
+            // Enhanced notification with Subscribe Profiles method
             const success = await sendKlaviyoBackInStockEvent(
               sub.email, 
               bundle.title, 
               productUrl,
               sub.first_name || '',
-              sub.last_name || ''
+              sub.last_name || '',
+              sub.phone || ''
             );
             
             if (success) {
