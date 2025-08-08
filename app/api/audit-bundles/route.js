@@ -297,53 +297,116 @@ async function sendKlaviyoBackInStockEvent(email, productName, productUrl, first
 // Simplified: Ensure profile is in list using direct method
 async function ensureProfileInList(email, firstName, lastName, phone, listId) {
   try {
-    console.log(`📋 Ensuring ${email} is in list using direct method...`);
+    console.log(`📋 Ensuring ${email} is in list using working method...`);
 
-    // Format phone number properly
-    let formattedPhone = null;
-    if (phone && phone.length > 0) {
-      formattedPhone = phone.trim();
-      if (!formattedPhone.startsWith('+')) {
-        formattedPhone = '+1' + formattedPhone.replace(/\D/g, '');
+    // Use the same working method as the subscription API
+    let profileId = await createOrGetProfileForNotification(email, firstName, lastName, phone);
+    
+    if (profileId) {
+      console.log(`📋 Adding profile ${profileId} to list ${listId}...`);
+      
+      const addToListData = {
+        data: [{
+          type: 'profile',
+          id: profileId
+        }]
+      };
+
+      const listResponse = await fetch(`https://a.klaviyo.com/api/lists/${listId}/relationships/profiles/`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+          'Content-Type': 'application/json',
+          'revision': '2024-10-15'
+        },
+        body: JSON.stringify(addToListData)
+      });
+
+      if (listResponse.ok || listResponse.status === 204) {
+        console.log(`✅ Ensured ${email} is in list successfully`);
+      } else {
+        console.log(`⚠️ List ensure response for ${email}: ${listResponse.status}`);
       }
     }
 
-    // Use the same direct list addition method as the subscription API
-    const listData = {
-      data: [{
+  } catch (error) {
+    console.log(`⚠️ Error ensuring ${email} in list:`, error.message);
+    // Don't fail the notification - continue anyway
+  }
+}
+
+// Create profile for back-in-stock notifications
+async function createOrGetProfileForNotification(email, firstName, lastName, phone) {
+  try {
+    // Format phone number with same logic as subscription API
+    let formattedPhone = null;
+    if (phone && phone.length > 0) {
+      let cleanPhone = phone.replace(/\D/g, '');
+      
+      if (cleanPhone.startsWith('234')) {
+        formattedPhone = '+' + cleanPhone;
+      } else if (cleanPhone.startsWith('0') && cleanPhone.length === 11) {
+        formattedPhone = '+234' + cleanPhone.substring(1);
+      } else if (cleanPhone.length === 10 && (cleanPhone.startsWith('90') || cleanPhone.startsWith('80') || cleanPhone.startsWith('70'))) {
+        formattedPhone = '+234' + cleanPhone;
+      } else if (cleanPhone.length === 10) {
+        formattedPhone = '+1' + cleanPhone;
+      } else {
+        formattedPhone = '+' + cleanPhone;
+      }
+    }
+
+    // Try to create profile (without phone to avoid validation issues)
+    const profileData = {
+      data: {
         type: 'profile',
         attributes: {
           email,
           first_name: firstName || '',
           last_name: lastName || '',
-          phone_number: formattedPhone,
           properties: {
             'Back in Stock Subscriber': true,
+            'Phone Number': formattedPhone || '',
             'Profile Ensured for Notification': new Date().toISOString()
           }
         }
-      }]
+      }
     };
 
-    const response = await fetch(`https://a.klaviyo.com/api/lists/${listId}/profiles/`, {
+    const profileResponse = await fetch('https://a.klaviyo.com/api/profiles/', {
       method: 'POST',
       headers: {
         'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
         'Content-Type': 'application/json',
         'revision': '2024-10-15'
       },
-      body: JSON.stringify(listData)
+      body: JSON.stringify(profileData)
     });
 
-    if (response.ok) {
-      console.log(`✅ Ensured ${email} is in list successfully`);
-    } else {
-      console.log(`⚠️ List ensure response for ${email}: ${response.status} (may already be in list)`);
-    }
+    if (profileResponse.ok) {
+      const result = await profileResponse.json();
+      return result.data.id;
+    } else if (profileResponse.status === 409) {
+      // Profile exists, get the ID
+      const getProfileResponse = await fetch(`https://a.klaviyo.com/api/profiles/?filter=equals(email,"${email}")`, {
+        headers: {
+          'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+          'revision': '2024-10-15'
+        }
+      });
 
+      if (getProfileResponse.ok) {
+        const result = await getProfileResponse.json();
+        if (result.data && result.data.length > 0) {
+          return result.data[0].id;
+        }
+      }
+    }
+    
+    return null;
   } catch (error) {
-    console.log(`⚠️ Error ensuring ${email} in list:`, error.message);
-    // Don't fail the notification - continue anyway
+    console.error('❌ Profile creation error for notification:', error);
+    return null;
   }
 }
 
