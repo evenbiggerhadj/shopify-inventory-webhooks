@@ -1,11 +1,11 @@
-// app/api/audit-bundles/route.js - Bundle audit and notification system
+// app/api/audit-bundles/route.js - FIXED Bundle audit with proper back-in-stock notifications
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
 // Use YOUR actual environment variable names
 const redis = new Redis({
-  url: process.env.KV_REST_API_URL,      // Changed from UPSTASH_REDIS_REST_URL
-  token: process.env.KV_REST_API_TOKEN,  // Changed from UPSTASH_REDIS_REST_TOKEN
+  url: process.env.KV_REST_API_URL,
+  token: process.env.KV_REST_API_TOKEN,
 });
 
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
@@ -14,7 +14,6 @@ const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
 
 // === FIXED Shopify Helper - NO MORE "/pipeline" ERRORS ===
 async function fetchFromShopify(endpoint, method = 'GET', body = null) {
-  // REMOVED the problematic validation that caused "/pipeline" errors
   if (!endpoint || typeof endpoint !== 'string') {
     throw new Error(`fetchFromShopify called with invalid endpoint: "${endpoint}"`);
   }
@@ -120,181 +119,7 @@ async function setSubscribers(productId, subs) {
   await redis.set(`subscribers:${productId}`, subs);
 }
 
-// === Enhanced function to ensure user is in back-in-stock list ===
-async function ensureInBackInStockList(email, firstName = '', lastName = '', phone = '') {
-  if (!KLAVIYO_API_KEY) return false;
-
-  const BACK_IN_STOCK_LIST_ID = process.env.KLAVIYO_BACK_IN_STOCK_LIST_ID || 'WG9GbK';
-
-  try {
-    console.log(`🔍 Ensuring ${email} is in back-in-stock list...`);
-
-    // STEP 1: Get profile ID first
-    const getProfileResponse = await fetch(`https://a.klaviyo.com/api/profiles/?filter=equals(email,"${email}")`, {
-      headers: {
-        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-        'revision': '2024-10-15'
-      }
-    });
-
-    let profileId = null;
-    if (getProfileResponse.ok) {
-      const getProfileResult = await getProfileResponse.json();
-      if (getProfileResult.data && getProfileResult.data.length > 0) {
-        profileId = getProfileResult.data[0].id;
-        console.log(`✅ Found profile ID: ${profileId} for ${email}`);
-      }
-    }
-
-    // STEP 2: If no profile exists, create one
-    if (!profileId) {
-      console.log(`📝 Creating new profile for ${email}...`);
-      
-      const profileData = {
-        data: {
-          type: 'profile',
-          attributes: {
-            email,
-            first_name: firstName,
-            last_name: lastName,
-            phone_number: phone,
-            properties: {
-              'Back in Stock Subscriber': true,
-              'Profile Created for Notification': new Date().toISOString()
-            }
-          }
-        }
-      };
-
-      const createProfileResponse = await fetch('https://a.klaviyo.com/api/profiles/', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-          'Content-Type': 'application/json',
-          'revision': '2024-10-15'
-        },
-        body: JSON.stringify(profileData)
-      });
-
-      if (createProfileResponse.ok) {
-        const createProfileResult = await createProfileResponse.json();
-        profileId = createProfileResult.data.id;
-        console.log(`✅ Created new profile: ${profileId} for ${email}`);
-      } else {
-        const errorText = await createProfileResponse.text();
-        console.error(`❌ Failed to create profile for ${email}:`, errorText);
-        return false;
-      }
-    }
-
-    // STEP 3: Add profile to list using profile ID
-    if (profileId) {
-      const addToListData = {
-        data: [{
-          type: 'profile',
-          id: profileId
-        }]
-      };
-
-      const listResponse = await fetch(`https://a.klaviyo.com/api/lists/${BACK_IN_STOCK_LIST_ID}/relationships/profiles/`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-          'Content-Type': 'application/json',
-          'revision': '2024-10-15'
-        },
-        body: JSON.stringify(addToListData)
-      });
-
-      if (listResponse.ok || listResponse.status === 204) {
-        console.log(`✅ Ensured ${email} is in back-in-stock list`);
-        return true;
-      } else {
-        const errorText = await listResponse.text();
-        console.log(`⚠️ List add response for ${email}: ${listResponse.status} - ${errorText}`);
-        return true; // Might already be in list
-      }
-    }
-
-    return false;
-  } catch (error) {
-    console.error(`❌ Failed to ensure ${email} in list:`, error);
-    return false;
-  }
-}
-
-// === Simplified Klaviyo Event Sender with Direct List Addition ===
-async function sendKlaviyoBackInStockEvent(email, productName, productUrl, firstName = '', lastName = '', phone = '') {
-  if (!KLAVIYO_API_KEY) {
-    console.error('❌ KLAVIYO_API_KEY not set - skipping notification');
-    return false;
-  }
-
-  const BACK_IN_STOCK_LIST_ID = process.env.KLAVIYO_BACK_IN_STOCK_LIST_ID || 'WG9GbK';
-
-  try {
-    console.log(`🔔 Sending back-in-stock notification to ${email}...`);
-
-    // STEP 1: Ensure profile is in list using simple method
-    await ensureProfileInList(email, firstName, lastName, phone, BACK_IN_STOCK_LIST_ID);
-
-    // STEP 2: Send the back-in-stock event
-    const eventData = {
-      data: {
-        type: 'event',
-        attributes: {
-          properties: {
-            ProductName: productName,
-            ProductURL: productUrl,
-            NotificationType: 'Back in Stock',
-            Timestamp: new Date().toISOString()
-          },
-          metric: { 
-            data: { 
-              type: 'metric', 
-              attributes: { name: 'Back in Stock' } 
-            } 
-          },
-          profile: { 
-            data: { 
-              type: 'profile', 
-              attributes: { 
-                email,
-                first_name: firstName,
-                last_name: lastName
-              } 
-            } 
-          }
-        }
-      }
-    };
-
-    const response = await fetch('https://a.klaviyo.com/api/events/', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-        'Content-Type': 'application/json',
-        'revision': '2024-10-15'
-      },
-      body: JSON.stringify(eventData)
-    });
-
-    if (response.ok) {
-      console.log(`✅ Back-in-stock notification sent to ${email}`);
-      return true;
-    } else {
-      const errorText = await response.text();
-      console.error(`❌ Back-in-stock event failed (${response.status}):`, errorText);
-      return false;
-    }
-
-  } catch (error) {
-    console.error(`❌ Failed to send notification to ${email}:`, error);
-    return false;
-  }
-}
-
-// Add to Back in Stock Alert list - triggers flow automatically
+// === FIXED: Use the SAME function as the back-in-stock API ===
 async function addToBackInStockAlertList(email, firstName, lastName, phone, productName, productUrl, alertListId) {
   if (!KLAVIYO_API_KEY) {
     console.error('❌ KLAVIYO_API_KEY not set');
@@ -304,7 +129,7 @@ async function addToBackInStockAlertList(email, firstName, lastName, phone, prod
   try {
     console.log(`📋 Adding ${email} to back-in-stock alert list for ${productName}...`);
 
-    // Format phone number
+    // Format phone number - SAME LOGIC as back-in-stock API
     let formattedPhone = null;
     if (phone && phone.length > 0) {
       let cleanPhone = phone.replace(/\D/g, '');
@@ -322,40 +147,38 @@ async function addToBackInStockAlertList(email, firstName, lastName, phone, prod
       }
     }
 
-    // Add to alert list with product details as properties
-    const listData = {
-      data: [{
-        type: 'profile',
-        attributes: {
-          email,
-          first_name: firstName,
-          last_name: lastName,
-          properties: {
-            'ProductName': productName,
-            'ProductURL': productUrl,
-            'AlertDate': new Date().toISOString(),
-            'Phone Number': formattedPhone || ''
-          }
-        }
-      }]
-    };
-
-    const response = await fetch(`https://a.klaviyo.com/api/lists/${alertListId}/profiles/`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-        'Content-Type': 'application/json',
-        'revision': '2024-10-15'
-      },
-      body: JSON.stringify(listData)
-    });
+    // FIXED: Use the SAME method as back-in-stock API
+    const profileId = await createOrGetProfileForNotification(email, firstName, lastName, formattedPhone);
     
-    if (response.ok) {
-      console.log(`✅ Added ${email} to back-in-stock alert list for ${productName}`);
-      return true;
+    if (profileId) {
+      // Add to alert list using relationships endpoint
+      const addToListData = {
+        data: [{
+          type: 'profile',
+          id: profileId
+        }]
+      };
+
+      const response = await fetch(`https://a.klaviyo.com/api/lists/${alertListId}/relationships/profiles/`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+          'Content-Type': 'application/json',
+          'revision': '2024-10-15'
+        },
+        body: JSON.stringify(addToListData)
+      });
+      
+      if (response.ok || response.status === 204) {
+        console.log(`✅ Added ${email} to back-in-stock alert list for ${productName}`);
+        return true;
+      } else {
+        const errorText = await response.text();
+        console.error(`❌ Failed to add ${email} to alert list:`, errorText);
+        return false;
+      }
     } else {
-      const errorText = await response.text();
-      console.error(`❌ Failed to add ${email} to alert list:`, errorText);
+      console.error(`❌ Could not create/get profile for ${email}`);
       return false;
     }
     
@@ -365,27 +188,9 @@ async function addToBackInStockAlertList(email, firstName, lastName, phone, prod
   }
 }
 
-// Create profile for back-in-stock notifications
+// === FIXED: Create profile function - SAME as back-in-stock API ===
 async function createOrGetProfileForNotification(email, firstName, lastName, phone) {
   try {
-    // Format phone number with same logic as subscription API
-    let formattedPhone = null;
-    if (phone && phone.length > 0) {
-      let cleanPhone = phone.replace(/\D/g, '');
-      
-      if (cleanPhone.startsWith('234')) {
-        formattedPhone = '+' + cleanPhone;
-      } else if (cleanPhone.startsWith('0') && cleanPhone.length === 11) {
-        formattedPhone = '+234' + cleanPhone.substring(1);
-      } else if (cleanPhone.length === 10 && (cleanPhone.startsWith('90') || cleanPhone.startsWith('80') || cleanPhone.startsWith('70'))) {
-        formattedPhone = '+234' + cleanPhone;
-      } else if (cleanPhone.length === 10) {
-        formattedPhone = '+1' + cleanPhone;
-      } else {
-        formattedPhone = '+' + cleanPhone;
-      }
-    }
-
     // Try to create profile (without phone to avoid validation issues)
     const profileData = {
       data: {
@@ -396,7 +201,7 @@ async function createOrGetProfileForNotification(email, firstName, lastName, pho
           last_name: lastName || '',
           properties: {
             'Back in Stock Subscriber': true,
-            'Phone Number': formattedPhone || '',
+            'Phone Number': phone || '',
             'Profile Ensured for Notification': new Date().toISOString()
           }
         }
@@ -497,23 +302,25 @@ async function auditBundles() {
 
       console.log(`📊 ${bundle.title} → ${prevStatus || 'unknown'} → ${status}`);
 
-      // === NOTIFY SUBSCRIBERS IF BUNDLE NOW "ok" ===
+      // === FIXED: NOTIFY SUBSCRIBERS IF BUNDLE NOW "ok" ===
       if (
         (prevStatus === 'understocked' || prevStatus === 'out-of-stock') &&
         status === 'ok'
       ) {
-        console.log(`🔔 Bundle ${bundle.title} is back in stock! Adding subscribers to alert list...`);
+        console.log(`🔔 Bundle ${bundle.title} is back in stock! Processing subscribers...`);
         
         const subs = await getSubscribers(bundle.id);
-        
         console.log(`📧 Found ${subs.length} subscribers for ${bundle.title}`);
         
-        // Use the environment variable for the alert list
+        // FIXED: Use the correct environment variable
         const BACK_IN_STOCK_ALERT_LIST_ID = process.env.KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID || 'Tnz7TZ';
         
+        // FIXED: Process each subscriber correctly
         for (let sub of subs) {
           if (sub && !sub.notified) {
-            // Add them to the alert list instead of sending events
+            console.log(`📋 Processing subscriber: ${sub.email}`);
+            
+            // FIXED: Use the same function as back-in-stock API
             const success = await addToBackInStockAlertList(
               sub.email,
               sub.first_name || '',
@@ -527,14 +334,19 @@ async function auditBundles() {
             if (success) {
               sub.notified = true;
               notificationsSent++;
+              console.log(`✅ Successfully added ${sub.email} to alert list`);
             } else {
               notificationErrors++;
+              console.log(`❌ Failed to add ${sub.email} to alert list`);
             }
           }
         }
+        
+        // Save updated subscribers list
         await setSubscribers(bundle.id, subs);
       }
 
+      // Update product tags
       await updateProductTags(bundle.id, bundle.tags.split(','), status);
 
     } catch (error) {
