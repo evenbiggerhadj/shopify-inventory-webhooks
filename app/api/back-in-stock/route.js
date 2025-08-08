@@ -258,73 +258,29 @@ async function subscribeToKlaviyoList(subscriber) {
   try {
     console.log(`📋 Adding ${subscriber.email} DIRECTLY to list ${BACK_IN_STOCK_LIST_ID}...`);
 
-    // Format phone number properly
+    // Format phone number properly for international numbers
     let formattedPhone = null;
     if (subscriber.phone && subscriber.phone.length > 0) {
       formattedPhone = subscriber.phone.trim();
-      if (!formattedPhone.startsWith('+')) {
-        // Assume US number if no country code
+      
+      // Handle Nigerian numbers specifically
+      if (formattedPhone.startsWith('090') || formattedPhone.startsWith('080') || 
+          formattedPhone.startsWith('070') || formattedPhone.startsWith('081') || 
+          formattedPhone.startsWith('091')) {
+        // Nigerian number - add +234 and remove leading 0
+        formattedPhone = '+234' + formattedPhone.substring(1);
+      } else if (!formattedPhone.startsWith('+')) {
+        // Default to US format for other numbers
         formattedPhone = '+1' + formattedPhone.replace(/\D/g, '');
       }
+      
       console.log(`📱 Phone formatted as: ${formattedPhone}`);
     }
 
-    // METHOD 1: Direct list addition
-    const listData = {
-      data: [{
-        type: 'profile',
-        attributes: {
-          email: subscriber.email,
-          first_name: subscriber.first_name || '',
-          last_name: subscriber.last_name || '',
-          phone_number: formattedPhone,
-          properties: {
-            'Back in Stock Subscriber': true,
-            'Subscription Source': 'Bundle Notifications',
-            'Product Subscribed': subscriber.product_title,
-            'Product ID': subscriber.product_id,
-            'Product Handle': subscriber.product_handle,
-            'Subscribed At': subscriber.subscribed_at,
-            'Direct List Addition': true
-          }
-        }
-      }]
-    };
-
-    console.log('📤 Method 1: Trying direct list addition...');
-    console.log('URL:', `https://a.klaviyo.com/api/lists/${BACK_IN_STOCK_LIST_ID}/profiles/`);
-
-    const response = await fetch(`https://a.klaviyo.com/api/lists/${BACK_IN_STOCK_LIST_ID}/profiles/`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-        'Content-Type': 'application/json',
-        'revision': '2024-10-15'
-      },
-      body: JSON.stringify(listData)
-    });
-
-    console.log('📥 Method 1 response status:', response.status);
-
-    if (response.ok) {
-      console.log(`✅ Method 1 SUCCESS: ${subscriber.email} added directly to list!`);
-      
-      // Send confirmation event after successful list addition
-      setTimeout(() => {
-        sendSubscriptionEvent(subscriber).catch(err => {
-          console.log('⚠️ Event send failed (non-critical):', err.message);
-        });
-      }, 500);
-      
-      return true;
-    } else {
-      const errorText = await response.text();
-      console.error(`❌ Method 1 failed (${response.status}):`, errorText);
-      
-      // METHOD 2: Create profile first, then add to list
-      console.log('🔄 Trying Method 2: Create profile first, then add to list...');
-      return await alternativeListAddition(subscriber, BACK_IN_STOCK_LIST_ID);
-    }
+    // SKIP METHOD 1 - The 405 error shows this endpoint doesn't work
+    // Go directly to Method 2: Create profile first, then add to list
+    console.log('📋 Using Method 2: Create profile first, then add to list...');
+    return await alternativeListAddition(subscriber, BACK_IN_STOCK_LIST_ID);
 
   } catch (error) {
     console.error('❌ Method 1 Network Error:', error.message);
@@ -383,19 +339,27 @@ async function alternativeListAddition(subscriber, listId) {
   }
 }
 
-// Create or get profile ID
+// Create or get profile ID - FIXED for phone number issues
 async function createOrGetProfile(subscriber) {
   try {
-    // Format phone number
+    // Format phone number with better international support
     let formattedPhone = null;
     if (subscriber.phone && subscriber.phone.length > 0) {
       formattedPhone = subscriber.phone.trim();
-      if (!formattedPhone.startsWith('+')) {
+      
+      // Handle Nigerian numbers specifically  
+      if (formattedPhone.startsWith('090') || formattedPhone.startsWith('080') || 
+          formattedPhone.startsWith('070') || formattedPhone.startsWith('081') || 
+          formattedPhone.startsWith('091')) {
+        // Nigerian number - add +234 and remove leading 0
+        formattedPhone = '+234' + formattedPhone.substring(1);
+      } else if (!formattedPhone.startsWith('+')) {
+        // Default to US format for other numbers
         formattedPhone = '+1' + formattedPhone.replace(/\D/g, '');
       }
     }
 
-    // Try to create profile
+    // Try creating profile WITHOUT phone first (to avoid SMS validation issues)
     const profileData = {
       data: {
         type: 'profile',
@@ -403,17 +367,18 @@ async function createOrGetProfile(subscriber) {
           email: subscriber.email,
           first_name: subscriber.first_name || '',
           last_name: subscriber.last_name || '',
-          phone_number: formattedPhone,
+          // Skip phone_number initially to avoid validation issues
           properties: {
             'Back in Stock Subscriber': true,
             'Subscription Source': 'Bundle Notifications',
-            'Product Subscribed': subscriber.product_title
+            'Product Subscribed': subscriber.product_title,
+            'Phone Number': formattedPhone || '' // Store as property instead
           }
         }
       }
     };
 
-    console.log(`📝 Method 2: Creating profile for ${subscriber.email}...`);
+    console.log(`📝 Creating profile for ${subscriber.email} (without phone in main field)...`);
 
     const profileResponse = await fetch('https://a.klaviyo.com/api/profiles/', {
       method: 'POST',
@@ -425,13 +390,15 @@ async function createOrGetProfile(subscriber) {
       body: JSON.stringify(profileData)
     });
 
+    console.log(`📥 Profile creation response status: ${profileResponse.status}`);
+
     if (profileResponse.ok) {
       const result = await profileResponse.json();
-      console.log(`✅ Method 2: Profile created with ID ${result.data.id}`);
+      console.log(`✅ Profile created with ID ${result.data.id}`);
       return result.data.id;
     } else if (profileResponse.status === 409) {
       // Profile exists, get the ID
-      console.log(`ℹ️ Method 2: Profile exists, getting ID for ${subscriber.email}...`);
+      console.log(`ℹ️ Profile exists, getting ID for ${subscriber.email}...`);
       
       const getProfileResponse = await fetch(`https://a.klaviyo.com/api/profiles/?filter=equals(email,"${subscriber.email}")`, {
         headers: {
@@ -443,18 +410,18 @@ async function createOrGetProfile(subscriber) {
       if (getProfileResponse.ok) {
         const result = await getProfileResponse.json();
         if (result.data && result.data.length > 0) {
-          console.log(`✅ Method 2: Found existing profile ID ${result.data[0].id}`);
+          console.log(`✅ Found existing profile ID ${result.data[0].id}`);
           return result.data[0].id;
         }
       }
     } else {
       const errorText = await profileResponse.text();
-      console.error(`❌ Method 2: Profile creation failed (${profileResponse.status}):`, errorText);
+      console.error(`❌ Profile creation failed (${profileResponse.status}):`, errorText);
     }
     
     return null;
   } catch (error) {
-    console.error('❌ Method 2: Profile creation error:', error);
+    console.error('❌ Profile creation error:', error);
     return null;
   }
 }
