@@ -278,7 +278,7 @@ export async function GET(request) {
   }
 }
 
-// Enhanced sendSubscriptionConfirmation function with list addition
+// Enhanced sendSubscriptionConfirmation function with proper profile creation and list addition
 async function sendSubscriptionConfirmation(subscriber) {
   if (!KLAVIYO_API_KEY) {
     console.log('ℹ️ No Klaviyo API key - skipping confirmation email');
@@ -288,11 +288,11 @@ async function sendSubscriptionConfirmation(subscriber) {
   const BACK_IN_STOCK_LIST_ID = process.env.KLAVIYO_BACK_IN_STOCK_LIST_ID || 'WG9GbK';
   
   try {
-    // STEP 1: Add subscriber directly to Klaviyo list (this creates profile automatically)
-    console.log(`📋 Adding ${subscriber.email} to back-in-stock list ${BACK_IN_STOCK_LIST_ID}...`);
-    
-    const listData = {
-      data: [{
+    console.log(`🔍 Processing Klaviyo subscription for ${subscriber.email}...`);
+
+    // STEP 1: Create or update profile first
+    const profileData = {
+      data: {
         type: 'profile',
         attributes: {
           email: subscriber.email,
@@ -307,28 +307,80 @@ async function sendSubscriptionConfirmation(subscriber) {
             'Product ID': subscriber.product_id
           }
         }
-      }]
+      }
     };
 
-    const listResponse = await fetch(`https://a.klaviyo.com/api/lists/${BACK_IN_STOCK_LIST_ID}/profiles/`, {
+    console.log(`📝 Creating/updating profile for ${subscriber.email}...`);
+    const profileResponse = await fetch('https://a.klaviyo.com/api/profiles/', {
       method: 'POST',
       headers: {
         'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
         'Content-Type': 'application/json',
         'revision': '2024-10-15'
       },
-      body: JSON.stringify(listData)
+      body: JSON.stringify(profileData)
     });
 
-    if (listResponse.ok) {
-      console.log(`✅ Added ${subscriber.email} to back-in-stock list`);
+    let profileId = null;
+    if (profileResponse.ok) {
+      const profileResult = await profileResponse.json();
+      profileId = profileResult.data.id;
+      console.log(`✅ Profile created/updated: ${profileId}`);
+    } else if (profileResponse.status === 409) {
+      // Profile already exists, need to get the profile ID
+      console.log(`ℹ️ Profile already exists for ${subscriber.email}, fetching profile ID...`);
+      
+      const getProfileResponse = await fetch(`https://a.klaviyo.com/api/profiles/?filter=equals(email,"${subscriber.email}")`, {
+        headers: {
+          'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+          'revision': '2024-10-15'
+        }
+      });
+
+      if (getProfileResponse.ok) {
+        const getProfileResult = await getProfileResponse.json();
+        if (getProfileResult.data && getProfileResult.data.length > 0) {
+          profileId = getProfileResult.data[0].id;
+          console.log(`✅ Found existing profile ID: ${profileId}`);
+        }
+      }
     } else {
-      const errorText = await listResponse.text();
-      console.log(`⚠️ List add response (${listResponse.status}):`, errorText);
-      // Don't fail - user might already be in list
+      const errorText = await profileResponse.text();
+      console.error(`❌ Profile creation failed (${profileResponse.status}):`, errorText);
     }
 
-    // STEP 2: Send Subscription Confirmation Event (optional)
+    // STEP 2: Add profile to list using profile ID
+    if (profileId) {
+      console.log(`📋 Adding profile ${profileId} to list ${BACK_IN_STOCK_LIST_ID}...`);
+      
+      const addToListData = {
+        data: [{
+          type: 'profile',
+          id: profileId
+        }]
+      };
+
+      const listResponse = await fetch(`https://a.klaviyo.com/api/lists/${BACK_IN_STOCK_LIST_ID}/relationships/profiles/`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+          'Content-Type': 'application/json',
+          'revision': '2024-10-15'
+        },
+        body: JSON.stringify(addToListData)
+      });
+
+      if (listResponse.ok || listResponse.status === 204) {
+        console.log(`✅ Successfully added ${subscriber.email} to back-in-stock list`);
+      } else {
+        const listErrorText = await listResponse.text();
+        console.error(`❌ Failed to add to list (${listResponse.status}):`, listErrorText);
+      }
+    } else {
+      console.error(`❌ No profile ID available, cannot add to list`);
+    }
+
+    // STEP 3: Send Subscription Confirmation Event (optional)
     const eventData = {
       data: {
         type: 'event',
@@ -371,13 +423,14 @@ async function sendSubscriptionConfirmation(subscriber) {
       body: JSON.stringify(eventData)
     });
 
-    if (!eventResponse.ok) {
-      const errorText = await eventResponse.text();
-      console.log(`⚠️ Klaviyo event warning (${eventResponse.status}):`, errorText);
-      // Don't throw - list addition is more important
+    if (eventResponse.ok) {
+      console.log(`📧 Subscription event sent to ${subscriber.email}`);
     } else {
-      console.log(`📧 Klaviyo subscription event sent to ${subscriber.email}`);
+      const eventErrorText = await eventResponse.text();
+      console.log(`⚠️ Subscription event warning (${eventResponse.status}):`, eventErrorText);
     }
+
+    console.log(`✅ Klaviyo processing complete for ${subscriber.email}`);
 
   } catch (error) {
     console.error('❌ Klaviyo confirmation error:', error);

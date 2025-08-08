@@ -127,40 +127,96 @@ async function ensureInBackInStockList(email, firstName = '', lastName = '', pho
   const BACK_IN_STOCK_LIST_ID = process.env.KLAVIYO_BACK_IN_STOCK_LIST_ID || 'WG9GbK';
 
   try {
-    const listData = {
-      data: [{
-        type: 'profile',
-        attributes: {
-          email,
-          first_name: firstName,
-          last_name: lastName,
-          phone_number: phone,
-          properties: {
-            'Back in Stock Subscriber': true,
-            'Profile Ensured': new Date().toISOString()
-          }
-        }
-      }]
-    };
+    console.log(`🔍 Ensuring ${email} is in back-in-stock list...`);
 
-    const response = await fetch(`https://a.klaviyo.com/api/lists/${BACK_IN_STOCK_LIST_ID}/profiles/`, {
-      method: 'POST',
+    // STEP 1: Get profile ID first
+    const getProfileResponse = await fetch(`https://a.klaviyo.com/api/profiles/?filter=equals(email,"${email}")`, {
       headers: {
         'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-        'Content-Type': 'application/json',
         'revision': '2024-10-15'
-      },
-      body: JSON.stringify(listData)
+      }
     });
 
-    if (response.ok || response.status === 409) { // 409 = already exists
-      console.log(`✅ Ensured ${email} is in back-in-stock list`);
-      return true;
-    } else {
-      const errorText = await response.text();
-      console.log(`⚠️ List ensure response for ${email}: ${response.status} - ${errorText}`);
-      return true; // Assume success to continue with notification
+    let profileId = null;
+    if (getProfileResponse.ok) {
+      const getProfileResult = await getProfileResponse.json();
+      if (getProfileResult.data && getProfileResult.data.length > 0) {
+        profileId = getProfileResult.data[0].id;
+        console.log(`✅ Found profile ID: ${profileId} for ${email}`);
+      }
     }
+
+    // STEP 2: If no profile exists, create one
+    if (!profileId) {
+      console.log(`📝 Creating new profile for ${email}...`);
+      
+      const profileData = {
+        data: {
+          type: 'profile',
+          attributes: {
+            email,
+            first_name: firstName,
+            last_name: lastName,
+            phone_number: phone,
+            properties: {
+              'Back in Stock Subscriber': true,
+              'Profile Created for Notification': new Date().toISOString()
+            }
+          }
+        }
+      };
+
+      const createProfileResponse = await fetch('https://a.klaviyo.com/api/profiles/', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+          'Content-Type': 'application/json',
+          'revision': '2024-10-15'
+        },
+        body: JSON.stringify(profileData)
+      });
+
+      if (createProfileResponse.ok) {
+        const createProfileResult = await createProfileResponse.json();
+        profileId = createProfileResult.data.id;
+        console.log(`✅ Created new profile: ${profileId} for ${email}`);
+      } else {
+        const errorText = await createProfileResponse.text();
+        console.error(`❌ Failed to create profile for ${email}:`, errorText);
+        return false;
+      }
+    }
+
+    // STEP 3: Add profile to list using profile ID
+    if (profileId) {
+      const addToListData = {
+        data: [{
+          type: 'profile',
+          id: profileId
+        }]
+      };
+
+      const listResponse = await fetch(`https://a.klaviyo.com/api/lists/${BACK_IN_STOCK_LIST_ID}/relationships/profiles/`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+          'Content-Type': 'application/json',
+          'revision': '2024-10-15'
+        },
+        body: JSON.stringify(addToListData)
+      });
+
+      if (listResponse.ok || listResponse.status === 204) {
+        console.log(`✅ Ensured ${email} is in back-in-stock list`);
+        return true;
+      } else {
+        const errorText = await listResponse.text();
+        console.log(`⚠️ List add response for ${email}: ${listResponse.status} - ${errorText}`);
+        return true; // Might already be in list
+      }
+    }
+
+    return false;
   } catch (error) {
     console.error(`❌ Failed to ensure ${email} in list:`, error);
     return false;
