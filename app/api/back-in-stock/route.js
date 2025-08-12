@@ -1,4 +1,4 @@
-// app/api/back-in-stock/route.js - COMPLETELY FIXED for Klaviyo integration
+// app/api/back-in-stock/route.js - COMPLETE with US phone number support
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
@@ -136,10 +136,10 @@ export async function POST(request) {
       });
     }
 
-    // Format phone number properly
+    // Format phone number properly for US/Canadian numbers
     let formattedPhone = null;
     if (phone && phone.trim().length > 0) {
-      formattedPhone = formatPhoneNumber(phone.trim());
+      formattedPhone = formatPhoneNumberUS(phone.trim());
       console.log(`📱 Phone formatted as: ${formattedPhone}`);
     }
 
@@ -340,35 +340,37 @@ export async function GET(request) {
   }
 }
 
-// Phone number formatting function
-function formatPhoneNumber(phone) {
+// FIXED: Phone number formatting for US/Canadian numbers
+function formatPhoneNumberUS(phone) {
   if (!phone) return null;
   
   // Remove all non-digit characters
   let cleanPhone = phone.replace(/\D/g, '');
   
-  // Handle Nigerian numbers
-  if (cleanPhone.startsWith('234')) {
-    return '+' + cleanPhone;
-  } else if (cleanPhone.startsWith('0') && cleanPhone.length === 11) {
-    // Nigerian number starting with 0
-    return '+234' + cleanPhone.substring(1);
-  } else if (cleanPhone.length === 10 && /^[789]/.test(cleanPhone)) {
-    // 10-digit Nigerian number starting with 7, 8, or 9
-    return '+234' + cleanPhone;
-  } else if (cleanPhone.length === 10) {
-    // US number
+  // Handle US/Canadian numbers (prioritize these)
+  if (cleanPhone.length === 10) {
+    // 10-digit number - assume US/Canadian
     return '+1' + cleanPhone;
   } else if (cleanPhone.length === 11 && cleanPhone.startsWith('1')) {
-    // US number with country code
+    // 11-digit number starting with 1 - US/Canadian with country code
     return '+' + cleanPhone;
-  } else {
-    // Default: add + if not present
-    return cleanPhone.startsWith('+') ? cleanPhone : '+' + cleanPhone;
+  } else if (cleanPhone.startsWith('1') && cleanPhone.length === 11) {
+    // Explicitly US/Canadian
+    return '+' + cleanPhone;
   }
+  
+  // For any other case, default to US format
+  else if (cleanPhone.length >= 10) {
+    // Take last 10 digits and add +1
+    const last10 = cleanPhone.slice(-10);
+    return '+1' + last10;
+  }
+  
+  // Fallback - add +1 prefix
+  return '+1' + cleanPhone;
 }
 
-// COMPLETELY FIXED: Add to WAITLIST properly using correct Klaviyo method
+// Add to WAITLIST properly using correct Klaviyo method
 async function addToWaitlistProperly(subscriber, waitlistId) {
   if (!KLAVIYO_API_KEY) {
     console.log('❌ No KLAVIYO_API_KEY found');
@@ -430,7 +432,7 @@ async function addToWaitlistProperly(subscriber, waitlistId) {
   }
 }
 
-// FIXED: Create or get profile without subscriptions field
+// Create or get profile without subscriptions field
 async function createOrGetProfile(subscriber) {
   try {
     // Simple profile creation without problematic fields

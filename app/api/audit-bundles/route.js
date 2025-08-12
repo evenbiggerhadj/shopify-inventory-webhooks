@@ -1,4 +1,4 @@
-// app/api/audit-bundles/route.js - COMPLETELY FIXED for Alert List
+// app/api/audit-bundles/route.js - COMPLETE with US phone number support
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
@@ -144,28 +144,37 @@ async function setSubscribers(productId, subs) {
   await redis.set(`subscribers:${productId}`, subs);
 }
 
-// === Phone formatting function ===
-function formatPhoneNumber(phone) {
+// === FIXED: Phone formatting for US/Canadian numbers ===
+function formatPhoneNumberUS(phone) {
   if (!phone) return null;
   
+  // Remove all non-digit characters
   let cleanPhone = phone.replace(/\D/g, '');
   
-  if (cleanPhone.startsWith('234')) {
-    return '+' + cleanPhone;
-  } else if (cleanPhone.startsWith('0') && cleanPhone.length === 11) {
-    return '+234' + cleanPhone.substring(1);
-  } else if (cleanPhone.length === 10 && /^[789]/.test(cleanPhone)) {
-    return '+234' + cleanPhone;
-  } else if (cleanPhone.length === 10) {
+  // Handle US/Canadian numbers (prioritize these)
+  if (cleanPhone.length === 10) {
+    // 10-digit number - assume US/Canadian
     return '+1' + cleanPhone;
   } else if (cleanPhone.length === 11 && cleanPhone.startsWith('1')) {
+    // 11-digit number starting with 1 - US/Canadian with country code
     return '+' + cleanPhone;
-  } else {
-    return cleanPhone.startsWith('+') ? cleanPhone : '+' + cleanPhone;
+  } else if (cleanPhone.startsWith('1') && cleanPhone.length === 11) {
+    // Explicitly US/Canadian
+    return '+' + cleanPhone;
   }
+  
+  // For any other case, default to US format
+  else if (cleanPhone.length >= 10) {
+    // Take last 10 digits and add +1
+    const last10 = cleanPhone.slice(-10);
+    return '+1' + last10;
+  }
+  
+  // Fallback - add +1 prefix
+  return '+1' + cleanPhone;
 }
 
-// === FIXED: Add to ALERT LIST (when item is back in stock) ===
+// === Add to ALERT LIST (when item is back in stock) ===
 async function addToAlertListProperly(subscriber, productName, productUrl, alertListId) {
   try {
     console.log(`📋 Adding ${subscriber.email} to ALERT LIST ${alertListId} properly...`);
@@ -334,9 +343,9 @@ async function updateAlertProfileWithPhone(profileId, phone) {
   }
 }
 
-// === MAIN Audit Script with FIXED ALERT LIST Integration ===
+// === MAIN Audit Script with US Phone Support ===
 async function auditBundles() {
-  console.log('🔍 Starting bundle audit process with FIXED two-list SMS support...');
+  console.log('🔍 Starting bundle audit process with US phone support and two-list SMS...');
   
   const startTime = Date.now();
   const bundles = await getProductsTaggedBundle();
@@ -399,12 +408,12 @@ async function auditBundles() {
 
       console.log(`📊 ${bundle.title} → ${prevStatus || 'unknown'} → ${status}`);
 
-      // === FIXED: NOTIFY SUBSCRIBERS IF BUNDLE NOW "ok" - USES ALERT LIST ===
+      // === NOTIFY SUBSCRIBERS IF BUNDLE NOW "ok" - USES ALERT LIST ===
       if (
         (prevStatus === 'understocked' || prevStatus === 'out-of-stock') &&
         status === 'ok'
       ) {
-        console.log(`🔔 Bundle ${bundle.title} is back in stock! Processing subscribers with FIXED method...`);
+        console.log(`🔔 Bundle ${bundle.title} is back in stock! Processing subscribers with US phone support...`);
         
         const subs = await getSubscribers(bundle.id);
         console.log(`📧 Found ${subs.length} subscribers for ${bundle.title}`);
@@ -418,7 +427,13 @@ async function auditBundles() {
             subscribersBatchCount++;
             console.log(`📋 Processing subscriber ${subscribersBatchCount}/${subs.filter(s => s && !s.notified).length}: ${sub.email}`);
             
-            // Use FIXED method to add to ALERT LIST
+            // Format phone number for US if needed
+            if (sub.phone && !sub.phone.startsWith('+')) {
+              sub.phone = formatPhoneNumberUS(sub.phone);
+              console.log(`📱 Reformatted phone to: ${sub.phone}`);
+            }
+            
+            // Use proper method to add to ALERT LIST
             const success = await addToAlertListProperly(
               sub,
               bundle.title,
@@ -432,7 +447,7 @@ async function auditBundles() {
               
               if (sub.sms_consent && sub.phone) {
                 smsNotificationsSent++;
-                console.log(`✅ Added ${sub.email} to ALERT LIST - back-in-stock flow should trigger (SMS enabled)!`);
+                console.log(`✅ Added ${sub.email} to ALERT LIST - back-in-stock flow should trigger (SMS enabled to ${sub.phone})!`);
               } else {
                 console.log(`✅ Added ${sub.email} to ALERT LIST - back-in-stock flow should trigger (email only)!`);
               }
@@ -469,7 +484,7 @@ async function auditBundles() {
 
   const totalTime = (Date.now() - startTime) / 1000;
   
-  console.log(`\n✅ FIXED Audit complete with proper two-list system!`);
+  console.log(`\n✅ US Phone Audit complete with proper two-list system!`);
   console.log(`📦 Bundles processed: ${bundlesProcessed}`);
   console.log(`📧 Email notifications sent: ${notificationsSent}`);
   console.log(`📱 SMS notifications sent: ${smsNotificationsSent}`);
@@ -486,18 +501,18 @@ async function auditBundles() {
     apiCallsCount,
     avgApiCallRate: apiCallsCount / totalTime,
     timestamp: new Date().toISOString(),
-    system: 'FIXED Two-List (Waitlist + Alert List)'
+    system: 'US Phone Two-List (Waitlist + Alert List)'
   };
 }
 
 export async function GET() {
   try {
-    console.log('🚀 Starting FIXED bundle audit with proper two-list SMS support...');
+    console.log('🚀 Starting US phone bundle audit with proper two-list SMS support...');
     const results = await auditBundles();
     
     return NextResponse.json({ 
       success: true, 
-      message: 'FIXED Audit complete - proper Klaviyo integration with waitlist and alert lists.',
+      message: 'US Phone Audit complete - proper Klaviyo integration with waitlist and alert lists.',
       ...results
     });
   } catch (error) {
