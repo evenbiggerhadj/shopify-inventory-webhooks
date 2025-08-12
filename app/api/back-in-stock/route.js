@@ -1,210 +1,283 @@
-// app/api/back-in-stock/route.js - Production-ready subscription handler with DIRECT LIST ADDITION
+// app/api/back-in-stock/route.js
+// Back-in-stock subscription + Klaviyo list add + SMS consent (E.164) + audit trail
+
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
+/* =========================
+   ENV + REDIS
+   ========================= */
 const redis = new Redis({
   url: process.env.KV_REST_API_URL,
   token: process.env.KV_REST_API_TOKEN,
-  retry: {
-    retries: 3,
-    retryDelayOnFailover: 100,
-  }
+  retry: { retries: 3, retryDelayOnFailover: 100 }
 });
 
 const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
-const BACK_IN_STOCK_LIST_ID = process.env.KLAVIYO_BACK_IN_STOCK_LIST_ID || 'WG9GbK';
+const BACK_IN_STOCK_LIST_ID = process.env.KLAVIYO_BACK_IN_STOCK_LIST_ID; // required
+const ALLOW_ORIGIN = '*'; // set to your storefront domain if you want to lock it down
 
-// Handle CORS preflight requests
-export async function OPTIONS(request) {
-  return new NextResponse(null, {
-    status: 200,
+/* =========================
+   UTILITIES
+   ========================= */
+function jsonRes(body, status = 200, extraHeaders = {}) {
+  return new NextResponse(JSON.stringify(body), {
+    status,
     headers: {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    },
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': ALLOW_ORIGIN,
+      ...extraHeaders
+    }
   });
 }
 
-// Handle subscription requests (form submissions)
-export async function POST(request) {
-  try {
-    const body = await request.json();
-    const { email, phone, product_id, product_title, product_handle, first_name, last_name } = body;
-    
-    console.log('🚀 Processing back-in-stock subscription:', { 
-      email, 
-      product_id, 
-      product_title,
-      has_phone: !!phone,
-      timestamp: new Date().toISOString()
-    });
-    
-    // Validation
-    if (!email || !product_id) {
-      console.error('❌ Missing required fields:', { email: !!email, product_id: !!product_id });
-      return NextResponse.json({ 
-        success: false, 
-        error: 'Missing required fields: email and product_id' 
-      }, { 
-        status: 400,
-        headers: { 'Access-Control-Allow-Origin': '*' }
-      });
-    }
+function parseFullName(full) {
+  if (!full) return { first: '', last: '' };
+  const parts = String(full).trim().split(/\s+/);
+  if (parts.length === 1) return { first: parts[0], last: '' };
+  const first = parts.slice(0, -1).join(' ');
+  const last = parts.slice(-1).join(' ');
+  return { first, last };
+}
 
-    // Validate email format
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-      console.error('❌ Invalid email format:', email);
-      return NextResponse.json({ 
-        success: false, 
-        error: 'Invalid email format' 
-      }, { 
-        status: 400,
-        headers: { 'Access-Control-Allow-Origin': '*' }
-      });
-    }
+// Very light E.164 formatter (handles common US & NG cases and generic "+")
+function formatPhoneE164(raw) {
+  if (!raw) return null;
+  let v = String(raw).replace(/[^\d+]/g, '');
 
-    // Test Redis connection
-    try {
-      await redis.ping();
-      console.log('✅ Redis connection successful');
-    } catch (redisTestError) {
-      console.error('❌ Redis connection failed:', redisTestError);
-      return NextResponse.json({
-        success: false,
-        error: 'Database connection failed. Please try again.',
-      }, { 
-        status: 500,
-        headers: { 'Access-Control-Allow-Origin': '*' }
-      });
-    }
+  // Already looks like E.164
+  if (v.startsWith('+') && v.length >= 8) return v;
 
-    // Get existing subscribers
-    const key = `subscribers:${product_id}`;
-    let subscribers = [];
-    
-    try {
-      const existingSubscribers = await redis.get(key);
-      if (existingSubscribers) {
-        if (typeof existingSubscribers === 'string') {
-          subscribers = JSON.parse(existingSubscribers);
-        } else if (Array.isArray(existingSubscribers)) {
-          subscribers = existingSubscribers;
+  // Nigeria local leading 0 -> +234
+  if (/^0\d{10}$/.test(v)) return '+234' + v.slice(1);
+
+  // Nigeria 10-digit starting 70/80/90/81/91 -> +234
+  if (/^(70|80|90|81|91)\d{8}$/.test(v)) return '+234' + v;
+
+  // US/Canada 10-digit -> +1
+  if (/^\d{10}$/.test(v)) return '+1' + v;
+
+  // If it’s 11-15 digits without +, assume user included country code
+  if (/^\d{11,15}$/.test(v)) return '+' + v;
+
+  return null; // invalid/unhandled
+}
+
+async function klaviyoFetch(url, { method = 'GET', body, headers = {} } = {}) {
+  if (!KLAVIYO_API_KEY) {
+    throw new Error('KLAVIYO_API_KEY not configured');
+  }
+  return fetch(url, {
+    method,
+    headers: {
+      'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+      'Content-Type': 'application/json',
+      'revision': '2024-10-15',
+      ...headers
+    },
+    body
+  });
+}
+
+/* =========================
+   KLAVIYO HELPERS
+   ========================= */
+
+// Create (or get existing) profile; we avoid setting phone_number here to dodge strict validations
+async function createOrGetProfile({ email, first_name = '', last_name = '', properties = {} }) {
+  // Try create
+  const createPayload = {
+    data: {
+      type: 'profile',
+      attributes: {
+        email,
+        first_name,
+        last_name,
+        properties
+      }
+    }
+  };
+
+  let res = await klaviyoFetch('https://a.klaviyo.com/api/profiles/', {
+    method: 'POST',
+    body: JSON.stringify(createPayload)
+  });
+
+  if (res.ok) {
+    const j = await res.json();
+    return j?.data?.id || null;
+  }
+
+  // If profile exists, pull it
+  if (res.status === 409) {
+    res = await klaviyoFetch(
+      `https://a.klaviyo.com/api/profiles/?filter=equals(email,"${encodeURIComponent(email)}")`
+    );
+    if (res.ok) {
+      const j = await res.json();
+      return j?.data?.[0]?.id || null;
+    }
+  }
+
+  // Some other failure
+  const t = await res.text();
+  console.warn('createOrGetProfile failed:', res.status, t);
+  return null;
+}
+
+// Add an existing profile (by ID) to a list
+async function addToListByProfileId({ listId, profileId }) {
+  return klaviyoFetch(`https://a.klaviyo.com/api/lists/${listId}/relationships/profiles/`, {
+    method: 'POST',
+    body: JSON.stringify({ data: [{ type: 'profile', id: profileId }] })
+  });
+}
+
+// Set SMS marketing consent + phone number (PATCH profile)
+async function setSmsMarketingConsent({ profileId, phoneE164, method = 'Back in Stock Modal', ip }) {
+  const payload = {
+    data: {
+      type: 'profile',
+      id: profileId,
+      attributes: {
+        phone_number: phoneE164,
+        subscriptions: {
+          sms: {
+            marketing: {
+              consent: true,
+              // Klaviyo accepts ISO timestamps; include optional metadata
+              consented_at: new Date().toISOString(),
+              method,
+              ip
+            }
+          }
         }
       }
-    } catch (getError) {
-      console.log('⚠️ Error getting subscribers, starting fresh:', getError);
-      subscribers = [];
     }
-    
-    console.log(`📊 Current subscribers for product ${product_id}: ${subscribers.length}`);
-    
-    // Check if user is already subscribed
-    const existingSubscriber = subscribers.find(sub => sub && sub.email === email);
-    
-    if (existingSubscriber) {
-      console.log(`ℹ️ User ${email} already subscribed to product ${product_id}`);
-      return NextResponse.json({ 
-        success: true, 
-        message: 'You are already subscribed to notifications for this product',
-        alreadySubscribed: true,
-        subscriber_count: subscribers.length
-      }, {
-        headers: { 'Access-Control-Allow-Origin': '*' }
-      });
+  };
+
+  return klaviyoFetch(`https://a.klaviyo.com/api/profiles/${profileId}/`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload)
+  });
+}
+
+// Store human-readable proof in profile.properties for UI visibility
+async function storeSmsConsentProof({ profileId, phoneE164, ip, consentText }) {
+  if (!profileId) return;
+  const props = {
+    'SMS Consent': true,
+    'SMS Consent Timestamp': new Date().toISOString(),
+    'SMS Consent IP': ip || '',
+    'SMS Consent Text':
+      consentText ||
+      'I agree to receive SMS updates about this waitlist and back-in-stock alerts. Msg & data rates may apply. Reply STOP to opt out.',
+    'Phone (E164)': phoneE164 || ''
+  };
+
+  const payload = {
+    data: {
+      type: 'profile',
+      id: profileId,
+      attributes: { properties: props }
     }
+  };
 
-    // Create new subscriber object
-    const newSubscriber = {
-      email: email,
-      phone: phone || '',
-      product_id: product_id.toString(),
-      product_title: product_title || 'Unknown Product',
-      product_handle: product_handle || '',
-      first_name: first_name || '',
-      last_name: last_name || '',
-      notified: false,
-      subscribed_at: new Date().toISOString(),
-      ip_address: request.headers.get('x-forwarded-for') || 
-                  request.headers.get('x-real-ip') || 'unknown'
-    };
+  const res = await klaviyoFetch(`https://a.klaviyo.com/api/profiles/${profileId}/`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload)
+  });
 
-    // Add to subscribers list
-    subscribers.push(newSubscriber);
-    
-    // Save to Redis
-    try {
-      await redis.set(key, subscribers, { ex: 30 * 24 * 60 * 60 }); // 30 days expiry
-      console.log(`✅ Saved ${subscribers.length} subscribers to Redis for product ${product_id}`);
-    } catch (setError) {
-      console.error('❌ Error saving to Redis:', setError);
-      return NextResponse.json({
-        success: false,
-        error: 'Failed to save subscription. Please try again.',
-      }, { 
-        status: 500,
-        headers: { 'Access-Control-Allow-Origin': '*' }
-      });
-    }
-
-    // Add to Klaviyo (non-blocking - don't fail if this fails)
-    let klaviyoSuccess = false;
-    try {
-      klaviyoSuccess = await subscribeToKlaviyoList(newSubscriber);
-      if (klaviyoSuccess) {
-        console.log(`✅ Successfully added ${email} to Klaviyo list`);
-      } else {
-        console.log(`⚠️ Klaviyo subscription failed for ${email}, but Redis subscription successful`);
-      }
-    } catch (klaviyoError) {
-      console.error('⚠️ Klaviyo error (non-fatal):', klaviyoError.message);
-    }
-
-    return NextResponse.json({ 
-      success: true,
-      message: 'Successfully subscribed to back-in-stock notifications',
-      subscriber_count: subscribers.length,
-      klaviyo_success: klaviyoSuccess
-    }, {
-      headers: { 'Access-Control-Allow-Origin': '*' }
-    });
-
-  } catch (error) {
-    console.error('❌ Back-in-stock subscription error:', error);
-    return NextResponse.json({ 
-      success: false, 
-      error: 'Server error. Please try again.',
-      details: process.env.NODE_ENV === 'development' ? error.message : undefined
-    }, { 
-      status: 500,
-      headers: { 'Access-Control-Allow-Origin': '*' }
-    });
+  if (!res.ok) {
+    console.warn('storeSmsConsentProof warn:', res.status, await res.text());
   }
 }
 
-// Handle subscription status checks
-export async function GET(request) {
+// Optional: send a custom event (handy for segments/flows)
+async function sendSmsConsentEvent({ email, phoneE164 }) {
   try {
-    const { searchParams } = new URL(request.url);
-    const email = searchParams.get('email');
-    const product_id = searchParams.get('product_id');
+    const payload = {
+      data: {
+        type: 'event',
+        attributes: {
+          metric: { data: { type: 'metric', attributes: { name: 'SMS Consent Captured' } } },
+          properties: { 'Phone (E164)': phoneE164 || '' },
+          profile: { data: { type: 'profile', attributes: { email } } },
+          time: new Date().toISOString()
+        }
+      }
+    };
+    const r = await klaviyoFetch('https://a.klaviyo.com/api/events/', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+    if (!r.ok) console.warn('sendSmsConsentEvent warn:', r.status, await r.text());
+  } catch (e) {
+    console.warn('sendSmsConsentEvent error:', e.message);
+  }
+}
+
+/* =========================
+   CORS
+   ========================= */
+export async function OPTIONS() {
+  return new NextResponse(null, {
+    status: 200,
+    headers: {
+      'Access-Control-Allow-Origin': ALLOW_ORIGIN,
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+    }
+  });
+}
+
+/* =========================
+   POST  (subscribe)
+   ========================= */
+export async function POST(request) {
+  try {
+    const ip =
+      request.headers.get('x-forwarded-for') ||
+      request.headers.get('x-real-ip') ||
+      '';
+
+    const body = await request.json();
+    const {
+      email,
+      phone,
+      product_id,
+      product_title,
+      product_handle,
+      first_name = '',
+      last_name = '',
+      full_name = '', // optional (if your form uses a single full name field)
+      sms_consent = false
+    } = body || {};
 
     if (!email || !product_id) {
-      return NextResponse.json({ 
-        success: false, 
-        error: 'Missing email or product_id parameters' 
-      }, { 
-        status: 400,
-        headers: { 'Access-Control-Allow-Origin': '*' }
-      });
+      return jsonRes({ success: false, error: 'Missing required fields: email, product_id' }, 400);
     }
 
+    // Basic email format check
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email))) {
+      return jsonRes({ success: false, error: 'Invalid email format' }, 400);
+    }
+
+    // Split name if you prefer a single field in the form
+    let fName = first_name;
+    let lName = last_name;
+    if (!fName && !lName && full_name) {
+      const parsed = parseFullName(full_name);
+      fName = parsed.first;
+      lName = parsed.last;
+    }
+
+    // Redis guard
     await redis.ping();
-    
+
+    // De-dup per product
     const key = `subscribers:${product_id}`;
-    let subscribers = await redis.get(key) || [];
-    
+    let subscribers = await redis.get(key);
     if (typeof subscribers === 'string') {
       try {
         subscribers = JSON.parse(subscribers);
@@ -212,272 +285,159 @@ export async function GET(request) {
         subscribers = [];
       }
     }
-    if (!Array.isArray(subscribers)) {
-      subscribers = [];
+    if (!Array.isArray(subscribers)) subscribers = [];
+
+    if (subscribers.find((s) => s?.email === email)) {
+      return jsonRes({
+        success: true,
+        alreadySubscribed: true,
+        message: 'Already subscribed for this product',
+        subscriber_count: subscribers.length
+      });
     }
-    
-    const subscription = subscribers.find(sub => sub && sub.email === email);
-    const isSubscribed = !!subscription;
 
-    return NextResponse.json({ 
-      success: true,
-      subscribed: isSubscribed,
-      total_subscribers: subscribers.length,
-      subscription_details: subscription ? {
-        subscribed_at: subscription.subscribed_at,
-        notified: subscription.notified
-      } : null
-    }, {
-      headers: { 'Access-Control-Allow-Origin': '*' }
-    });
+    // Create subscriber record
+    const newSubscriber = {
+      email,
+      phone: phone || '',
+      product_id: String(product_id),
+      product_title: product_title || 'Unknown Product',
+      product_handle: product_handle || '',
+      first_name: fName || '',
+      last_name: lName || '',
+      sms_consent: !!sms_consent,
+      notified: false,
+      subscribed_at: new Date().toISOString(),
+      ip_address: ip || 'unknown'
+    };
 
-  } catch (error) {
-    console.error('❌ GET request error:', error);
-    return NextResponse.json({ 
-      success: false, 
-      error: error.message 
-    }, { 
-      status: 500,
-      headers: { 'Access-Control-Allow-Origin': '*' }
-    });
-  }
-}
+    subscribers.push(newSubscriber);
+    await redis.set(key, subscribers, { ex: 30 * 24 * 60 * 60 });
 
-// DIRECT LIST ADDITION - This should work with your full access API key
-async function subscribeToKlaviyoList(subscriber) {
-  if (!KLAVIYO_API_KEY) {
-    console.log('❌ No KLAVIYO_API_KEY found in environment variables');
-    return false;
-  }
+    /* =========================
+       KLAVIYO INTEGRATION
+       ========================= */
+    let klaviyo_list_success = false;
+    let klaviyo_sms_success = false;
 
-  console.log('🔍 Debug Info:');
-  console.log('- Klaviyo API Key exists:', !!KLAVIYO_API_KEY);
-  console.log('- List ID:', BACK_IN_STOCK_LIST_ID);
-  console.log('- Subscriber email:', subscriber.email);
-  
-  try {
-    console.log(`📋 Adding ${subscriber.email} DIRECTLY to list ${BACK_IN_STOCK_LIST_ID}...`);
+    if (!KLAVIYO_API_KEY || !BACK_IN_STOCK_LIST_ID) {
+      // If not configured, still return success so the modal UX is smooth
+      return jsonRes({
+        success: true,
+        message: 'Subscribed locally. (Klaviyo not configured)',
+        subscriber_count: subscribers.length,
+        klaviyo_success: false,
+        klaviyo_sms_success: false
+      });
+    }
 
-    // Format phone number properly for international numbers
-    let formattedPhone = null;
-    if (subscriber.phone && subscriber.phone.length > 0) {
-      formattedPhone = subscriber.phone.trim();
-      
-      // Handle Nigerian numbers specifically
-      if (formattedPhone.startsWith('090') || formattedPhone.startsWith('080') || 
-          formattedPhone.startsWith('070') || formattedPhone.startsWith('081') || 
-          formattedPhone.startsWith('091')) {
-        // Nigerian number - add +234 and remove leading 0
-        formattedPhone = '+234' + formattedPhone.substring(1);
-      } else if (!formattedPhone.startsWith('+')) {
-        // Default to US format for other numbers
-        formattedPhone = '+1' + formattedPhone.replace(/\D/g, '');
+    // 1) Create/get profile
+    const profileId = await createOrGetProfile({
+      email,
+      first_name: newSubscriber.first_name,
+      last_name: newSubscriber.last_name,
+      properties: {
+        'Back in Stock Subscriber': true,
+        'Subscription Source': 'Bundle Notifications',
+        'Product Subscribed': newSubscriber.product_title
       }
-      
-      console.log(`📱 Phone formatted as: ${formattedPhone}`);
-    }
+    });
 
-    // SKIP METHOD 1 - The 405 error shows this endpoint doesn't work
-    // Go directly to Method 2: Create profile first, then add to list
-    console.log('📋 Using Method 2: Create profile first, then add to list...');
-    return await alternativeListAddition(subscriber, BACK_IN_STOCK_LIST_ID);
-
-  } catch (error) {
-    console.error('❌ Method 1 Network Error:', error.message);
-    console.log('🔄 Trying Method 2: Create profile first, then add to list...');
-    return await alternativeListAddition(subscriber, BACK_IN_STOCK_LIST_ID);
-  }
-}
-
-// Alternative method: Add using relationships endpoint
-async function alternativeListAddition(subscriber, listId) {
-  try {
-    console.log(`🔄 Method 2: Creating profile first for ${subscriber.email}...`);
-    
-    // First create/get the profile
-    let profileId = await createOrGetProfile(subscriber);
-    
     if (profileId) {
-      console.log(`📋 Method 2: Adding profile ${profileId} to list...`);
-      
-      // Then add to list using relationships
-      const addToListData = {
-        data: [{
-          type: 'profile',
-          id: profileId
-        }]
-      };
-
-      const listResponse = await fetch(`https://a.klaviyo.com/api/lists/${listId}/relationships/profiles/`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-          'Content-Type': 'application/json',
-          'revision': '2024-10-15'
-        },
-        body: JSON.stringify(addToListData)
+      // 2) Add to email list (to trigger your email flow)
+      const addRes = await addToListByProfileId({
+        listId: BACK_IN_STOCK_LIST_ID,
+        profileId
       });
+      klaviyo_list_success = addRes.ok;
 
-      console.log('📥 Method 2 list response status:', listResponse.status);
+      // 3) If consent + phone provided, set SMS marketing consent
+      if (newSubscriber.sms_consent && newSubscriber.phone) {
+        const phoneE164 = formatPhoneE164(newSubscriber.phone);
+        if (phoneE164) {
+          const smsRes = await setSmsMarketingConsent({
+            profileId,
+            phoneE164,
+            method: 'Back in Stock Modal',
+            ip
+          });
+          klaviyo_sms_success = smsRes.ok;
 
-      if (listResponse.ok || listResponse.status === 204) {
-        console.log(`✅ Method 2 SUCCESS: Added ${subscriber.email} to list!`);
-        return true;
-      } else {
-        const errorText = await listResponse.text();
-        console.error(`❌ Method 2 list addition failed:`, errorText);
-        return false;
+          // 4) Store visible proof for auditing in Klaviyo UI
+          await storeSmsConsentProof({
+            profileId,
+            phoneE164,
+            ip,
+            consentText:
+              'I agree to receive SMS updates about this waitlist and back-in-stock alerts. Msg & data rates may apply. Reply STOP to opt out.'
+          });
+
+          // 5) Optional event
+          await sendSmsConsentEvent({ email, phoneE164 });
+        }
       }
     } else {
-      console.error(`❌ Method 2: Could not create/find profile for ${subscriber.email}`);
-      return false;
+      console.error('Could not create/get Klaviyo profile for', email);
     }
-    
+
+    return jsonRes({
+      success: true,
+      message: 'Successfully subscribed to back-in-stock notifications',
+      subscriber_count: subscribers.length,
+      klaviyo_success: klaviyo_list_success,
+      klaviyo_sms_success
+    });
   } catch (error) {
-    console.error('❌ Method 2 error:', error);
-    return false;
+    console.error('Back-in-stock POST error:', error);
+    return jsonRes(
+      {
+        success: false,
+        error: 'Server error. Please try again.',
+        details: process.env.NODE_ENV === 'development' ? error.message : undefined
+      },
+      500
+    );
   }
 }
 
-// Create or get profile ID - FIXED for phone number issues
-async function createOrGetProfile(subscriber) {
+/* =========================
+   GET (subscription status)
+   ========================= */
+export async function GET(request) {
   try {
-    // Format phone number with better international support
-    let formattedPhone = null;
-    if (subscriber.phone && subscriber.phone.length > 0) {
-      formattedPhone = subscriber.phone.trim();
-      
-      // Handle Nigerian numbers specifically  
-      if (formattedPhone.startsWith('090') || formattedPhone.startsWith('080') || 
-          formattedPhone.startsWith('070') || formattedPhone.startsWith('081') || 
-          formattedPhone.startsWith('091')) {
-        // Nigerian number - add +234 and remove leading 0
-        formattedPhone = '+234' + formattedPhone.substring(1);
-      } else if (!formattedPhone.startsWith('+')) {
-        // Default to US format for other numbers
-        formattedPhone = '+1' + formattedPhone.replace(/\D/g, '');
-      }
+    const { searchParams } = new URL(request.url);
+    const email = searchParams.get('email');
+    const product_id = searchParams.get('product_id');
+
+    if (!email || !product_id) {
+      return jsonRes({ success: false, error: 'Missing email or product_id' }, 400);
     }
 
-    // Try creating profile WITHOUT phone first (to avoid SMS validation issues)
-    const profileData = {
-      data: {
-        type: 'profile',
-        attributes: {
-          email: subscriber.email,
-          first_name: subscriber.first_name || '',
-          last_name: subscriber.last_name || '',
-          // Skip phone_number initially to avoid validation issues
-          properties: {
-            'Back in Stock Subscriber': true,
-            'Subscription Source': 'Bundle Notifications',
-            'Product Subscribed': subscriber.product_title,
-            'Phone Number': formattedPhone || '' // Store as property instead
-          }
-        }
+    await redis.ping();
+
+    const key = `subscribers:${product_id}`;
+    let subscribers = await redis.get(key);
+    if (typeof subscribers === 'string') {
+      try {
+        subscribers = JSON.parse(subscribers);
+      } catch {
+        subscribers = [];
       }
-    };
+    }
+    if (!Array.isArray(subscribers)) subscribers = [];
 
-    console.log(`📝 Creating profile for ${subscriber.email} (without phone in main field)...`);
+    const sub = subscribers.find((s) => s?.email === email);
 
-    const profileResponse = await fetch('https://a.klaviyo.com/api/profiles/', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-        'Content-Type': 'application/json',
-        'revision': '2024-10-15'
-      },
-      body: JSON.stringify(profileData)
+    return jsonRes({
+      success: true,
+      subscribed: !!sub,
+      total_subscribers: subscribers.length,
+      subscription_details: sub
+        ? { subscribed_at: sub.subscribed_at, notified: sub.notified, sms_consent: sub.sms_consent }
+        : null
     });
-
-    console.log(`📥 Profile creation response status: ${profileResponse.status}`);
-
-    if (profileResponse.ok) {
-      const result = await profileResponse.json();
-      console.log(`✅ Profile created with ID ${result.data.id}`);
-      return result.data.id;
-    } else if (profileResponse.status === 409) {
-      // Profile exists, get the ID
-      console.log(`ℹ️ Profile exists, getting ID for ${subscriber.email}...`);
-      
-      const getProfileResponse = await fetch(`https://a.klaviyo.com/api/profiles/?filter=equals(email,"${subscriber.email}")`, {
-        headers: {
-          'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-          'revision': '2024-10-15'
-        }
-      });
-
-      if (getProfileResponse.ok) {
-        const result = await getProfileResponse.json();
-        if (result.data && result.data.length > 0) {
-          console.log(`✅ Found existing profile ID ${result.data[0].id}`);
-          return result.data[0].id;
-        }
-      }
-    } else {
-      const errorText = await profileResponse.text();
-      console.error(`❌ Profile creation failed (${profileResponse.status}):`, errorText);
-    }
-    
-    return null;
   } catch (error) {
-    console.error('❌ Profile creation error:', error);
-    return null;
-  }
-}
-
-// Send subscription confirmation event
-async function sendSubscriptionEvent(subscriber) {
-  try {
-    const eventData = {
-      data: {
-        type: 'event',
-        attributes: {
-          properties: {
-            ProductName: subscriber.product_title,
-            ProductID: subscriber.product_id,
-            ProductHandle: subscriber.product_handle,
-            SubscriptionDate: subscriber.subscribed_at,
-            NotificationType: 'Subscription Confirmation',
-            Method: 'Direct List Addition'
-          },
-          metric: { 
-            data: { 
-              type: 'metric', 
-              attributes: { name: 'Back in Stock Subscription' } 
-            } 
-          },
-          profile: { 
-            data: { 
-              type: 'profile', 
-              attributes: { 
-                email: subscriber.email,
-                first_name: subscriber.first_name,
-                last_name: subscriber.last_name
-              } 
-            } 
-          }
-        }
-      }
-    };
-
-    const response = await fetch('https://a.klaviyo.com/api/events/', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-        'Content-Type': 'application/json',
-        'revision': '2024-10-15'
-      },
-      body: JSON.stringify(eventData)
-    });
-
-    if (response.ok) {
-      console.log(`📧 Subscription event sent for ${subscriber.email}`);
-    } else {
-      const errorText = await response.text();
-      console.log(`⚠️ Event send warning (${response.status}):`, errorText);
-    }
-  } catch (error) {
-    console.error('❌ Event send error:', error);
+    console.error('Back-in-stock GET error:', error);
+    return jsonRes({ success: false, error: error.message }, 500);
   }
 }
