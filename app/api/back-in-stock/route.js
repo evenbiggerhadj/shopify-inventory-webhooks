@@ -221,24 +221,28 @@ export async function POST(request) {
     subscribers.push(newSub);
     await redis.set(key, subscribers, { ex: 30 * 24 * 60 * 60 });
 
-    // Non-blocking: subscribe to Klaviyo (but we still report success if it fails)
-    let klaviyoSuccess = false;
-    try {
-      klaviyoSuccess = await klaviyoSubscribe({
-        email,
-        phoneE164,
-        smsConsent: !!sms_consent
-      });
-    } catch (e) {
-      console.warn('Klaviyo subscribe warning:', e.message);
-    }
+   // Non-blocking: subscribe to Klaviyo (but we still report success if it fails)
+let klaviyoSuccess = false;
+let klaviyoError = null;
+try {
+  klaviyoSuccess = await klaviyoSubscribe({
+    email,
+    phoneE164,
+    smsConsent: !!sms_consent
+  });
+} catch (e) {
+  klaviyoError = e.message;     // <--- capture the reason
+  console.warn('Klaviyo subscribe warning:', klaviyoError);
+}
 
-    return withCORS(json({
-      success: true,
-      message: 'Successfully subscribed to back-in-stock notifications',
-      subscriber_count: subscribers.length,
-      klaviyo_success: !!klaviyoSuccess
-    }), origin);
+return withCORS(json({
+  success: true,
+  message: 'Successfully subscribed to back-in-stock notifications',
+  subscriber_count: subscribers.length,
+  klaviyo_success: !!klaviyoSuccess,
+  ...(klaviyoError ? { klaviyo_error: klaviyoError } : {})  // <--- include it
+}), origin);
+
 
   } catch (error) {
     console.error('POST /back-in-stock fatal:', error);
