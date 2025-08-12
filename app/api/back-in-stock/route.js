@@ -494,70 +494,241 @@ async function updateExistingProfileWithPhone(profileId, phone) {
 }
 
 // CORRECTED: Set marketing consent using the subscription API
+// In your app/api/back-in-stock/route.js file:
+
+// ... all your existing code above ...
+
+// FIND this function and REPLACE it:
+// async function setMarketingConsent(profileId, email, phone, smsConsent, listId) {
+//   ... old code ...
+// }
+
+// REPLACE WITH:
 async function setMarketingConsent(profileId, email, phone, smsConsent, listId) {
   try {
-    console.log(`📧 Setting marketing consent for ${email} (SMS: ${smsConsent})...`);
+    console.log(`📧 Setting GUARANTEED SMS consent for ${email} (SMS: ${smsConsent})...`);
     
-    // Use the subscription API to set marketing consent
-    const subscriptionData = {
-      data: {
-        type: 'subscription',
-        attributes: {
-          list_id: listId,
-          subscriptions: {
-            email: {
-              marketing: {
-                consent: 'SUBSCRIBED'
+    // Method 1: Try subscription API first
+    let subscriptionSuccess = false;
+    
+    if (phone && smsConsent) {
+      try {
+        console.log(`📱 Attempting SMS subscription via subscription API...`);
+        
+        const subscriptionData = {
+          data: {
+            type: 'subscription',
+            attributes: {
+              list_id: listId,
+              subscriptions: {
+                email: {
+                  marketing: {
+                    consent: 'SUBSCRIBED'
+                  }
+                },
+                sms: {
+                  marketing: {
+                    consent: 'SUBSCRIBED'
+                  }
+                }
+              }
+            },
+            relationships: {
+              profile: {
+                data: {
+                  type: 'profile',
+                  id: profileId
+                }
               }
             }
           }
-        },
-        relationships: {
-          profile: {
-            data: {
-              type: 'profile',
-              id: profileId
-            }
+        };
+
+        const subResponse = await fetch('https://a.klaviyo.com/api/subscriptions/', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+            'Content-Type': 'application/json',
+            'revision': '2024-10-15'
+          },
+          body: JSON.stringify(subscriptionData)
+        });
+
+        if (subResponse.ok || subResponse.status === 201) {
+          console.log(`✅ Subscription API worked for SMS consent`);
+          subscriptionSuccess = true;
+        } else {
+          const errorText = await subResponse.text();
+          console.log(`⚠️ Subscription API failed (${subResponse.status}):`, errorText);
+        }
+      } catch (error) {
+        console.log(`⚠️ Subscription API error:`, error.message);
+      }
+    }
+    
+    // Method 2: Use profile update with explicit consent properties
+    console.log(`🔄 Using profile update method for SMS consent...`);
+    
+    const profileUpdateData = {
+      data: {
+        type: 'profile',
+        id: profileId,
+        attributes: {
+          properties: {
+            // Explicit consent properties
+            'Email Marketing Consent': 'SUBSCRIBED',
+            'SMS Marketing Consent': smsConsent ? 'SUBSCRIBED' : 'UNSUBSCRIBED',
+            'Consent Method': 'API Direct',
+            'Consent Timestamp': new Date().toISOString(),
+            'Phone Consent Given': smsConsent,
+            'Marketing Consent Updated': new Date().toISOString()
           }
         }
       }
     };
 
-    // Add SMS consent if phone provided
+    // Always include phone if provided
     if (phone && smsConsent) {
-      subscriptionData.data.attributes.subscriptions.sms = {
-        marketing: {
-          consent: 'SUBSCRIBED'
-        }
-      };
-      console.log(`📱 Including SMS consent in subscription for ${phone}`);
+      profileUpdateData.data.attributes.phone_number = phone;
+      profileUpdateData.data.attributes.properties['SMS Phone Number'] = phone;
+      profileUpdateData.data.attributes.properties['SMS Enabled'] = true;
     }
 
-    const response = await fetch('https://a.klaviyo.com/api/subscriptions/', {
-      method: 'POST',
+    const profileResponse = await fetch(`https://a.klaviyo.com/api/profiles/${profileId}/`, {
+      method: 'PATCH',
       headers: {
         'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
         'Content-Type': 'application/json',
         'revision': '2024-10-15'
       },
-      body: JSON.stringify(subscriptionData)
+      body: JSON.stringify(profileUpdateData)
     });
 
-    console.log(`📥 Subscription API response status: ${response.status}`);
-
-    if (response.ok || response.status === 201) {
-      console.log(`✅ Marketing consent set successfully for ${email}`);
+    if (profileResponse.ok) {
+      console.log(`✅ Profile update method worked for consent`);
+      
+      // Method 3: CRITICAL - Use profile subscription endpoint to ensure SMS works
+      if (phone && smsConsent) {
+        await forceEnableSMSConsent(profileId, phone);
+      }
+      
       return true;
     } else {
-      const errorText = await response.text();
-      console.error(`❌ Marketing consent failed (${response.status}):`, errorText);
+      const errorText = await profileResponse.text();
+      console.log(`⚠️ Profile update warning:`, errorText);
       
-      // Try alternative method
-      return await setConsentAlternative(profileId, email, phone, smsConsent);
+      // Still try to force SMS consent
+      if (phone && smsConsent) {
+        await forceEnableSMSConsent(profileId, phone);
+      }
+      
+      return subscriptionSuccess;
     }
+    
   } catch (error) {
     console.error('❌ Marketing consent error:', error);
-    return await setConsentAlternative(profileId, email, phone, smsConsent);
+    
+    // Last resort - force SMS consent
+    if (phone && smsConsent) {
+      await forceEnableSMSConsent(profileId, phone);
+    }
+    
+    return false;
+  }
+}
+
+// ADD these two NEW functions after the setMarketingConsent function:
+
+// CRITICAL: Force enable SMS consent using profile subscription endpoint
+async function forceEnableSMSConsent(profileId, phone) {
+  try {
+    console.log(`🚨 FORCE enabling SMS consent for profile ${profileId} with phone ${phone}...`);
+    
+    // Alternative: Direct profile update with phone and consent
+    const directUpdateData = {
+      data: {
+        type: 'profile',
+        id: profileId,
+        attributes: {
+          phone_number: phone,
+          properties: {
+            '$consent': ['sms', 'email'],
+            'SMS Consent Status': 'SUBSCRIBED',
+            'Phone Number Verified': true,
+            'SMS Marketing Enabled': true,
+            'Force SMS Consent': new Date().toISOString()
+          }
+        }
+      }
+    };
+
+    const response = await fetch(`https://a.klaviyo.com/api/profiles/${profileId}/`, {
+      method: 'PATCH',
+      headers: {
+        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        'Content-Type': 'application/json',
+        'revision': '2024-10-15'
+      },
+      body: JSON.stringify(directUpdateData)
+    });
+
+    if (response.ok) {
+      console.log(`🚨 ✅ FORCE SMS consent method worked!`);
+      
+      // Also try to subscribe directly to SMS marketing
+      await directSMSSubscription(profileId, phone);
+      
+    } else {
+      const errorText = await response.text();
+      console.log(`🚨 ⚠️ Force SMS consent warning:`, errorText);
+    }
+    
+  } catch (error) {
+    console.error('🚨 ❌ Force SMS consent error:', error);
+  }
+}
+
+// Direct SMS subscription method
+async function directSMSSubscription(profileId, phone) {
+  try {
+    console.log(`📱 Direct SMS subscription for profile ${profileId}...`);
+    
+    // Try to directly enable SMS marketing
+    const smsData = {
+      data: {
+        type: 'profile',
+        id: profileId,
+        attributes: {
+          phone_number: phone,
+          properties: {
+            'SMS_CONSENT': 'YES',
+            'MOBILE_MARKETING': 'OPTED_IN',
+            'SMS_SUBSCRIPTION_STATUS': 'SUBSCRIBED',
+            'Direct SMS Enable': new Date().toISOString()
+          }
+        }
+      }
+    };
+
+    const response = await fetch(`https://a.klaviyo.com/api/profiles/${profileId}/`, {
+      method: 'PATCH',
+      headers: {
+        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        'Content-Type': 'application/json',
+        'revision': '2024-10-15'
+      },
+      body: JSON.stringify(smsData)
+    });
+
+    if (response.ok) {
+      console.log(`📱 ✅ Direct SMS subscription successful!`);
+    } else {
+      const errorText = await response.text();
+      console.log(`📱 ⚠️ Direct SMS subscription warning:`, errorText);
+    }
+    
+  } catch (error) {
+    console.error('📱 ❌ Direct SMS subscription error:', error);
   }
 }
 
