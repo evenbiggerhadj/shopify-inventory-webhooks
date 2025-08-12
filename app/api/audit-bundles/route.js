@@ -1,4 +1,4 @@
-// app/api/audit-bundles/route.js - COMPLETE FIXED with SMS support and proper phone handling
+// app/api/audit-bundles/route.js - COMPLETE with two-list system (ALERT LIST)
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
@@ -154,7 +154,7 @@ async function setSubscribers(productId, subs) {
   await redis.set(`subscribers:${productId}`, subs);
 }
 
-// === FIXED Phone formatting function ===
+// === Phone formatting function ===
 function formatPhoneNumber(phone) {
   if (!phone) return null;
   
@@ -182,240 +182,17 @@ function formatPhoneNumber(phone) {
   }
 }
 
-// === FIXED Klaviyo Functions with SMS support ===
-async function createOrGetProfileForNotification(email, firstName, lastName, phone, productName, productUrl, smsConsent) {
+// === NEW: Add to ALERT LIST (when item is back in stock) - triggers notification flow ===
+async function addToAlertList(subscriber, productName, productUrl, alertListId) {
   try {
-    // Format phone number properly
-    let formattedPhone = null;
-    if (phone && phone.length > 0) {
-      formattedPhone = formatPhoneNumber(phone);
-      console.log(`📱 Phone formatted as: ${formattedPhone}`);
-    }
+    console.log(`📋 Adding ${subscriber.email} to ALERT LIST ${alertListId}...`);
+    console.log(`📱 SMS Consent: ${subscriber.sms_consent}, Phone: ${subscriber.phone || 'none'}`);
 
-    const profileData = {
-      data: {
-        type: 'profile',
-        attributes: {
-          email,
-          first_name: firstName || '',
-          last_name: lastName || '',
-          properties: {
-            'Back in Stock Subscriber': true,
-            'Profile Ensured for Notification': new Date().toISOString(),
-            'Last Product Subscribed': productName,
-            'SMS Consent Given': smsConsent || false
-          }
-        }
-      }
-    };
-
-    // Add phone and SMS consent if provided
-    if (formattedPhone && smsConsent) {
-      profileData.data.attributes.phone_number = formattedPhone;
-      profileData.data.attributes.subscriptions = {
-        email: {
-          marketing: {
-            consent: 'SUBSCRIBED'
-          }
-        },
-        sms: {
-          marketing: {
-            consent: 'SUBSCRIBED'
-          }
-        }
-      };
-      console.log(`📱 Setting SMS consent for ${email} with phone ${formattedPhone}`);
-    } else {
-      // Email only
-      profileData.data.attributes.subscriptions = {
-        email: {
-          marketing: {
-            consent: 'SUBSCRIBED'
-          }
-        }
-      };
-      console.log(`📧 Email-only notification for ${email}`);
-    }
-
-    const profileResponse = await fetch('https://a.klaviyo.com/api/profiles/', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-        'Content-Type': 'application/json',
-        'revision': '2024-10-15'
-      },
-      body: JSON.stringify(profileData)
-    });
-
-    if (profileResponse.ok) {
-      const result = await profileResponse.json();
-      return result.data.id;
-    } else if (profileResponse.status === 409) {
-      // Profile exists, get the ID and update consent if needed
-      const getProfileResponse = await fetch(`https://a.klaviyo.com/api/profiles/?filter=equals(email,"${email}")`, {
-        headers: {
-          'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-          'revision': '2024-10-15'
-        }
-      });
-
-      if (getProfileResponse.ok) {
-        const result = await getProfileResponse.json();
-        if (result.data && result.data.length > 0) {
-          const profileId = result.data[0].id;
-          
-          // Update SMS consent if phone provided and consent given
-          if (formattedPhone && smsConsent) {
-            await updateProfileSMSConsent(profileId, formattedPhone);
-          }
-          
-          return profileId;
-        }
-      }
-    } else {
-      const errorText = await profileResponse.text();
-      console.error(`❌ Profile creation failed (${profileResponse.status}):`, errorText);
-    }
-    
-    return null;
-  } catch (error) {
-    console.error('❌ Profile creation error for notification:', error);
-    return null;
-  }
-}
-
-// Update SMS consent for existing profile
-async function updateProfileSMSConsent(profileId, phone) {
-  try {
-    const updateData = {
-      data: {
-        type: 'profile',
-        id: profileId,
-        attributes: {
-          phone_number: phone,
-          subscriptions: {
-            sms: {
-              marketing: {
-                consent: 'SUBSCRIBED'
-              }
-            }
-          },
-          properties: {
-            'SMS Consent Updated': new Date().toISOString()
-          }
-        }
-      }
-    };
-
-    const response = await fetch(`https://a.klaviyo.com/api/profiles/${profileId}/`, {
-      method: 'PATCH',
-      headers: {
-        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-        'Content-Type': 'application/json',
-        'revision': '2024-10-15'
-      },
-      body: JSON.stringify(updateData)
-    });
-
-    if (response.ok) {
-      console.log(`✅ Updated SMS consent for profile ${profileId}`);
-    } else {
-      const errorText = await response.text();
-      console.log(`⚠️ SMS consent update warning:`, errorText);
-    }
-  } catch (error) {
-    console.error('❌ SMS consent update error:', error);
-  }
-}
-
-// Send back-in-stock event (triggers flows instead of promotional emails)
-async function sendBackInStockEvent(email, firstName, lastName, productName, productUrl, phone, smsConsent) {
-  try {
-    const eventData = {
-      data: {
-        type: 'event',
-        attributes: {
-          properties: {
-            ProductName: productName,
-            ProductURL: productUrl,
-            NotificationType: 'Back in Stock',
-            SMSEnabled: smsConsent || false,
-            PhoneNumber: phone || '',
-            EventTimestamp: new Date().toISOString(),
-            Source: 'Bundle Audit System'
-          },
-          metric: { 
-            data: { 
-              type: 'metric', 
-              attributes: { name: 'Back in Stock Alert' } // This should match your flow trigger
-            } 
-          },
-          profile: { 
-            data: { 
-              type: 'profile', 
-              attributes: { 
-                email: email,
-                first_name: firstName || '',
-                last_name: lastName || ''
-              } 
-            } 
-          }
-        }
-      }
-    };
-
-    const response = await fetch('https://a.klaviyo.com/api/events/', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-        'Content-Type': 'application/json',
-        'revision': '2024-10-15'
-      },
-      body: JSON.stringify(eventData)
-    });
-
-    if (response.ok) {
-      console.log(`📧 Back-in-stock event sent for ${email} (triggers flow instead of promotional email)`);
-      return true;
-    } else {
-      const errorText = await response.text();
-      console.log(`⚠️ Event send warning (${response.status}):`, errorText);
-      return false;
-    }
-  } catch (error) {
-    console.error('❌ Event send error:', error);
-    return false;
-  }
-}
-
-async function addToBackInStockAlertList(email, firstName, lastName, phone, productName, productUrl, alertListId, smsConsent = false) {
-  if (!KLAVIYO_API_KEY) {
-    console.error('❌ KLAVIYO_API_KEY not set');
-    return false;
-  }
-
-  try {
-    console.log(`📋 Adding ${email} to back-in-stock alert list for ${productName}...`);
-    console.log(`📱 SMS Consent: ${smsConsent}, Phone: ${phone || 'none'}`);
-
-    // Format phone number properly
-    let formattedPhone = null;
-    if (phone && phone.length > 0) {
-      formattedPhone = formatPhoneNumber(phone);
-      console.log(`📱 Phone formatted as: ${formattedPhone}`);
-    }
-
-    const profileId = await createOrGetProfileForNotification(
-      email, 
-      firstName, 
-      lastName, 
-      formattedPhone, 
-      productName, 
-      productUrl,
-      smsConsent
-    );
+    // Create profile with alert properties
+    const profileId = await createAlertProfile(subscriber, productName, productUrl);
     
     if (profileId) {
+      // Add to alert list
       const addToListData = {
         data: [{
           type: 'profile',
@@ -434,43 +211,180 @@ async function addToBackInStockAlertList(email, firstName, lastName, phone, prod
       });
       
       if (response.ok || response.status === 204) {
-        console.log(`✅ Added ${email} to back-in-stock alert list for ${productName} (SMS: ${smsConsent})`);
-        
-        // Send back-in-stock event to trigger flow
-        const eventSent = await sendBackInStockEvent(
-          email, 
-          firstName, 
-          lastName, 
-          productName, 
-          productUrl, 
-          formattedPhone, 
-          smsConsent
-        );
-        
-        if (eventSent) {
-          console.log(`🎯 Flow trigger event sent successfully for ${email}`);
-        }
-        
+        console.log(`✅ Added ${subscriber.email} to ALERT LIST - back-in-stock flow should trigger!`);
         return true;
       } else {
         const errorText = await response.text();
-        console.error(`❌ Failed to add ${email} to alert list:`, errorText);
+        console.error(`❌ Failed to add to alert list:`, errorText);
         return false;
       }
     } else {
-      console.error(`❌ Could not create/get profile for ${email}`);
+      console.error(`❌ Could not create alert profile for ${subscriber.email}`);
       return false;
     }
     
   } catch (error) {
-    console.error(`❌ Alert list error for ${email}:`, error);
+    console.error('❌ Alert list error:', error);
     return false;
   }
 }
 
-// === OPTIMIZED Main Audit Script with SMS Support ===
+// === NEW: Create alert profile with back-in-stock info ===
+async function createAlertProfile(subscriber, productName, productUrl) {
+  try {
+    const profileData = {
+      data: {
+        type: 'profile',
+        attributes: {
+          email: subscriber.email,
+          first_name: subscriber.first_name || '',
+          last_name: subscriber.last_name || '',
+          properties: {
+            'Back in Stock Item': productName,
+            'Back in Stock URL': productUrl,
+            'Alert Date': new Date().toISOString(),
+            'Original Waitlist Date': subscriber.subscribed_at,
+            'SMS Consent': subscriber.sms_consent || false,
+            'Product ID': subscriber.product_id,
+            'Alert Trigger': 'Inventory Back in Stock'
+          }
+        }
+      }
+    };
+
+    // Add phone and SMS consent if provided
+    if (subscriber.phone && subscriber.sms_consent) {
+      profileData.data.attributes.phone_number = subscriber.phone;
+      profileData.data.attributes.subscriptions = {
+        email: {
+          marketing: {
+            consent: 'SUBSCRIBED'
+          }
+        },
+        sms: {
+          marketing: {
+            consent: 'SUBSCRIBED'
+          }
+        }
+      };
+      console.log(`📱 Setting SMS consent for alert: ${subscriber.email} with phone ${subscriber.phone}`);
+    } else {
+      // Email only
+      profileData.data.attributes.subscriptions = {
+        email: {
+          marketing: {
+            consent: 'SUBSCRIBED'
+          }
+        }
+      };
+      console.log(`📧 Email-only alert for ${subscriber.email}`);
+    }
+
+    console.log(`📝 Creating alert profile for ${subscriber.email}...`);
+
+    const profileResponse = await fetch('https://a.klaviyo.com/api/profiles/', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        'Content-Type': 'application/json',
+        'revision': '2024-10-15'
+      },
+      body: JSON.stringify(profileData)
+    });
+
+    if (profileResponse.ok) {
+      const result = await profileResponse.json();
+      console.log(`✅ Alert profile created with ID ${result.data.id}`);
+      return result.data.id;
+    } else if (profileResponse.status === 409) {
+      // Profile exists, get it and update
+      console.log(`ℹ️ Profile exists, updating alert info for ${subscriber.email}...`);
+      
+      const getProfileResponse = await fetch(`https://a.klaviyo.com/api/profiles/?filter=equals(email,"${subscriber.email}")`, {
+        headers: {
+          'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+          'revision': '2024-10-15'
+        }
+      });
+
+      if (getProfileResponse.ok) {
+        const result = await getProfileResponse.json();
+        if (result.data && result.data.length > 0) {
+          const profileId = result.data[0].id;
+          
+          // Update with alert info and SMS consent
+          await updateAlertProfile(profileId, subscriber, productName, productUrl);
+          
+          return profileId;
+        }
+      }
+    } else {
+      const errorText = await profileResponse.text();
+      console.error(`❌ Alert profile creation failed:`, errorText);
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('❌ Alert profile creation error:', error);
+    return null;
+  }
+}
+
+// === NEW: Update profile for alert notification ===
+async function updateAlertProfile(profileId, subscriber, productName, productUrl) {
+  try {
+    const updateData = {
+      data: {
+        type: 'profile',
+        id: profileId,
+        attributes: {
+          properties: {
+            'Back in Stock Item': productName,
+            'Back in Stock URL': productUrl,
+            'Alert Date': new Date().toISOString(),
+            'SMS Consent': subscriber.sms_consent || false,
+            'Alert Trigger': 'Inventory Back in Stock'
+          }
+        }
+      }
+    };
+
+    // Update SMS info if consent given
+    if (subscriber.phone && subscriber.sms_consent) {
+      updateData.data.attributes.phone_number = subscriber.phone;
+      updateData.data.attributes.subscriptions = {
+        sms: {
+          marketing: {
+            consent: 'SUBSCRIBED'
+          }
+        }
+      };
+    }
+
+    const response = await fetch(`https://a.klaviyo.com/api/profiles/${profileId}/`, {
+      method: 'PATCH',
+      headers: {
+        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        'Content-Type': 'application/json',
+        'revision': '2024-10-15'
+      },
+      body: JSON.stringify(updateData)
+    });
+
+    if (response.ok) {
+      console.log(`✅ Updated profile for alert notification`);
+    } else {
+      const errorText = await response.text();
+      console.log(`⚠️ Alert profile update warning:`, errorText);
+    }
+  } catch (error) {
+    console.error('❌ Alert profile update error:', error);
+  }
+}
+
+// === MAIN Audit Script with ALERT LIST Integration ===
 async function auditBundles() {
-  console.log('🔍 Starting bundle audit process with SMS support and rate limiting...');
+  console.log('🔍 Starting bundle audit process with two-list SMS support and rate limiting...');
   
   const startTime = Date.now();
   const bundles = await getProductsTaggedBundle();
@@ -536,7 +450,7 @@ async function auditBundles() {
 
       console.log(`📊 ${bundle.title} → ${prevStatus || 'unknown'} → ${status}`);
 
-      // === NOTIFY SUBSCRIBERS IF BUNDLE NOW "ok" ===
+      // === NOTIFY SUBSCRIBERS IF BUNDLE NOW "ok" - USES ALERT LIST ===
       if (
         (prevStatus === 'understocked' || prevStatus === 'out-of-stock') &&
         status === 'ok'
@@ -546,23 +460,22 @@ async function auditBundles() {
         const subs = await getSubscribers(bundle.id);
         console.log(`📧 Found ${subs.length} subscribers for ${bundle.title}`);
         
+        // Use ALERT LIST (triggers back-in-stock notification flow)
         const BACK_IN_STOCK_ALERT_LIST_ID = process.env.KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID || 'Tnz7TZ';
         
         let subscribersBatchCount = 0;
+        
         for (let sub of subs) {
           if (sub && !sub.notified) {
             subscribersBatchCount++;
             console.log(`📋 Processing subscriber ${subscribersBatchCount}/${subs.filter(s => s && !s.notified).length}: ${sub.email}`);
             
-            const success = await addToBackInStockAlertList(
-              sub.email,
-              sub.first_name || '',
-              sub.last_name || '',
-              sub.phone || '',
+            // Add to ALERT LIST (triggers back-in-stock notification flow)
+            const success = await addToAlertList(
+              sub,
               bundle.title,
               `https://${SHOPIFY_STORE.replace('.myshopify.com', '')}.com/products/${bundle.handle}`,
-              BACK_IN_STOCK_ALERT_LIST_ID,
-              sub.sms_consent || false // Pass SMS consent flag
+              BACK_IN_STOCK_ALERT_LIST_ID
             );
             
             if (success) {
@@ -571,13 +484,13 @@ async function auditBundles() {
               
               if (sub.sms_consent && sub.phone) {
                 smsNotificationsSent++;
-                console.log(`✅ Successfully sent email + SMS notification to ${sub.email}`);
+                console.log(`✅ Added ${sub.email} to ALERT LIST - back-in-stock notification flow should trigger (SMS enabled)!`);
               } else {
-                console.log(`✅ Successfully sent email notification to ${sub.email}`);
+                console.log(`✅ Added ${sub.email} to ALERT LIST - back-in-stock notification flow should trigger (email only)!`);
               }
             } else {
               notificationErrors++;
-              console.log(`❌ Failed to send notification to ${sub.email}`);
+              console.log(`❌ Failed to add ${sub.email} to alert list`);
             }
             
             // Small delay between notifications to avoid overwhelming Klaviyo
@@ -612,7 +525,7 @@ async function auditBundles() {
 
   const totalTime = (Date.now() - startTime) / 1000;
   
-  console.log(`\n✅ Audit complete!`);
+  console.log(`\n✅ Audit complete with two-list system!`);
   console.log(`📦 Bundles processed: ${bundlesProcessed}`);
   console.log(`📧 Email notifications sent: ${notificationsSent}`);
   console.log(`📱 SMS notifications sent: ${smsNotificationsSent}`);
@@ -628,18 +541,19 @@ async function auditBundles() {
     totalTimeSeconds: totalTime,
     apiCallsCount,
     avgApiCallRate: apiCallsCount / totalTime,
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    system: 'Two-List (Waitlist + Alert List)'
   };
 }
 
 export async function GET() {
   try {
-    console.log('🚀 Starting rate-limited bundle audit with SMS support...');
+    console.log('🚀 Starting rate-limited bundle audit with two-list SMS support...');
     const results = await auditBundles();
     
     return NextResponse.json({ 
       success: true, 
-      message: 'Audit complete and tags updated.',
+      message: 'Audit complete with two-list system - tags updated and alert list notifications sent.',
       ...results
     });
   } catch (error) {
