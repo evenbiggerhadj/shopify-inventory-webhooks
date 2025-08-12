@@ -1,4 +1,4 @@
-// app/api/audit-bundles/route.js - COMPLETE with US phone number support
+// app/api/audit-bundles/route.js - CORRECTED with proper consent and phone handling
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
@@ -144,94 +144,27 @@ async function setSubscribers(productId, subs) {
   await redis.set(`subscribers:${productId}`, subs);
 }
 
-// === FIXED: Phone formatting for US/Canadian numbers ===
+// Phone formatting for US/Canadian numbers
 function formatPhoneNumberUS(phone) {
   if (!phone) return null;
   
-  // Remove all non-digit characters
   let cleanPhone = phone.replace(/\D/g, '');
   
-  // Handle US/Canadian numbers (prioritize these)
   if (cleanPhone.length === 10) {
-    // 10-digit number - assume US/Canadian
     return '+1' + cleanPhone;
   } else if (cleanPhone.length === 11 && cleanPhone.startsWith('1')) {
-    // 11-digit number starting with 1 - US/Canadian with country code
     return '+' + cleanPhone;
   } else if (cleanPhone.startsWith('1') && cleanPhone.length === 11) {
-    // Explicitly US/Canadian
     return '+' + cleanPhone;
-  }
-  
-  // For any other case, default to US format
-  else if (cleanPhone.length >= 10) {
-    // Take last 10 digits and add +1
+  } else if (cleanPhone.length >= 10) {
     const last10 = cleanPhone.slice(-10);
     return '+1' + last10;
   }
   
-  // Fallback - add +1 prefix
   return '+1' + cleanPhone;
 }
 
-// === Add to ALERT LIST (when item is back in stock) ===
-async function addToAlertListProperly(subscriber, productName, productUrl, alertListId) {
-  try {
-    console.log(`📋 Adding ${subscriber.email} to ALERT LIST ${alertListId} properly...`);
-    console.log(`📱 SMS Consent: ${subscriber.sms_consent}, Phone: ${subscriber.phone || 'none'}`);
-
-    // Step 1: Create or get profile for alert
-    const profileId = await createOrGetAlertProfile(subscriber, productName, productUrl);
-    
-    if (!profileId) {
-      console.error('❌ Could not create/get alert profile');
-      return false;
-    }
-    
-    console.log(`✅ Got alert profile ID: ${profileId}`);
-
-    // Step 2: Add profile to alert list
-    const addToListData = {
-      data: [{
-        type: 'profile',
-        id: profileId
-      }]
-    };
-
-    const listResponse = await fetch(`https://a.klaviyo.com/api/lists/${alertListId}/relationships/profiles/`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-        'Content-Type': 'application/json',
-        'revision': '2024-10-15'
-      },
-      body: JSON.stringify(addToListData)
-    });
-
-    console.log(`📥 Alert list addition response status: ${listResponse.status}`);
-
-    if (listResponse.ok || listResponse.status === 204) {
-      console.log(`✅ Successfully added ${subscriber.email} to ALERT LIST - flow should trigger!`);
-      
-      // Update phone if needed
-      if (subscriber.phone && subscriber.sms_consent) {
-        await updateAlertProfileWithPhone(profileId, subscriber.phone);
-      }
-      
-      return true;
-    } else {
-      const errorText = await listResponse.text();
-      console.error(`❌ Failed to add to alert list (${listResponse.status}):`, errorText);
-      return false;
-    }
-    
-  } catch (error) {
-    console.error('❌ Alert list error:', error);
-    return false;
-  }
-}
-
-// Create or get profile for alert notifications
+// CORRECTED: Create or get alert profile with phone included
 async function createOrGetAlertProfile(subscriber, productName, productUrl) {
   try {
     const profileData = {
@@ -253,6 +186,12 @@ async function createOrGetAlertProfile(subscriber, productName, productUrl) {
         }
       }
     };
+
+    // Include phone number if provided
+    if (subscriber.phone && subscriber.sms_consent) {
+      profileData.data.attributes.phone_number = subscriber.phone;
+      console.log(`📱 Including phone in alert profile: ${subscriber.phone}`);
+    }
 
     console.log(`📝 Creating alert profile for ${subscriber.email}...`);
 
@@ -288,6 +227,12 @@ async function createOrGetAlertProfile(subscriber, productName, productUrl) {
         if (result.data && result.data.length > 0) {
           const profileId = result.data[0].id;
           console.log(`✅ Found existing profile ID ${profileId} for alert`);
+          
+          // Update with alert info and phone
+          if (subscriber.phone && subscriber.sms_consent) {
+            await updateAlertProfileWithPhone(profileId, subscriber.phone, productName, productUrl);
+          }
+          
           return profileId;
         }
       }
@@ -303,10 +248,10 @@ async function createOrGetAlertProfile(subscriber, productName, productUrl) {
   }
 }
 
-// Update alert profile with phone number
-async function updateAlertProfileWithPhone(profileId, phone) {
+// Update alert profile with phone and alert info
+async function updateAlertProfileWithPhone(profileId, phone, productName, productUrl) {
   try {
-    console.log(`📱 Updating alert profile ${profileId} with phone ${phone}...`);
+    console.log(`📱 Updating alert profile ${profileId} with phone and alert info...`);
     
     const updateData = {
       data: {
@@ -315,6 +260,9 @@ async function updateAlertProfileWithPhone(profileId, phone) {
         attributes: {
           phone_number: phone,
           properties: {
+            'Back in Stock Item': productName,
+            'Back in Stock URL': productUrl,
+            'Alert Date': new Date().toISOString(),
             'SMS Phone Number': phone,
             'Alert SMS Updated': new Date().toISOString()
           }
@@ -333,19 +281,148 @@ async function updateAlertProfileWithPhone(profileId, phone) {
     });
 
     if (response.ok) {
-      console.log(`✅ Updated alert profile ${profileId} with phone number`);
+      console.log(`✅ Updated alert profile ${profileId} with phone and alert info`);
     } else {
       const errorText = await response.text();
-      console.log(`⚠️ Alert phone update warning (${response.status}):`, errorText);
+      console.log(`⚠️ Alert profile update warning (${response.status}):`, errorText);
     }
   } catch (error) {
-    console.error('❌ Alert phone update error:', error);
+    console.error('❌ Alert profile update error:', error);
   }
 }
 
-// === MAIN Audit Script with US Phone Support ===
+// CORRECTED: Set marketing consent for alert notifications
+async function setAlertMarketingConsent(profileId, email, phone, smsConsent, listId) {
+  try {
+    console.log(`📧 Setting alert marketing consent for ${email} (SMS: ${smsConsent})...`);
+    
+    const subscriptionData = {
+      data: {
+        type: 'subscription',
+        attributes: {
+          list_id: listId,
+          subscriptions: {
+            email: {
+              marketing: {
+                consent: 'SUBSCRIBED'
+              }
+            }
+          }
+        },
+        relationships: {
+          profile: {
+            data: {
+              type: 'profile',
+              id: profileId
+            }
+          }
+        }
+      }
+    };
+
+    // Add SMS consent if phone provided
+    if (phone && smsConsent) {
+      subscriptionData.data.attributes.subscriptions.sms = {
+        marketing: {
+          consent: 'SUBSCRIBED'
+        }
+      };
+      console.log(`📱 Including SMS consent for alert: ${phone}`);
+    }
+
+    const response = await fetch('https://a.klaviyo.com/api/subscriptions/', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        'Content-Type': 'application/json',
+        'revision': '2024-10-15'
+      },
+      body: JSON.stringify(subscriptionData)
+    });
+
+    console.log(`📥 Alert subscription API response status: ${response.status}`);
+
+    if (response.ok || response.status === 201) {
+      console.log(`✅ Alert marketing consent set successfully for ${email}`);
+      return true;
+    } else {
+      const errorText = await response.text();
+      console.error(`❌ Alert marketing consent failed (${response.status}):`, errorText);
+      return false;
+    }
+  } catch (error) {
+    console.error('❌ Alert marketing consent error:', error);
+    return false;
+  }
+}
+
+// CORRECTED: Add to ALERT LIST with proper consent handling
+async function addToAlertListProperly(subscriber, productName, productUrl, alertListId) {
+  try {
+    console.log(`📋 Adding ${subscriber.email} to ALERT LIST ${alertListId} with proper consent...`);
+    console.log(`📱 SMS Consent: ${subscriber.sms_consent}, Phone: ${subscriber.phone || 'none'}`);
+
+    // Step 1: Create or get profile for alert (includes phone)
+    const profileId = await createOrGetAlertProfile(subscriber, productName, productUrl);
+    
+    if (!profileId) {
+      console.error('❌ Could not create/get alert profile');
+      return false;
+    }
+    
+    console.log(`✅ Got alert profile ID: ${profileId}`);
+
+    // Step 2: Set marketing consent for alert list
+    const consentSet = await setAlertMarketingConsent(
+      profileId, 
+      subscriber.email, 
+      subscriber.phone, 
+      subscriber.sms_consent, 
+      alertListId
+    );
+    
+    if (consentSet) {
+      console.log(`✅ Alert marketing consent set for ${subscriber.email}`);
+    }
+
+    // Step 3: Add profile to alert list
+    const addToListData = {
+      data: [{
+        type: 'profile',
+        id: profileId
+      }]
+    };
+
+    const listResponse = await fetch(`https://a.klaviyo.com/api/lists/${alertListId}/relationships/profiles/`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        'Content-Type': 'application/json',
+        'revision': '2024-10-15'
+      },
+      body: JSON.stringify(addToListData)
+    });
+
+    console.log(`📥 Alert list addition response status: ${listResponse.status}`);
+
+    if (listResponse.ok || listResponse.status === 204) {
+      console.log(`✅ Successfully added ${subscriber.email} to ALERT LIST with proper consent!`);
+      return true;
+    } else {
+      const errorText = await listResponse.text();
+      console.error(`❌ Failed to add to alert list (${listResponse.status}):`, errorText);
+      return false;
+    }
+    
+  } catch (error) {
+    console.error('❌ Alert list error:', error);
+    return false;
+  }
+}
+
+// === MAIN Audit Script with Corrected Consent Handling ===
 async function auditBundles() {
-  console.log('🔍 Starting bundle audit process with US phone support and two-list SMS...');
+  console.log('🔍 Starting bundle audit process with CORRECTED consent and phone handling...');
   
   const startTime = Date.now();
   const bundles = await getProductsTaggedBundle();
@@ -408,12 +485,12 @@ async function auditBundles() {
 
       console.log(`📊 ${bundle.title} → ${prevStatus || 'unknown'} → ${status}`);
 
-      // === NOTIFY SUBSCRIBERS IF BUNDLE NOW "ok" - USES ALERT LIST ===
+      // === NOTIFY SUBSCRIBERS IF BUNDLE NOW "ok" - USES CORRECTED ALERT LIST ===
       if (
         (prevStatus === 'understocked' || prevStatus === 'out-of-stock') &&
         status === 'ok'
       ) {
-        console.log(`🔔 Bundle ${bundle.title} is back in stock! Processing subscribers with US phone support...`);
+        console.log(`🔔 Bundle ${bundle.title} is back in stock! Processing subscribers with CORRECTED consent handling...`);
         
         const subs = await getSubscribers(bundle.id);
         console.log(`📧 Found ${subs.length} subscribers for ${bundle.title}`);
@@ -433,7 +510,7 @@ async function auditBundles() {
               console.log(`📱 Reformatted phone to: ${sub.phone}`);
             }
             
-            // Use proper method to add to ALERT LIST
+            // Use CORRECTED method to add to ALERT LIST
             const success = await addToAlertListProperly(
               sub,
               bundle.title,
@@ -447,9 +524,9 @@ async function auditBundles() {
               
               if (sub.sms_consent && sub.phone) {
                 smsNotificationsSent++;
-                console.log(`✅ Added ${sub.email} to ALERT LIST - back-in-stock flow should trigger (SMS enabled to ${sub.phone})!`);
+                console.log(`✅ Added ${sub.email} to ALERT LIST with proper consent - back-in-stock flow should trigger (SMS enabled to ${sub.phone})!`);
               } else {
-                console.log(`✅ Added ${sub.email} to ALERT LIST - back-in-stock flow should trigger (email only)!`);
+                console.log(`✅ Added ${sub.email} to ALERT LIST with proper consent - back-in-stock flow should trigger (email only)!`);
               }
             } else {
               notificationErrors++;
@@ -484,7 +561,7 @@ async function auditBundles() {
 
   const totalTime = (Date.now() - startTime) / 1000;
   
-  console.log(`\n✅ US Phone Audit complete with proper two-list system!`);
+  console.log(`\n✅ CORRECTED Audit complete with proper consent and phone handling!`);
   console.log(`📦 Bundles processed: ${bundlesProcessed}`);
   console.log(`📧 Email notifications sent: ${notificationsSent}`);
   console.log(`📱 SMS notifications sent: ${smsNotificationsSent}`);
@@ -501,18 +578,18 @@ async function auditBundles() {
     apiCallsCount,
     avgApiCallRate: apiCallsCount / totalTime,
     timestamp: new Date().toISOString(),
-    system: 'US Phone Two-List (Waitlist + Alert List)'
+    system: 'CORRECTED US Phone Two-List with Proper Consent'
   };
 }
 
 export async function GET() {
   try {
-    console.log('🚀 Starting US phone bundle audit with proper two-list SMS support...');
+    console.log('🚀 Starting CORRECTED bundle audit with proper consent and phone handling...');
     const results = await auditBundles();
     
     return NextResponse.json({ 
       success: true, 
-      message: 'US Phone Audit complete - proper Klaviyo integration with waitlist and alert lists.',
+      message: 'CORRECTED Audit complete - proper Klaviyo integration with consent and phone handling.',
       ...results
     });
   } catch (error) {

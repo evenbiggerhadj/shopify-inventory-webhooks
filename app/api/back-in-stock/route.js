@@ -1,4 +1,4 @@
-// app/api/back-in-stock/route.js - COMPLETE with US phone number support
+// app/api/back-in-stock/route.js - CORRECTED with proper consent and phone handling
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
@@ -182,7 +182,7 @@ export async function POST(request) {
     try {
       waitlistSuccess = await addToWaitlistProperly(newSubscriber, BACK_IN_STOCK_WAITLIST_ID);
       if (waitlistSuccess) {
-        console.log(`✅ Successfully added ${email} to WAITLIST - confirmation flow should trigger`);
+        console.log(`✅ Successfully added ${email} to WAITLIST with proper consent - confirmation flow should trigger`);
       } else {
         console.log(`⚠️ Waitlist addition failed for ${email}, but Redis subscription successful`);
       }
@@ -340,7 +340,7 @@ export async function GET(request) {
   }
 }
 
-// FIXED: Phone number formatting for US/Canadian numbers
+// Phone number formatting for US/Canadian numbers
 function formatPhoneNumberUS(phone) {
   if (!phone) return null;
   
@@ -370,72 +370,10 @@ function formatPhoneNumberUS(phone) {
   return '+1' + cleanPhone;
 }
 
-// Add to WAITLIST properly using correct Klaviyo method
-async function addToWaitlistProperly(subscriber, waitlistId) {
-  if (!KLAVIYO_API_KEY) {
-    console.log('❌ No KLAVIYO_API_KEY found');
-    return false;
-  }
-
-  try {
-    console.log(`📋 Adding ${subscriber.email} to WAITLIST ${waitlistId} using proper method...`);
-    console.log(`📱 SMS Consent: ${subscriber.sms_consent}, Phone: ${subscriber.phone || 'none'}`);
-
-    // Step 1: Create or get profile ID
-    const profileId = await createOrGetProfile(subscriber);
-    
-    if (!profileId) {
-      console.error('❌ Could not create/get profile');
-      return false;
-    }
-    
-    console.log(`✅ Got profile ID: ${profileId}`);
-
-    // Step 2: Add profile to waitlist using relationships endpoint
-    const addToListData = {
-      data: [{
-        type: 'profile',
-        id: profileId
-      }]
-    };
-
-    const listResponse = await fetch(`https://a.klaviyo.com/api/lists/${waitlistId}/relationships/profiles/`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-        'Content-Type': 'application/json',
-        'revision': '2024-10-15'
-      },
-      body: JSON.stringify(addToListData)
-    });
-
-    console.log(`📥 List addition response status: ${listResponse.status}`);
-
-    if (listResponse.ok || listResponse.status === 204) {
-      console.log(`✅ Successfully added ${subscriber.email} to WAITLIST - flow should trigger!`);
-      
-      // Step 3: Update phone and SMS consent after adding to list
-      if (subscriber.phone && subscriber.sms_consent) {
-        await updateProfileWithPhone(profileId, subscriber.phone);
-      }
-      
-      return true;
-    } else {
-      const errorText = await listResponse.text();
-      console.error(`❌ Failed to add to waitlist (${listResponse.status}):`, errorText);
-      return false;
-    }
-    
-  } catch (error) {
-    console.error('❌ Waitlist error:', error);
-    return false;
-  }
-}
-
-// Create or get profile without subscriptions field
+// CORRECTED: Create or get profile with phone included from start
 async function createOrGetProfile(subscriber) {
   try {
-    // Simple profile creation without problematic fields
+    // Create profile with phone number included from the start
     const profileData = {
       data: {
         type: 'profile',
@@ -454,7 +392,13 @@ async function createOrGetProfile(subscriber) {
       }
     };
 
-    console.log(`📝 Creating simple profile for ${subscriber.email}...`);
+    // Add phone number if provided
+    if (subscriber.phone && subscriber.sms_consent) {
+      profileData.data.attributes.phone_number = subscriber.phone;
+      console.log(`📱 Including phone in profile creation: ${subscriber.phone}`);
+    }
+
+    console.log(`📝 Creating profile with phone for ${subscriber.email}...`);
 
     const profileResponse = await fetch('https://a.klaviyo.com/api/profiles/', {
       method: 'POST',
@@ -488,6 +432,12 @@ async function createOrGetProfile(subscriber) {
         if (result.data && result.data.length > 0) {
           const profileId = result.data[0].id;
           console.log(`✅ Found existing profile ID ${profileId}`);
+          
+          // Update the existing profile with phone
+          if (subscriber.phone && subscriber.sms_consent) {
+            await updateExistingProfileWithPhone(profileId, subscriber.phone);
+          }
+          
           return profileId;
         }
       }
@@ -503,10 +453,10 @@ async function createOrGetProfile(subscriber) {
   }
 }
 
-// Update profile with phone number after creation
-async function updateProfileWithPhone(profileId, phone) {
+// Update existing profile with phone number
+async function updateExistingProfileWithPhone(profileId, phone) {
   try {
-    console.log(`📱 Updating profile ${profileId} with phone ${phone}...`);
+    console.log(`📱 Updating existing profile ${profileId} with phone ${phone}...`);
     
     const updateData = {
       data: {
@@ -516,7 +466,7 @@ async function updateProfileWithPhone(profileId, phone) {
           phone_number: phone,
           properties: {
             'SMS Phone Number': phone,
-            'SMS Consent Updated': new Date().toISOString()
+            'Phone Updated': new Date().toISOString()
           }
         }
       }
@@ -533,12 +483,198 @@ async function updateProfileWithPhone(profileId, phone) {
     });
 
     if (response.ok) {
-      console.log(`✅ Updated profile ${profileId} with phone number`);
+      console.log(`✅ Updated existing profile ${profileId} with phone`);
     } else {
       const errorText = await response.text();
-      console.log(`⚠️ Phone update warning (${response.status}):`, errorText);
+      console.log(`⚠️ Profile phone update warning (${response.status}):`, errorText);
     }
   } catch (error) {
-    console.error('❌ Phone update error:', error);
+    console.error('❌ Profile phone update error:', error);
+  }
+}
+
+// CORRECTED: Set marketing consent using the subscription API
+async function setMarketingConsent(profileId, email, phone, smsConsent, listId) {
+  try {
+    console.log(`📧 Setting marketing consent for ${email} (SMS: ${smsConsent})...`);
+    
+    // Use the subscription API to set marketing consent
+    const subscriptionData = {
+      data: {
+        type: 'subscription',
+        attributes: {
+          list_id: listId,
+          subscriptions: {
+            email: {
+              marketing: {
+                consent: 'SUBSCRIBED'
+              }
+            }
+          }
+        },
+        relationships: {
+          profile: {
+            data: {
+              type: 'profile',
+              id: profileId
+            }
+          }
+        }
+      }
+    };
+
+    // Add SMS consent if phone provided
+    if (phone && smsConsent) {
+      subscriptionData.data.attributes.subscriptions.sms = {
+        marketing: {
+          consent: 'SUBSCRIBED'
+        }
+      };
+      console.log(`📱 Including SMS consent in subscription for ${phone}`);
+    }
+
+    const response = await fetch('https://a.klaviyo.com/api/subscriptions/', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        'Content-Type': 'application/json',
+        'revision': '2024-10-15'
+      },
+      body: JSON.stringify(subscriptionData)
+    });
+
+    console.log(`📥 Subscription API response status: ${response.status}`);
+
+    if (response.ok || response.status === 201) {
+      console.log(`✅ Marketing consent set successfully for ${email}`);
+      return true;
+    } else {
+      const errorText = await response.text();
+      console.error(`❌ Marketing consent failed (${response.status}):`, errorText);
+      
+      // Try alternative method
+      return await setConsentAlternative(profileId, email, phone, smsConsent);
+    }
+  } catch (error) {
+    console.error('❌ Marketing consent error:', error);
+    return await setConsentAlternative(profileId, email, phone, smsConsent);
+  }
+}
+
+// Alternative method to set consent
+async function setConsentAlternative(profileId, email, phone, smsConsent) {
+  try {
+    console.log(`🔄 Trying alternative consent method for ${email}...`);
+    
+    // Update profile with explicit consent properties
+    const updateData = {
+      data: {
+        type: 'profile',
+        id: profileId,
+        attributes: {
+          properties: {
+            'Email Marketing Consent': 'SUBSCRIBED',
+            'SMS Marketing Consent': smsConsent ? 'SUBSCRIBED' : 'UNSUBSCRIBED',
+            'Consent Updated': new Date().toISOString(),
+            'Accept Marketing': true
+          }
+        }
+      }
+    };
+
+    if (phone && smsConsent) {
+      updateData.data.attributes.phone_number = phone;
+    }
+
+    const response = await fetch(`https://a.klaviyo.com/api/profiles/${profileId}/`, {
+      method: 'PATCH',
+      headers: {
+        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        'Content-Type': 'application/json',
+        'revision': '2024-10-15'
+      },
+      body: JSON.stringify(updateData)
+    });
+
+    if (response.ok) {
+      console.log(`✅ Alternative consent method worked for ${email}`);
+      return true;
+    } else {
+      const errorText = await response.text();
+      console.log(`⚠️ Alternative consent warning:`, errorText);
+      return false;
+    }
+  } catch (error) {
+    console.error('❌ Alternative consent error:', error);
+    return false;
+  }
+}
+
+// CORRECTED: Main waitlist function with proper consent handling
+async function addToWaitlistProperly(subscriber, waitlistId) {
+  if (!KLAVIYO_API_KEY) {
+    console.log('❌ No KLAVIYO_API_KEY found');
+    return false;
+  }
+
+  try {
+    console.log(`📋 Adding ${subscriber.email} to WAITLIST ${waitlistId} with proper consent...`);
+    console.log(`📱 SMS Consent: ${subscriber.sms_consent}, Phone: ${subscriber.phone || 'none'}`);
+
+    // Step 1: Create or get profile ID (includes phone)
+    const profileId = await createOrGetProfile(subscriber);
+    
+    if (!profileId) {
+      console.error('❌ Could not create/get profile');
+      return false;
+    }
+    
+    console.log(`✅ Got profile ID: ${profileId}`);
+
+    // Step 2: Set marketing consent BEFORE adding to list
+    const consentSet = await setMarketingConsent(
+      profileId, 
+      subscriber.email, 
+      subscriber.phone, 
+      subscriber.sms_consent, 
+      waitlistId
+    );
+    
+    if (consentSet) {
+      console.log(`✅ Marketing consent set for ${subscriber.email}`);
+    }
+
+    // Step 3: Add profile to waitlist
+    const addToListData = {
+      data: [{
+        type: 'profile',
+        id: profileId
+      }]
+    };
+
+    const listResponse = await fetch(`https://a.klaviyo.com/api/lists/${waitlistId}/relationships/profiles/`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        'Content-Type': 'application/json',
+        'revision': '2024-10-15'
+      },
+      body: JSON.stringify(addToListData)
+    });
+
+    console.log(`📥 List addition response status: ${listResponse.status}`);
+
+    if (listResponse.ok || listResponse.status === 204) {
+      console.log(`✅ Successfully added ${subscriber.email} to WAITLIST with proper consent!`);
+      return true;
+    } else {
+      const errorText = await listResponse.text();
+      console.error(`❌ Failed to add to waitlist (${listResponse.status}):`, errorText);
+      return false;
+    }
+    
+  } catch (error) {
+    console.error('❌ Waitlist error:', error);
+    return false;
   }
 }
