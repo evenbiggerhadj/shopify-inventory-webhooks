@@ -11,10 +11,8 @@ const redis = new Redis({
 
 /* ----------------- Env ----------------- */
 const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
-// WAITLIST list (form signups)
-const WAITLIST_LIST_ID = process.env.KLAVIYO_LIST_ID;
-// used to build canonical product URLs from the handle
-const PUBLIC_STORE_DOMAIN = process.env.PUBLIC_STORE_DOMAIN || 'armadillotough.com';
+const WAITLIST_LIST_ID = process.env.KLAVIYO_LIST_ID; // waitlist list (form signups)
+const PUBLIC_STORE_DOMAIN = process.env.PUBLIC_STORE_DOMAIN || 'armadillotough.com'; // used for product URLs
 
 /* ----------------- utils ----------------- */
 function cors(resp, origin = '*') {
@@ -44,6 +42,9 @@ function splitName(full) {
 const findIdxByEmail = (arr, email) =>
   arr.findIndex(s => String(s?.email || '').toLowerCase() === String(email || '').toLowerCase());
 
+const productUrlFrom = (handle) =>
+  handle ? `https://${PUBLIC_STORE_DOMAIN}/products/${handle}` : '';
+
 /* ----------------- CORS preflight ----------------- */
 export async function OPTIONS(request) {
   return cors(new NextResponse(null, { status: 204 }), request.headers.get('origin') || '*');
@@ -71,10 +72,11 @@ export async function POST(request) {
       product_id,
       product_title,
       product_handle,
+      full_name,
       first_name,
       last_name,
-      full_name,
       sms_consent = false,
+      source = 'BIS modal',
     } = body || {};
 
     // required
@@ -101,9 +103,7 @@ export async function POST(request) {
     const smsAllowed = !!(sms_consent && phoneE164);
 
     // canonical product URL
-    const product_url = product_handle
-      ? `https://${PUBLIC_STORE_DOMAIN}/products/${product_handle}`
-      : '';
+    const product_url = productUrlFrom(product_handle);
 
     // redis upsert
     try { await redis.ping(); } catch {
@@ -163,7 +163,7 @@ export async function POST(request) {
       klaviyo_success = false; klaviyo_status = 0; klaviyo_body = e?.message || String(e);
     }
 
-    // 2) Stamp product props onto the profile so flows can use {{ profile.* }}
+    // 2) Stamp product props (for list-based flows if you use them)
     let profile_update_success = false, profile_update_status = 0, profile_update_body = '';
     try {
       const out = await updateProfileProperties({
@@ -181,7 +181,7 @@ export async function POST(request) {
       profile_update_success = false; profile_update_status = 0; profile_update_body = e?.message || String(e);
     }
 
-    // 3) Fire metric event with product context (for event-triggered flows)
+    // 3) Fire the signup event (recommended trigger for welcome/waitlist flows)
     let event_success = false, event_status = 0, event_body = '';
     try {
       const out = await trackKlaviyoEvent({
@@ -189,13 +189,13 @@ export async function POST(request) {
         email,
         phoneE164,
         properties: {
-          product_id: upserted.product_id,
+          product_id: String(upserted.product_id),
           product_title: upserted.product_title,
           product_handle: upserted.product_handle,
           product_url: upserted.product_url,
           sms_consent: !!smsAllowed,
-          source: 'BIS modal'
-        }
+          source,
+        },
       });
       event_success = out.ok; event_status = out.status; event_body = out.body;
     } catch (e) {
@@ -215,7 +215,7 @@ export async function POST(request) {
         profile_update_body,
         event_success,
         event_status,
-        event_body
+        event_body,
       }),
       origin
     );
@@ -292,18 +292,11 @@ async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
       type: 'profile-subscription-bulk-create-job',
       attributes: {
         profiles: { data: [
-          {
-            type: 'profile',
-            attributes: {
-              email,
-              ...(sms && phoneE164 ? { phone_number: phoneE164 } : {}),
-              subscriptions,
-            },
-          },
-        ]},
+          { type: 'profile', attributes: { email, ...(sms && phoneE164 ? { phone_number: phoneE164 } : {}), subscriptions } }
+        ] }
       },
-      relationships: { list: { data: { type: 'list', id: listId } } },
-    },
+      relationships: { list: { data: { type: 'list', id: listId } } }
+    }
   };
 
   const res = await fetch('https://a.klaviyo.com/api/profile-subscription-bulk-create-jobs/', {
@@ -312,9 +305,9 @@ async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
       Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
       accept: 'application/json',
       'content-type': 'application/json',
-      revision: '2024-10-15',
+      revision: '2023-10-15'
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(payload)
   });
 
   const body = await res.text();
@@ -329,32 +322,26 @@ async function updateProfileProperties({ email, properties }) {
 
   const payload = {
     data: {
-      type: 'profile-bulk-update-job',
+      type: 'profile-properties-bulk-update-job',
       attributes: {
         profiles: {
           data: [
-            {
-              type: 'profile',
-              attributes: {
-                email,
-                properties,
-              },
-            },
-          ],
-        },
-      },
-    },
+            { type: 'profile', attributes: { email, properties } }
+          ]
+        }
+      }
+    }
   };
 
-  const res = await fetch('https://a.klaviyo.com/api/profile-bulk-update-jobs/', {
+  const res = await fetch('https://a.klaviyo.com/api/profile-properties-bulk-update-jobs/', {
     method: 'POST',
     headers: {
       Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
       accept: 'application/json',
       'content-type': 'application/json',
-      revision: '2024-10-15',
+      revision: '2023-10-15'
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(payload)
   });
 
   const body = await res.text();
@@ -362,7 +349,7 @@ async function updateProfileProperties({ email, properties }) {
   return { ok: true, status: res.status, body };
 }
 
-/** Send a Klaviyo metric event with product context (for event-triggered flows) */
+/** Send a Klaviyo metric event with product context */
 async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }) {
   if (!KLAVIYO_API_KEY) throw new Error('KLAVIYO_API_KEY missing');
   if (!metricName) throw new Error('metricName missing');
@@ -387,7 +374,7 @@ async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }) {
       Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
       accept: 'application/json',
       'content-type': 'application/json',
-      revision: '2024-10-15'
+      revision: '2023-10-15'
     },
     body: JSON.stringify(body)
   });

@@ -41,7 +41,7 @@ const emailKey = (e) => `email:${String(e || '').toLowerCase()}`;
 const productUrlFrom = (handle) =>
   handle ? `https://${PUBLIC_STORE_DOMAIN}/products/${handle}` : '';
 
-/** Klaviyo: Subscribe Profiles bulk job — with list relationship (records consent properly). */
+/* ----------------- Klaviyo helpers ----------------- */
 async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
   if (!KLAVIYO_API_KEY) throw new Error('KLAVIYO_API_KEY missing');
   if (!listId) throw new Error('listId missing');
@@ -53,18 +53,9 @@ async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
   const payload = {
     data: {
       type: 'profile-subscription-bulk-create-job',
-      attributes: {
-        profiles: { data: [
-          {
-            type: 'profile',
-            attributes: {
-              email,
-              ...(sms && phoneE164 ? { phone_number: phoneE164 } : {}),
-              subscriptions,
-            },
-          },
-        ]},
-      },
+      attributes: { profiles: { data: [
+        { type: 'profile', attributes: { email, ...(sms && phoneE164 ? { phone_number: phoneE164 } : {}), subscriptions } }
+      ]}},
       relationships: { list: { data: { type: 'list', id: listId } } },
     },
   };
@@ -75,42 +66,38 @@ async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
       Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
       accept: 'application/json',
       'content-type': 'application/json',
-      revision: '2024-10-15',
+      revision: '2023-10-15',
     },
     body: JSON.stringify(payload),
   });
 
-  const body = await res.text(); // async job; acceptance is success path
+  const body = await res.text();
   if (!res.ok) throw new Error(`Klaviyo subscribe failed: ${res.status} ${res.statusText} :: ${body}`);
   return { ok: true, status: res.status, body };
 }
 
-/** Klaviyo: Profile bulk update — stamp product name/URL onto profile for flow templates */
 async function updateProfileProperties({ email, properties }) {
   if (!KLAVIYO_API_KEY) throw new Error('KLAVIYO_API_KEY missing');
   if (!email) throw new Error('email missing');
 
   const payload = {
     data: {
-      type: 'profile-bulk-update-job',
+      type: 'profile-properties-bulk-update-job',
       attributes: {
-        profiles: {
-          data: [{
-            type: 'profile',
-            attributes: { email, properties },
-          }],
-        },
-      },
-    },
+        profiles: { data: [
+          { type: 'profile', attributes: { email, properties } }
+        ] }
+      }
+    }
   };
 
-  const res = await fetch('https://a.klaviyo.com/api/profile-bulk-update-jobs/', {
+  const res = await fetch('https://a.klaviyo.com/api/profile-properties-bulk-update-jobs/', {
     method: 'POST',
     headers: {
       Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
       accept: 'application/json',
       'content-type': 'application/json',
-      revision: '2024-10-15',
+      revision: '2023-10-15',
     },
     body: JSON.stringify(payload),
   });
@@ -120,7 +107,6 @@ async function updateProfileProperties({ email, properties }) {
   return { ok: true, status: res.status, body };
 }
 
-/** Send a Klaviyo metric event with product context */
 async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }) {
   if (!KLAVIYO_API_KEY) throw new Error('KLAVIYO_API_KEY missing');
   if (!metricName) throw new Error('metricName missing');
@@ -145,9 +131,9 @@ async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }) {
       Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
       accept: 'application/json',
       'content-type': 'application/json',
-      revision: '2024-10-15'
+      revision: '2023-10-15',
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
   });
 
   const txt = await res.text();
@@ -334,26 +320,28 @@ async function auditBundles() {
               sms: smsConsent,
             });
 
-            // 2) Stamp product props so flow templates can show product name & URL
-            const stampedTitle =
-              sub.product_title || bundle.title || 'Unknown Product';
+            // 2) Stamp product props (non-blocking)
+            const stampedTitle = sub.product_title || bundle.title || 'Unknown Product';
             const stampedHandle = sub.product_handle || bundle.handle || '';
-            const stampedUrl =
-              sub.product_url || productUrlFrom(stampedHandle) || productUrl;
+            const stampedUrl = sub.product_url || productUrlFrom(stampedHandle) || productUrl;
 
-            await updateProfileProperties({
-              email: sub.email,
-              properties: {
-                last_back_in_stock_product_name: stampedTitle,
-                last_back_in_stock_product_url: stampedUrl,
-                last_back_in_stock_product_handle: stampedHandle,
-                last_back_in_stock_product_id: String(bundle.id),
-                last_back_in_stock_notified_at: new Date().toISOString(),
-              },
-            });
-            profileUpdates++;
+            try {
+              await updateProfileProperties({
+                email: sub.email,
+                properties: {
+                  last_back_in_stock_product_name: stampedTitle,
+                  last_back_in_stock_product_url: stampedUrl,
+                  last_back_in_stock_product_handle: stampedHandle,
+                  last_back_in_stock_product_id: String(bundle.id),
+                  last_back_in_stock_notified_at: new Date().toISOString(),
+                },
+              });
+              profileUpdates++;
+            } catch (e) {
+              console.warn('⚠️ Profile props write failed, continuing:', e.message);
+            }
 
-            // 3) Fire event for flows/personalization
+            // 3) Fire the event used by your flow
             await trackKlaviyoEvent({
               metricName: 'Back in Stock',
               email: sub.email,
@@ -368,7 +356,7 @@ async function auditBundles() {
               }
             });
 
-            // mark notified
+            // 4) Mark as notified and pace
             sub.notified = true;
             notificationsSent++;
             if (smsConsent) smsNotificationsSent++;
