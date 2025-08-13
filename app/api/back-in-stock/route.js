@@ -21,6 +21,7 @@ function cors(resp, origin = '*') {
   resp.headers.set('Access-Control-Allow-Origin', origin);
   resp.headers.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   resp.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  resp.headers.set('Vary', 'Origin');
   return resp;
 }
 function toE164(raw) {
@@ -78,7 +79,6 @@ export async function POST(request) {
       full_name,
       sms_consent = false,
       source = 'BIS modal',
-      force_reset_notified = false,
     } = body || {};
 
     // required
@@ -106,6 +106,7 @@ export async function POST(request) {
 
     // canonical product URL
     const product_url = productUrlFrom(product_handle);
+    
 
     // redis upsert
     try { await redis.ping(); } catch {
@@ -126,6 +127,8 @@ export async function POST(request) {
     const idx = findIdxByEmail(subscribers, email);
     const prior = idx !== -1 ? (subscribers[idx] || {}) : null;
 
+    const now = new Date().toISOString();
+
     const upserted = {
       ...(prior || {}),
       email,
@@ -133,12 +136,18 @@ export async function POST(request) {
       first_name: first_name || prior?.first_name || '',
       last_name: last_name || prior?.last_name || '',
       sms_consent: smsAllowed ? true : !!prior?.sms_consent,
+    
       product_id: String(product_id),
       product_title: product_title || prior?.product_title || 'Unknown Product',
       product_handle: product_handle || prior?.product_handle || '',
       product_url: product_url || prior?.product_url || '',
-      notified: force_reset_notified ? false : !!prior?.notified, // re-arm if requested
-      subscribed_at: prior?.subscribed_at || new Date().toISOString(),
+    
+      // 🔑 Re-arm on every submit so they’re eligible for the next OK flip
+      notified: false,
+      last_rearmed_at: now,
+      rearm_count: (prior?.rearm_count || 0) + 1,
+    
+      subscribed_at: prior?.subscribed_at || now,
       ip_address:
         request.headers.get('x-forwarded-for') ||
         request.headers.get('x-real-ip') ||
@@ -146,12 +155,12 @@ export async function POST(request) {
         'unknown',
       last_source: source,
     };
+    
 
     if (idx !== -1) subscribers[idx] = upserted;
     else subscribers.push(upserted);
 
-    await redis.set(key, subscribers, { ex: 30 * 24 * 60 * 60 });
-
+    await redis.set(key, subscribers, { ex: 90 * 24 * 60 * 60 }); // 90d
     // 1) Subscribe to WAITLIST list (records consent properly)
     let klaviyo_success = false, klaviyo_status = 0, klaviyo_body = '';
     try {
@@ -210,6 +219,7 @@ export async function POST(request) {
       NextResponse.json({
         success: true,
         message: 'Successfully subscribed to the back-in-stock waitlist',
+        rearmed: true,
         subscriber_count: subscribers.length,
         klaviyo_success,
         klaviyo_status,
@@ -317,7 +327,7 @@ async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
       Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
       accept: 'application/json',
       'content-type': 'application/json',
-      revision: '2023-10-15',
+      revision: '2024-10-15',
     },
     body: JSON.stringify(payload),
   });
@@ -341,7 +351,7 @@ async function updateProfileProperties({ email, properties }) {
       headers: {
         Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
         accept: 'application/json',
-        revision: '2023-10-15',
+        revision: '2024-10-15',
       },
     }
   );
@@ -366,7 +376,7 @@ async function updateProfileProperties({ email, properties }) {
       Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
       accept: 'application/json',
       'content-type': 'application/json',
-      revision: '2023-10-15',
+      revision: '2024-10-15',
     },
     body: JSON.stringify({
       data: {
@@ -409,7 +419,7 @@ async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }) {
       Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
       accept: 'application/json',
       'content-type': 'application/json',
-      revision: '2023-10-15'
+      revision: '2024-10-15'
     },
     body: JSON.stringify(body)
   });

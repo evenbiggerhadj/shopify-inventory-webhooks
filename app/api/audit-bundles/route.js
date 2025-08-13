@@ -68,7 +68,7 @@ async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
       Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
       accept: 'application/json',
       'content-type': 'application/json',
-      revision: '2023-10-15',
+      revision: '2024-10-15',
     },
     body: JSON.stringify(payload),
   });
@@ -91,7 +91,7 @@ async function updateProfileProperties({ email, properties }) {
       headers: {
         Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
         accept: 'application/json',
-        revision: '2023-10-15',
+        revision: '2024-10-15',
       },
     }
   );
@@ -116,7 +116,7 @@ async function updateProfileProperties({ email, properties }) {
       Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
       accept: 'application/json',
       'content-type': 'application/json',
-      revision: '2023-10-15',
+      revision: '2024-10-15',
     },
     body: JSON.stringify({
       data: {
@@ -156,7 +156,7 @@ async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }) {
       Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
       accept: 'application/json',
       'content-type': 'application/json',
-      revision: '2023-10-15',
+      revision: '2024-10-15',
     },
     body: JSON.stringify(body),
   });
