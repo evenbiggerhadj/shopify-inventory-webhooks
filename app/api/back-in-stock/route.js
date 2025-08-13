@@ -1,55 +1,70 @@
-// app/api/back-in-stock/route.js — Server-side Subscribe Profiles (with list) + Redis
+// app/api/back-in-stock/route.js — WAITLIST signup (Subscribe Profiles + Redis + product props)
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
+/* ----------------- Redis ----------------- */
 const redis = new Redis({
   url: process.env.KV_REST_API_URL,
   token: process.env.KV_REST_API_TOKEN,
-  retry: { retries: 3, retryDelayOnFailover: 100 }
+  retry: { retries: 3, retryDelayOnFailover: 100 },
 });
 
+/* ----------------- Env ----------------- */
 const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
-// Back-in-stock WAITLIST Klaviyo list (set to your real list)
-const BACK_IN_STOCK_LIST_ID = process.env.KLAVIYO_BACK_IN_STOCK_LIST_ID || 'WG9GbK';
+// WAITLIST list (form signups)
+const WAITLIST_LIST_ID = process.env.KLAVIYO_LIST_ID;
+// used to build canonical product URLs from the handle
+const PUBLIC_STORE_DOMAIN = process.env.PUBLIC_STORE_DOMAIN || 'armadillotough.com';
 
 /* ----------------- utils ----------------- */
-function cors(resp, origin='*'){
+function cors(resp, origin = '*') {
   resp.headers.set('Access-Control-Allow-Origin', origin);
-  resp.headers.set('Access-Control-Allow-Methods','GET,POST,OPTIONS');
-  resp.headers.set('Access-Control-Allow-Headers','Content-Type, Authorization');
+  resp.headers.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  resp.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   return resp;
 }
-function toE164(raw){
+function toE164(raw) {
   if (!raw) return null;
   let v = String(raw).trim().replace(/[^\d+]/g, '');
-  if (v.startsWith('+')) return /^\+\d{8,15}$/.test(v) ? v : null;   // strict E.164
-  if (/^0\d{10}$/.test(v)) return '+234' + v.slice(1);               // NG local 0XXXXXXXXXX
-  if (/^(70|80|81|90|91)\d{8}$/.test(v)) return '+234' + v;          // NG 10-digit
-  if (/^\d{10}$/.test(v)) return '+1' + v;                           // US 10-digit
+  if (v.startsWith('+')) return /^\+\d{8,15}$/.test(v) ? v : null; // strict E.164
+  if (/^0\d{10}$/.test(v)) return '+234' + v.slice(1);            // NG local 0XXXXXXXXXX
+  if (/^(70|80|81|90|91)\d{8}$/.test(v)) return '+234' + v;       // NG 10-digit
+  if (/^\d{10}$/.test(v)) return '+1' + v;                         // US 10-digit
   return null;
 }
-function splitName(full){
-  const s = String(full||'').trim();
-  if (!s) return { first_name:'', last_name:'' };
+function splitName(full) {
+  const s = String(full || '').trim();
+  if (!s) return { first_name: '', last_name: '' };
   const parts = s.split(/\s+/);
   if (parts.length === 1) return { first_name: parts[0], last_name: '' };
   const first_name = parts.shift();
-  const last_name  = parts.join(' ');
+  const last_name = parts.join(' ');
   return { first_name, last_name };
 }
+const findIdxByEmail = (arr, email) =>
+  arr.findIndex(s => String(s?.email || '').toLowerCase() === String(email || '').toLowerCase());
 
-/* ----------------- CORS ----------------- */
-export async function OPTIONS(request){
+/* ----------------- CORS preflight ----------------- */
+export async function OPTIONS(request) {
   return cors(new NextResponse(null, { status: 204 }), request.headers.get('origin') || '*');
 }
 
-/* ----------------- POST ----------------- */
+/* ----------------- POST — create/merge waitlist signup ----------------- */
 export async function POST(request) {
   const origin = request.headers.get('origin') || '*';
 
   try {
-    const body = await request.json();
+    if (!KLAVIYO_API_KEY || !WAITLIST_LIST_ID) {
+      return cors(
+        NextResponse.json(
+          { success: false, error: 'Server misconfigured: missing KLAVIYO_API_KEY or KLAVIYO_LIST_ID' },
+          { status: 500 }
+        ),
+        origin
+      );
+    }
 
+    const body = await request.json();
     let {
       email,
       phone,
@@ -59,34 +74,43 @@ export async function POST(request) {
       first_name,
       last_name,
       full_name,
-      sms_consent = false
+      sms_consent = false,
     } = body || {};
 
-    // Validate
+    // required
     if (!email || !product_id) {
-      return cors(NextResponse.json({
-        success: false, error: 'Missing required fields: email and product_id'
-      }, { status: 400 }), origin);
+      return cors(
+        NextResponse.json({ success: false, error: 'Missing required fields: email and product_id' }, { status: 400 }),
+        origin
+      );
     }
     const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email).trim());
     if (!emailOk) {
-      return cors(NextResponse.json({ success:false, error:'Invalid email format' }, { status:400 }), origin);
+      return cors(NextResponse.json({ success: false, error: 'Invalid email format' }, { status: 400 }), origin);
     }
 
-    // Names
+    // names
     if ((!first_name && !last_name) && full_name) {
       const spl = splitName(full_name);
       first_name = spl.first_name;
       last_name = spl.last_name;
     }
 
-    // Normalize phone & compute sms eligibility
+    // phone + consent
     const phoneE164 = toE164(phone);
     const smsAllowed = !!(sms_consent && phoneE164);
 
-    // Redis upsert
+    // canonical product URL
+    const product_url = product_handle
+      ? `https://${PUBLIC_STORE_DOMAIN}/products/${product_handle}`
+      : '';
+
+    // redis upsert
     try { await redis.ping(); } catch {
-      return cors(NextResponse.json({ success:false, error:'Database connection failed. Please try again.' }, { status:500 }), origin);
+      return cors(
+        NextResponse.json({ success: false, error: 'Database connection failed. Please try again.' }, { status: 500 }),
+        origin
+      );
     }
 
     const key = `subscribers:${product_id}`;
@@ -97,63 +121,97 @@ export async function POST(request) {
       else if (typeof existing === 'string') subscribers = JSON.parse(existing || '[]');
     } catch { subscribers = []; }
 
-    if (subscribers.find(s => s?.email === email)) {
-      return cors(NextResponse.json({
-        success: true,
-        message: 'You are already subscribed to notifications for this product',
-        alreadySubscribed: true,
-        subscriber_count: subscribers.length
-      }), origin);
-    }
+    const idx = findIdxByEmail(subscribers, email);
+    const prior = idx !== -1 ? (subscribers[idx] || {}) : null;
 
-    const newSubscriber = {
+    const upserted = {
+      ...(prior || {}),
       email,
-      phone: phoneE164 || '',
+      phone: phoneE164 || prior?.phone || '',
+      first_name: first_name || prior?.first_name || '',
+      last_name: last_name || prior?.last_name || '',
+      sms_consent: smsAllowed ? true : !!prior?.sms_consent,
       product_id: String(product_id),
-      product_title: product_title || 'Unknown Product',
-      product_handle: product_handle || '',
-      first_name: first_name || '',
-      last_name: last_name || '',
-      sms_consent: smsAllowed,
-      notified: false,
-      subscribed_at: new Date().toISOString(),
-      ip_address: request.headers.get('x-forwarded-for') ||
-                  request.headers.get('x-real-ip') || 'unknown'
+      product_title: product_title || prior?.product_title || 'Unknown Product',
+      product_handle: product_handle || prior?.product_handle || '',
+      product_url: product_url || prior?.product_url || '',
+      notified: !!prior?.notified,
+      subscribed_at: prior?.subscribed_at || new Date().toISOString(),
+      ip_address:
+        request.headers.get('x-forwarded-for') ||
+        request.headers.get('x-real-ip') ||
+        prior?.ip_address ||
+        'unknown',
     };
 
-    subscribers.push(newSubscriber);
-    try { await redis.set(key, subscribers, { ex: 30 * 24 * 60 * 60 }); }
-    catch { return cors(NextResponse.json({ success:false, error:'Failed to save subscription. Please try again.' }, { status:500 }), origin); }
+    if (idx !== -1) subscribers[idx] = upserted;
+    else subscribers.push(upserted);
 
-    // Klaviyo Subscribe Profiles (bulk create job)
+    await redis.set(key, subscribers, { ex: 30 * 24 * 60 * 60 });
+
+    // 1) Subscribe to WAITLIST list (records consent properly)
     let klaviyo_success = false, klaviyo_status = 0, klaviyo_body = '';
     try {
       const out = await subscribeProfilesToList({
-        listId: BACK_IN_STOCK_LIST_ID, email, phoneE164, sms: smsAllowed
+        listId: WAITLIST_LIST_ID,
+        email,
+        phoneE164,
+        sms: smsAllowed,
       });
       klaviyo_success = out.ok; klaviyo_status = out.status; klaviyo_body = out.body;
     } catch (e) {
       klaviyo_success = false; klaviyo_status = 0; klaviyo_body = e?.message || String(e);
     }
 
-    return cors(NextResponse.json({
-      success: true,
-      message: 'Successfully subscribed to back-in-stock notifications',
-      subscriber_count: subscribers.length,
-      klaviyo_success,
-      klaviyo_status,
-      klaviyo_body
-    }), origin);
+    // 2) Stamp product props onto the profile so flows can use {{ profile.* }}
+    let profile_update_success = false, profile_update_status = 0, profile_update_body = '';
+    try {
+      const out = await updateProfileProperties({
+        email,
+        properties: {
+          last_waitlist_product_name: upserted.product_title,
+          last_waitlist_product_url: upserted.product_url,
+          last_waitlist_product_handle: upserted.product_handle,
+          last_waitlist_product_id: upserted.product_id,
+          last_waitlist_subscribed_at: upserted.subscribed_at,
+        },
+      });
+      profile_update_success = out.ok; profile_update_status = out.status; profile_update_body = out.body;
+    } catch (e) {
+      profile_update_success = false; profile_update_status = 0; profile_update_body = e?.message || String(e);
+    }
+
+    return cors(
+      NextResponse.json({
+        success: true,
+        message: 'Successfully subscribed to the back-in-stock waitlist',
+        subscriber_count: subscribers.length,
+        klaviyo_success,
+        klaviyo_status,
+        klaviyo_body,
+        profile_update_success,
+        profile_update_status,
+        profile_update_body,
+      }),
+      origin
+    );
 
   } catch (error) {
-    return cors(NextResponse.json({
-      success:false, error:'Server error. Please try again.',
-      details: process.env.NODE_ENV === 'development' ? error?.message : undefined
-    }, { status:500 }), origin);
+    return cors(
+      NextResponse.json(
+        {
+          success: false,
+          error: 'Server error. Please try again.',
+          details: process.env.NODE_ENV === 'development' ? error?.message : undefined,
+        },
+        { status: 500 }
+      ),
+      origin
+    );
   }
 }
 
-/* ----------------- GET ----------------- */
+/* ----------------- GET — check if a given email is on the waitlist for a product ----------------- */
 export async function GET(request) {
   const origin = request.headers.get('origin') || '*';
   try {
@@ -162,9 +220,10 @@ export async function GET(request) {
     const product_id = searchParams.get('product_id');
 
     if (!email || !product_id) {
-      return cors(NextResponse.json({
-        success:false, error:'Missing email or product_id parameters'
-      }, { status:400 }), origin);
+      return cors(
+        NextResponse.json({ success: false, error: 'Missing email or product_id parameters' }, { status: 400 }),
+        origin
+      );
     }
 
     await redis.ping();
@@ -173,23 +232,29 @@ export async function GET(request) {
     if (typeof subs === 'string') { try { subs = JSON.parse(subs); } catch { subs = []; } }
     if (!Array.isArray(subs)) subs = [];
 
-    const sub = subs.find(s => s?.email === email);
-    return cors(NextResponse.json({
-      success: true,
-      subscribed: !!sub,
-      total_subscribers: subs.length,
-      subscription_details: sub ? {
-        subscribed_at: sub.subscribed_at,
-        notified: sub.notified,
-        sms_consent: !!sub.sms_consent
-      } : null
-    }), origin);
+    const sub = subs.find(s => String(s?.email || '').toLowerCase() === String(email).toLowerCase());
+    return cors(
+      NextResponse.json({
+        success: true,
+        subscribed: !!sub,
+        total_subscribers: subs.length,
+        subscription_details: sub ? {
+          subscribed_at: sub.subscribed_at,
+          notified: sub.notified,
+          sms_consent: !!sub.sms_consent,
+          product_title: sub.product_title,
+          product_handle: sub.product_handle,
+          product_url: sub.product_url,
+        } : null,
+      }),
+      origin
+    );
   } catch (error) {
-    return cors(NextResponse.json({ success:false, error:error?.message || 'Error' }, { status:500 }), origin);
+    return cors(NextResponse.json({ success: false, error: error?.message || 'Error' }, { status: 500 }), origin);
   }
 }
 
-/* ----------------- Klaviyo Subscribe Profiles helper ----------------- */
+/* ----------------- Klaviyo helpers ----------------- */
 async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
   if (!KLAVIYO_API_KEY) throw new Error('KLAVIYO_API_KEY missing');
   if (!listId) throw new Error('List ID missing');
@@ -208,27 +273,67 @@ async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
             attributes: {
               email,
               ...(sms && phoneE164 ? { phone_number: phoneE164 } : {}),
-              subscriptions
-            }
-          }
-        ] }
+              subscriptions,
+            },
+          },
+        ]},
       },
-      relationships: { list: { data: { type: 'list', id: listId } } }
-    }
+      relationships: { list: { data: { type: 'list', id: listId } } },
+    },
   };
 
   const res = await fetch('https://a.klaviyo.com/api/profile-subscription-bulk-create-jobs/', {
     method: 'POST',
     headers: {
-      'Authorization': `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-      'accept': 'application/json',
+      Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+      accept: 'application/json',
       'content-type': 'application/json',
-      'revision': '2024-10-15'
+      revision: '2024-10-15',
     },
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
   });
 
-  const body = await res.text(); // async job — acceptance is enough here
+  const body = await res.text();
   if (!res.ok) throw new Error(`Subscribe Profiles failed: ${res.status} ${res.statusText} :: ${body}`);
-  return { ok:true, status:res.status, body };
+  return { ok: true, status: res.status, body };
+}
+
+/** Upsert custom properties on the profile so flows can reference {{ profile.* }} */
+async function updateProfileProperties({ email, properties }) {
+  if (!KLAVIYO_API_KEY) throw new Error('KLAVIYO_API_KEY missing');
+  if (!email) throw new Error('Email missing');
+
+  const payload = {
+    data: {
+      type: 'profile-bulk-update-job',
+      attributes: {
+        profiles: {
+          data: [
+            {
+              type: 'profile',
+              attributes: {
+                email,
+                properties, // arbitrary custom fields
+              },
+            },
+          ],
+        },
+      },
+    },
+  };
+
+  const res = await fetch('https://a.klaviyo.com/api/profile-bulk-update-jobs/', {
+    method: 'POST',
+    headers: {
+      Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+      accept: 'application/json',
+      'content-type': 'application/json',
+      revision: '2024-10-15',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const body = await res.text();
+  if (!res.ok) throw new Error(`Profile properties update failed: ${res.status} ${res.statusText} :: ${body}`);
+  return { ok: true, status: res.status, body };
 }
