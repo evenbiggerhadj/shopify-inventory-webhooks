@@ -1,6 +1,4 @@
-// app/api/audit-bundles/route.js — Audit bundles + notify waitlist
-// - Subscribe Profiles (alert list) + profile props + Back in Stock event
-// - "Catch-up" send if already OK but un-notified subs exist
+// app/api/audit-bundles/route.js — Audit bundles + notify waitlist (Subscribe Profiles + profile props + event)
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
@@ -75,43 +73,63 @@ async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
     body: JSON.stringify(payload),
   });
 
-  const body = await res.text(); // async job; acceptance is success path
+  const body = await res.text();
   if (!res.ok) throw new Error(`Klaviyo subscribe failed: ${res.status} ${res.statusText} :: ${body}`);
   return { ok: true, status: res.status, body };
 }
 
 async function updateProfileProperties({ email, properties }) {
   if (!KLAVIYO_API_KEY) throw new Error('KLAVIYO_API_KEY missing');
-  if (!email) throw new Error('email missing');
+  if (!email) throw new Error('Email missing');
 
-  const payload = {
-    data: {
-      type: 'profile-properties-bulk-update-job',
-      attributes: {
-        profiles: {
-          data: [{
-            type: 'profile',
-            attributes: { email, properties },
-          }],
-        },
+  // 1) Find profile id by email
+  const filter = `equals(email,"${String(email).replace(/"/g, '\\"')}")`;
+  const listRes = await fetch(
+    `https://a.klaviyo.com/api/profiles/?filter=${encodeURIComponent(filter)}&page[size]=1`,
+    {
+      method: 'GET',
+      headers: {
+        Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        accept: 'application/json',
+        revision: '2023-10-15',
       },
-    },
-  };
+    }
+  );
 
-  const res = await fetch('https://a.klaviyo.com/api/profile-properties-bulk-update-jobs/', {
-    method: 'POST',
+  if (!listRes.ok) {
+    const txt = await listRes.text();
+    throw new Error(`Profiles lookup failed: ${listRes.status} ${listRes.statusText} :: ${txt}`);
+  }
+
+  const listJson = await listRes.json();
+  const id = listJson?.data?.[0]?.id;
+
+  // If the profile isn’t visible yet, skip gracefully.
+  if (!id) {
+    return { ok: false, status: 404, body: 'profile_not_found', skipped: true };
+  }
+
+  // 2) Patch properties
+  const patchRes = await fetch(`https://a.klaviyo.com/api/profiles/${id}/`, {
+    method: 'PATCH',
     headers: {
       Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
       accept: 'application/json',
       'content-type': 'application/json',
       revision: '2023-10-15',
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      data: {
+        type: 'profile',
+        id,
+        attributes: { properties },
+      },
+    }),
   });
 
-  const body = await res.text();
-  if (!res.ok) throw new Error(`Profile properties update failed: ${res.status} ${res.statusText} :: ${body}`);
-  return { ok: true, status: res.status, body };
+  const txt = await patchRes.text();
+  if (!patchRes.ok) throw new Error(`Profile PATCH failed: ${patchRes.status} ${patchRes.statusText} :: ${txt}`);
+  return { ok: true, status: patchRes.status, body: txt };
 }
 
 async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }) {
@@ -292,16 +310,10 @@ async function auditBundles() {
       await setBundleStatus(bundle.id, prevStatus, status);
       console.log(`📊 ${bundle.title}: ${prevStatus || 'unknown'} → ${status}`);
 
-      // ---------- notification decision ----------
-      const subs = (await getSubscribers(bundle.id)) || [];
-      const hasUnnotified = subs.some(s => !s?.notified);
+      // If moving back to OK, notify all not-yet-notified subscribers
+      if ((prevStatus === 'understocked' || prevStatus === 'out-of-stock') && status === 'ok') {
+        const subs = (await getSubscribers(bundle.id)) || [];
 
-      // notify on restock transition, OR catch-up if already ok but we have unnotified subs
-      const restockedNow =
-        (prevStatus === 'understocked' || prevStatus === 'out-of-stock') && status === 'ok';
-      const shouldNotify = restockedNow || (status === 'ok' && hasUnnotified);
-
-      if (shouldNotify) {
         // de-dupe by normalized phone; fall back to email
         const seen = new Set();
         const uniqueSubs = [];
@@ -333,39 +345,39 @@ async function auditBundles() {
               sms: smsConsent,
             });
 
-            // 2) Stamp product props (best effort)
-            const stampedTitle  = sub.product_title  || bundle.title || 'Unknown Product';
+            // 2) Stamp product props (best-effort)
+            const stampedTitle = sub.product_title || bundle.title || 'Unknown Product';
             const stampedHandle = sub.product_handle || bundle.handle || '';
-            const stampedUrl    = sub.product_url    || productUrlFrom(stampedHandle) || productUrl;
+            const stampedUrl = sub.product_url || productUrlFrom(stampedHandle) || productUrl;
 
             try {
-              await updateProfileProperties({
+              const out = await updateProfileProperties({
                 email: sub.email,
                 properties: {
-                  last_back_in_stock_product_name:   stampedTitle,
-                  last_back_in_stock_product_url:    stampedUrl,
+                  last_back_in_stock_product_name: stampedTitle,
+                  last_back_in_stock_product_url: stampedUrl,
                   last_back_in_stock_product_handle: stampedHandle,
-                  last_back_in_stock_product_id:     String(bundle.id),
-                  last_back_in_stock_notified_at:    new Date().toISOString(),
+                  last_back_in_stock_product_id: String(bundle.id),
+                  last_back_in_stock_notified_at: new Date().toISOString(),
                 },
               });
-              profileUpdates++;
+              if (out.ok) profileUpdates++;
             } catch (e) {
               console.warn('⚠️ Profile props write failed, continuing:', e.message);
             }
 
-            // 3) Fire the event used by your alert flow
+            // 3) Fire the event used by your notification flow
             await trackKlaviyoEvent({
               metricName: 'Back in Stock',
               email: sub.email,
               phoneE164,
               properties: {
-                product_id:     String(bundle.id),
-                product_title:  stampedTitle,
+                product_id: String(bundle.id),
+                product_title: stampedTitle,
                 product_handle: stampedHandle,
-                product_url:    stampedUrl,
-                sms_consent:    !!smsConsent,
-                source:         restockedNow ? 'bundle audit' : 'catch-up'
+                product_url: stampedUrl,
+                sms_consent: !!smsConsent,
+                source: 'bundle audit',
               }
             });
 
@@ -427,7 +439,7 @@ export async function GET() {
     const results = await auditBundles();
     return NextResponse.json({
       success: true,
-      message: 'Audit complete and tags updated (Klaviyo Subscribe Profiles + profile props + event + catch-up).',
+      message: 'Audit complete and tags updated (Klaviyo Subscribe Profiles + profile props + event).',
       ...results,
     });
   } catch (error) {

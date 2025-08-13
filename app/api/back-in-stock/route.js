@@ -1,7 +1,4 @@
-// app/api/back-in-stock/route.js — WAITLIST signup
-// - Subscribe Profiles (records consent) + Redis
-// - Stamp product props on profile
-// - Fire "Back in Stock Subscription" event
+// app/api/back-in-stock/route.js — WAITLIST signup (Subscribe Profiles + Redis + product props + event)
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
@@ -46,6 +43,8 @@ function splitName(full) {
 }
 const findIdxByEmail = (arr, email) =>
   arr.findIndex(s => String(s?.email || '').toLowerCase() === String(email || '').toLowerCase());
+const productUrlFrom = (handle) =>
+  handle ? `https://${PUBLIC_STORE_DOMAIN}/products/${handle}` : '';
 
 /* ----------------- CORS preflight ----------------- */
 export async function OPTIONS(request) {
@@ -79,7 +78,6 @@ export async function POST(request) {
       full_name,
       sms_consent = false,
       source = 'BIS modal',
-      // NEW — let re-submits re-arm their own record
       force_reset_notified = false,
     } = body || {};
 
@@ -107,9 +105,7 @@ export async function POST(request) {
     const smsAllowed = !!(sms_consent && phoneE164);
 
     // canonical product URL
-    const product_url = product_handle
-      ? `https://${PUBLIC_STORE_DOMAIN}/products/${product_handle}`
-      : '';
+    const product_url = productUrlFrom(product_handle);
 
     // redis upsert
     try { await redis.ping(); } catch {
@@ -141,14 +137,14 @@ export async function POST(request) {
       product_title: product_title || prior?.product_title || 'Unknown Product',
       product_handle: product_handle || prior?.product_handle || '',
       product_url: product_url || prior?.product_url || '',
-      // KEY: when customer re-submits with the flag, make them eligible again
-      notified: force_reset_notified ? false : !!prior?.notified,
+      notified: force_reset_notified ? false : !!prior?.notified, // re-arm if requested
       subscribed_at: prior?.subscribed_at || new Date().toISOString(),
       ip_address:
         request.headers.get('x-forwarded-for') ||
         request.headers.get('x-real-ip') ||
         prior?.ip_address ||
         'unknown',
+      last_source: source,
     };
 
     if (idx !== -1) subscribers[idx] = upserted;
@@ -171,7 +167,7 @@ export async function POST(request) {
     }
 
     // 2) Stamp product props onto the profile so flows can use {{ profile.* }}
-    let profile_update_success = false, profile_update_status = 0, profile_update_body = '';
+    let profile_update_success = false, profile_update_status = 0, profile_update_body = '', profile_update_skipped = false;
     try {
       const out = await updateProfileProperties({
         email,
@@ -183,12 +179,13 @@ export async function POST(request) {
           last_waitlist_subscribed_at: upserted.subscribed_at,
         },
       });
-      profile_update_success = out.ok; profile_update_status = out.status; profile_update_body = out.body;
+      profile_update_success = !!out.ok; profile_update_status = out.status || 0; profile_update_body = out.body || '';
+      profile_update_skipped = !!out.skipped;
     } catch (e) {
       profile_update_success = false; profile_update_status = 0; profile_update_body = e?.message || String(e);
     }
 
-    // 3) Fire "Back in Stock Subscription" event for your signup flow
+    // 3) Fire an event your signup flow can trigger on
     let event_success = false, event_status = 0, event_body = '';
     try {
       const out = await trackKlaviyoEvent({
@@ -196,13 +193,13 @@ export async function POST(request) {
         email,
         phoneE164,
         properties: {
-          product_id: String(upserted.product_id),
+          product_id: String(product_id),
           product_title: upserted.product_title,
           product_handle: upserted.product_handle,
           product_url: upserted.product_url,
           sms_consent: !!smsAllowed,
-          source
-        }
+          source,
+        },
       });
       event_success = out.ok; event_status = out.status; event_body = out.body;
     } catch (e) {
@@ -220,6 +217,7 @@ export async function POST(request) {
         profile_update_success,
         profile_update_status,
         profile_update_body,
+        profile_update_skipped,
         event_success,
         event_status,
         event_body,
@@ -329,44 +327,61 @@ async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
   return { ok: true, status: res.status, body };
 }
 
-/** Upsert custom properties on the profile so flows can reference {{ profile.* }} */
+/** Upsert custom properties on the profile (GET by email → PATCH by id) */
 async function updateProfileProperties({ email, properties }) {
   if (!KLAVIYO_API_KEY) throw new Error('KLAVIYO_API_KEY missing');
   if (!email) throw new Error('Email missing');
 
-  const payload = {
-    data: {
-      type: 'profile-properties-bulk-update-job',
-      attributes: {
-        profiles: {
-          data: [
-            {
-              type: 'profile',
-              attributes: {
-                email,
-                properties, // arbitrary custom fields
-              },
-            },
-          ],
-        },
+  // 1) Find profile id by email
+  const filter = `equals(email,"${String(email).replace(/"/g, '\\"')}")`;
+  const listRes = await fetch(
+    `https://a.klaviyo.com/api/profiles/?filter=${encodeURIComponent(filter)}&page[size]=1`,
+    {
+      method: 'GET',
+      headers: {
+        Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        accept: 'application/json',
+        revision: '2023-10-15',
       },
-    },
-  };
+    }
+  );
 
-  const res = await fetch('https://a.klaviyo.com/api/profile-properties-bulk-update-jobs/', {
-    method: 'POST',
+  if (!listRes.ok) {
+    const txt = await listRes.text();
+    throw new Error(`Profiles lookup failed: ${listRes.status} ${listRes.statusText} :: ${txt}`);
+  }
+
+  const listJson = await listRes.json();
+  const id = listJson?.data?.[0]?.id;
+
+  // If we can’t see the profile yet (subscribe job is async), skip gracefully.
+  if (!id) {
+    return { ok: false, status: 404, body: 'profile_not_found', skipped: true };
+  }
+
+  // 2) Patch properties on the profile
+  const patchRes = await fetch(`https://a.klaviyo.com/api/profiles/${id}/`, {
+    method: 'PATCH',
     headers: {
       Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
       accept: 'application/json',
       'content-type': 'application/json',
       revision: '2023-10-15',
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      data: {
+        type: 'profile',
+        id,
+        attributes: { properties },
+      },
+    }),
   });
 
-  const body = await res.text();
-  if (!res.ok) throw new Error(`Profile properties update failed: ${res.status} ${res.statusText} :: ${body}`);
-  return { ok: true, status: res.status, body };
+  const txt = await patchRes.text();
+  if (!patchRes.ok) {
+    throw new Error(`Profile PATCH failed: ${patchRes.status} ${patchRes.statusText} :: ${txt}`);
+  }
+  return { ok: true, status: patchRes.status, body: txt };
 }
 
 /** Send a Klaviyo metric event with product context */
@@ -394,9 +409,9 @@ async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }) {
       Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
       accept: 'application/json',
       'content-type': 'application/json',
-      revision: '2023-10-15',
+      revision: '2023-10-15'
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(body)
   });
 
   const txt = await res.text();
