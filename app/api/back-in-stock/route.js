@@ -10,11 +10,20 @@ const redis = new Redis({
 });
 
 /* ----------------- Env ----------------- */
-const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
-// WAITLIST list (form signups)
-const WAITLIST_LIST_ID = process.env.KLAVIYO_LIST_ID;
-// used to build canonical product URLs from the handle
+const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;     // required
+const WAITLIST_LIST_ID = process.env.KLAVIYO_LIST_ID;    // required (BIS form list)
 const PUBLIC_STORE_DOMAIN = process.env.PUBLIC_STORE_DOMAIN || 'armadillotough.com';
+
+/* ----------------- CORS allowlist ----------------- */
+const ALLOW_ORIGINS = [
+  'https://armadillotough.com',
+  'https://www.armadillotough.com',
+  'https://armadillotough.myshopify.com',
+];
+const pickOrigin = (req) => {
+  const o = req.headers.get('origin');
+  return ALLOW_ORIGINS.includes(o) ? o : ALLOW_ORIGINS[0];
+};
 
 /* ----------------- utils ----------------- */
 function cors(resp, origin = '*') {
@@ -29,7 +38,7 @@ function toE164(raw) {
   let v = String(raw).trim().replace(/[^\d+]/g, '');
   if (v.startsWith('+')) return /^\+\d{8,15}$/.test(v) ? v : null; // strict E.164
   if (/^0\d{10}$/.test(v)) return '+234' + v.slice(1);            // NG local 0XXXXXXXXXX
-  if (/^(70|80|81|90|91)\d{8}$/.test(v)) return '+234' + v;       // NG 10-digit
+  if (/^(70|80|81|90|91)\d{8}$/.test(v)) return '+234' + v;        // NG 10-digit
   if (/^\d{10}$/.test(v)) return '+1' + v;                         // US 10-digit
   return null;
 }
@@ -44,17 +53,25 @@ function splitName(full) {
 }
 const findIdxByEmail = (arr, email) =>
   arr.findIndex(s => String(s?.email || '').toLowerCase() === String(email || '').toLowerCase());
+
+const normalizeProductId = (raw) => {
+  if (!raw) return '';
+  const n = String(raw);
+  // supports raw number, "gid://shopify/Product/123", "product-123", etc.
+  const m = n.match(/(\d{5,})$/);
+  return m ? m[1] : n.replace(/[^\d]/g, '') || n;
+};
 const productUrlFrom = (handle) =>
   handle ? `https://${PUBLIC_STORE_DOMAIN}/products/${handle}` : '';
 
 /* ----------------- CORS preflight ----------------- */
 export async function OPTIONS(request) {
-  return cors(new NextResponse(null, { status: 204 }), request.headers.get('origin') || '*');
+  return cors(new NextResponse(null, { status: 204 }), pickOrigin(request));
 }
 
 /* ----------------- POST — create/merge waitlist signup ----------------- */
 export async function POST(request) {
-  const origin = request.headers.get('origin') || '*';
+  const origin = pickOrigin(request);
 
   try {
     if (!KLAVIYO_API_KEY || !WAITLIST_LIST_ID) {
@@ -104,9 +121,10 @@ export async function POST(request) {
     const phoneE164 = toE164(phone);
     const smsAllowed = !!(sms_consent && phoneE164);
 
-    // canonical product URL
-    const product_url = productUrlFrom(product_handle);
-    
+    // product identity
+    const pid = normalizeProductId(product_id);
+    const handle = String(product_handle || '').trim();
+    const product_url = productUrlFrom(handle);
 
     // redis upsert
     try { await redis.ping(); } catch {
@@ -116,13 +134,32 @@ export async function POST(request) {
       );
     }
 
-    const key = `subscribers:${product_id}`;
-    let subscribers = [];
-    try {
-      const existing = await redis.get(key);
-      if (Array.isArray(existing)) subscribers = existing;
-      else if (typeof existing === 'string') subscribers = JSON.parse(existing || '[]');
-    } catch { subscribers = []; }
+    const idKey = `subscribers:${pid}`;
+    const handleKey = handle ? `subscribers_handle:${handle}` : null;
+
+    const readList = async (key) => {
+      if (!key) return [];
+      const v = await redis.get(key);
+      if (Array.isArray(v)) return v;
+      if (typeof v === 'string') { try { return JSON.parse(v); } catch { return []; } }
+      return [];
+    };
+
+    // read both keys and merge by email (latest re-arm wins)
+    const [byId, byHandle] = await Promise.all([readList(idKey), readList(handleKey)]);
+    const mergedMap = new Map();
+    const stamp = (x) => {
+      const k = String(x?.email || '').toLowerCase();
+      const prev = mergedMap.get(k);
+      if (!prev) mergedMap.set(k, x);
+      else {
+        const a = Date.parse(x?.last_rearmed_at || x?.subscribed_at || 0);
+        const b = Date.parse(prev?.last_rearmed_at || prev?.subscribed_at || 0);
+        mergedMap.set(k, a >= b ? x : prev);
+      }
+    };
+    [...byId, ...byHandle].forEach(stamp);
+    const subscribers = Array.from(mergedMap.values());
 
     const idx = findIdxByEmail(subscribers, email);
     const prior = idx !== -1 ? (subscribers[idx] || {}) : null;
@@ -136,17 +173,14 @@ export async function POST(request) {
       first_name: first_name || prior?.first_name || '',
       last_name: last_name || prior?.last_name || '',
       sms_consent: smsAllowed ? true : !!prior?.sms_consent,
-    
-      product_id: String(product_id),
+      product_id: String(pid),
       product_title: product_title || prior?.product_title || 'Unknown Product',
-      product_handle: product_handle || prior?.product_handle || '',
+      product_handle: handle || prior?.product_handle || '',
       product_url: product_url || prior?.product_url || '',
-    
       // 🔑 Re-arm on every submit so they’re eligible for the next OK flip
       notified: false,
       last_rearmed_at: now,
       rearm_count: (prior?.rearm_count || 0) + 1,
-    
       subscribed_at: prior?.subscribed_at || now,
       ip_address:
         request.headers.get('x-forwarded-for') ||
@@ -155,12 +189,15 @@ export async function POST(request) {
         'unknown',
       last_source: source,
     };
-    
 
     if (idx !== -1) subscribers[idx] = upserted;
     else subscribers.push(upserted);
 
-    await redis.set(key, subscribers, { ex: 90 * 24 * 60 * 60 }); // 90d
+    // write to BOTH keys (90d TTL)
+    const writes = [redis.set(idKey, subscribers, { ex: 90 * 24 * 60 * 60 })];
+    if (handleKey) writes.push(redis.set(handleKey, subscribers, { ex: 90 * 24 * 60 * 60 }));
+    await Promise.all(writes);
+
     // 1) Subscribe to WAITLIST list (records consent properly)
     let klaviyo_success = false, klaviyo_status = 0, klaviyo_body = '';
     try {
@@ -202,7 +239,7 @@ export async function POST(request) {
         email,
         phoneE164,
         properties: {
-          product_id: String(product_id),
+          product_id: String(pid),
           product_title: upserted.product_title,
           product_handle: upserted.product_handle,
           product_url: upserted.product_url,
@@ -250,33 +287,44 @@ export async function POST(request) {
   }
 }
 
-/* ----------------- GET — check if a given email is on the waitlist for a product ----------------- */
+/* ----------------- GET — check if a given email is on the waitlist (by id OR handle) ----------------- */
 export async function GET(request) {
-  const origin = request.headers.get('origin') || '*';
+  const origin = pickOrigin(request);
   try {
     const { searchParams } = new URL(request.url);
     const email = searchParams.get('email');
-    const product_id = searchParams.get('product_id');
+    const product_id_raw = searchParams.get('product_id');
+    const product_handle = searchParams.get('product_handle');
 
-    if (!email || !product_id) {
+    if (!email || (!product_id_raw && !product_handle)) {
       return cors(
-        NextResponse.json({ success: false, error: 'Missing email or product_id parameters' }, { status: 400 }),
+        NextResponse.json({ success: false, error: 'Missing email and product_id or product_handle' }, { status: 400 }),
         origin
       );
     }
 
     await redis.ping();
-    const key = `subscribers:${product_id}`;
-    let subs = await redis.get(key) || [];
-    if (typeof subs === 'string') { try { subs = JSON.parse(subs); } catch { subs = []; } }
-    if (!Array.isArray(subs)) subs = [];
+    const pid = product_id_raw ? normalizeProductId(product_id_raw) : null;
+    const idKey = pid ? `subscribers:${pid}` : null;
+    const handleKey = product_handle ? `subscribers_handle:${product_handle}` : null;
 
-    const sub = subs.find(s => String(s?.email || '').toLowerCase() === String(email).toLowerCase());
+    const readList = async (key) => {
+      if (!key) return [];
+      const v = await redis.get(key);
+      if (Array.isArray(v)) return v;
+      if (typeof v === 'string') { try { return JSON.parse(v); } catch { return []; } }
+      return [];
+    };
+
+    const [byId, byHandle] = await Promise.all([readList(idKey), readList(handleKey)]);
+    const merged = [...byId, ...byHandle];
+
+    const sub = merged.find(s => String(s?.email || '').toLowerCase() === String(email).toLowerCase());
     return cors(
       NextResponse.json({
         success: true,
         subscribed: !!sub,
-        total_subscribers: subs.length,
+        total_subscribers: merged.length,
         subscription_details: sub ? {
           subscribed_at: sub.subscribed_at,
           notified: sub.notified,
@@ -285,6 +333,7 @@ export async function GET(request) {
           product_handle: sub.product_handle,
           product_url: sub.product_url,
         } : null,
+        keys_checked: [idKey, handleKey].filter(Boolean),
       }),
       origin
     );
@@ -327,7 +376,7 @@ async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
       Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
       accept: 'application/json',
       'content-type': 'application/json',
-      revision: '2024-10-15',
+      revision: '2023-10-15',
     },
     body: JSON.stringify(payload),
   });
@@ -351,7 +400,7 @@ async function updateProfileProperties({ email, properties }) {
       headers: {
         Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
         accept: 'application/json',
-        revision: '2024-10-15',
+        revision: '2023-10-15',
       },
     }
   );
@@ -376,7 +425,7 @@ async function updateProfileProperties({ email, properties }) {
       Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
       accept: 'application/json',
       'content-type': 'application/json',
-      revision: '2024-10-15',
+      revision: '2023-10-15',
     },
     body: JSON.stringify({
       data: {
@@ -419,7 +468,7 @@ async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }) {
       Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
       accept: 'application/json',
       'content-type': 'application/json',
-      revision: '2024-10-15'
+      revision: '2023-10-15'
     },
     body: JSON.stringify(body)
   });
