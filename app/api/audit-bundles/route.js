@@ -1,4 +1,4 @@
-// app/api/audit-bundles/route.js — Audit bundles + notify waitlist (Subscribe Profiles + profile props + event)
+// app/api/audit-bundles/route.js — Audit bundles + notify waitlist (pending-first logic)
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
@@ -8,22 +8,22 @@ const redis = new Redis({
   token: process.env.KV_REST_API_TOKEN,
 });
 
-const SHOPIFY_STORE = process.env.SHOPIFY_STORE;                // e.g. "armadillotough.myshopify.com"
+const SHOPIFY_STORE   = process.env.SHOPIFY_STORE;                // e.g. "armadillotough.myshopify.com"
 const ADMIN_API_TOKEN = process.env.SHOPIFY_ADMIN_API_KEY;
 const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
 
 // ALERT list (used when stock returns to OK)
 const ALERT_LIST_ID = process.env.KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID;
 
-const PUBLIC_STORE_DOMAIN = process.env.PUBLIC_STORE_DOMAIN || 'armadillotough.com'; // used to build product URL
+const PUBLIC_STORE_DOMAIN = process.env.PUBLIC_STORE_DOMAIN || 'armadillotough.com'; // build product URL
 
 /* ----------------- guards ----------------- */
 function assertEnv() {
   const missing = [];
-  if (!SHOPIFY_STORE) missing.push('SHOPIFY_STORE');
+  if (!SHOPIFY_STORE)   missing.push('SHOPIFY_STORE');
   if (!ADMIN_API_TOKEN) missing.push('SHOPIFY_ADMIN_API_KEY');
   if (!KLAVIYO_API_KEY) missing.push('KLAVIYO_API_KEY');
-  if (!ALERT_LIST_ID) missing.push('KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID');
+  if (!ALERT_LIST_ID)   missing.push('KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID');
   if (missing.length) throw new Error(`Missing env: ${missing.join(', ')}`);
 }
 
@@ -41,7 +41,16 @@ const emailKey = (e) => `email:${String(e || '').toLowerCase()}`;
 const productUrlFrom = (handle) =>
   handle ? `https://${PUBLIC_STORE_DOMAIN}/products/${handle}` : '';
 
-/* ----------------- Klaviyo helpers ----------------- */
+function extractStatusFromTags(tagsStr) {
+  const tags = String(tagsStr || '')
+    .split(',').map(t => t.trim().toLowerCase());
+  if (tags.includes('bundle-out-of-stock')) return 'out-of-stock';
+  if (tags.includes('bundle-understocked')) return 'understocked';
+  if (tags.includes('bundle-ok')) return 'ok';
+  return null;
+}
+
+/* ----------------- Klaviyo ----------------- */
 async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
   if (!KLAVIYO_API_KEY) throw new Error('KLAVIYO_API_KEY missing');
   if (!listId) throw new Error('listId missing');
@@ -55,7 +64,14 @@ async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
       type: 'profile-subscription-bulk-create-job',
       attributes: {
         profiles: { data: [
-          { type: 'profile', attributes: { email, ...(sms && phoneE164 ? { phone_number: phoneE164 } : {}), subscriptions } }
+          {
+            type: 'profile',
+            attributes: {
+              email,
+              ...(sms && phoneE164 ? { phone_number: phoneE164 } : {}),
+              subscriptions,
+            },
+          },
         ]},
       },
       relationships: { list: { data: { type: 'list', id: listId } } },
@@ -80,36 +96,25 @@ async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
 
 async function updateProfileProperties({ email, properties }) {
   if (!KLAVIYO_API_KEY) throw new Error('KLAVIYO_API_KEY missing');
-  if (!email) throw new Error('Email missing');
+  if (!email) throw new Error('email missing');
 
-  // 1) Find profile id by email
+  // GET profile id by email → PATCH properties
   const filter = `equals(email,"${String(email).replace(/"/g, '\\"')}")`;
   const listRes = await fetch(
     `https://a.klaviyo.com/api/profiles/?filter=${encodeURIComponent(filter)}&page[size]=1`,
-    {
-      method: 'GET',
-      headers: {
-        Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
-        accept: 'application/json',
-        revision: '2024-10-15',
-      },
-    }
+    { method: 'GET', headers: {
+      Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+      accept: 'application/json',
+      revision: '2024-10-15',
+    }}
   );
-
   if (!listRes.ok) {
     const txt = await listRes.text();
     throw new Error(`Profiles lookup failed: ${listRes.status} ${listRes.statusText} :: ${txt}`);
   }
+  const id = (await listRes.json())?.data?.[0]?.id;
+  if (!id) return { ok: false, status: 404, body: 'profile_not_found', skipped: true };
 
-  const listJson = await listRes.json();
-  const id = listJson?.data?.[0]?.id;
-
-  // If the profile isn’t visible yet, skip gracefully.
-  if (!id) {
-    return { ok: false, status: 404, body: 'profile_not_found', skipped: true };
-  }
-
-  // 2) Patch properties
   const patchRes = await fetch(`https://a.klaviyo.com/api/profiles/${id}/`, {
     method: 'PATCH',
     headers: {
@@ -118,13 +123,7 @@ async function updateProfileProperties({ email, properties }) {
       'content-type': 'application/json',
       revision: '2024-10-15',
     },
-    body: JSON.stringify({
-      data: {
-        type: 'profile',
-        id,
-        attributes: { properties },
-      },
-    }),
+    body: JSON.stringify({ data: { type: 'profile', id, attributes: { properties } } }),
   });
 
   const txt = await patchRes.text();
@@ -143,9 +142,7 @@ async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }) {
         time: new Date().toISOString(),
         properties: properties || {},
         metric: { data: { type: 'metric', attributes: { name: metricName } } },
-        profile: {
-          data: { type: 'profile', attributes: { email, ...(phoneE164 ? { phone_number: phoneE164 } : {}) } }
-        }
+        profile: { data: { type: 'profile', attributes: { email, ...(phoneE164 ? { phone_number: phoneE164 } : {}) } } }
       }
     }
   };
@@ -168,7 +165,7 @@ async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }) {
 
 /* ----------------- Shopify rate limiting ----------------- */
 let lastApiCall = 0;
-const MIN_DELAY_MS = 600; // ~1.67 rps (safe under 2/sec)
+const MIN_DELAY_MS = 600; // ~1.67 rps under 2/sec
 async function rateLimitedDelay() {
   const now = Date.now();
   const dt = now - lastApiCall;
@@ -263,7 +260,7 @@ async function setSubscribers(productId, subs) {
 async function auditBundles() {
   assertEnv();
 
-  console.log('🔍 Starting bundle audit with proper Klaviyo subscribe flow...');
+  console.log('🔍 Starting bundle audit (pending-first notification strategy)…');
   const start = Date.now();
 
   const bundles = await getProductsTaggedBundle();
@@ -274,7 +271,7 @@ async function auditBundles() {
   let smsNotificationsSent = 0;
   let notificationErrors = 0;
   let profileUpdates = 0;
-  let apiCallsCount = 1; // already fetched products
+  let apiCallsCount = 1; // fetched products once
 
   for (const bundle of bundles) {
     try {
@@ -305,34 +302,41 @@ async function auditBundles() {
       if (out.length) status = 'out-of-stock';
       else if (under.length) status = 'understocked';
 
-      const prev = await getBundleStatus(bundle.id);
-      const prevStatus = prev ? prev.current : null;
-      await setBundleStatus(bundle.id, prevStatus, status);
-      console.log(`📊 ${bundle.title}: ${prevStatus || 'unknown'} → ${status}`);
+      // determine previous status via Redis, fallback to tags on product
+      const prevObj = await getBundleStatus(bundle.id);
+      const prevStatus = prevObj?.current ?? extractStatusFromTags(bundle.tags);
+      await setBundleStatus(bundle.id, prevStatus || null, status);
+      console.log(`📊 ${bundle.title}: ${(prevStatus || 'unknown')} → ${status}`);
 
-      // If moving back to OK, notify all not-yet-notified subscribers
-      if ((prevStatus === 'understocked' || prevStatus === 'out-of-stock') && status === 'ok') {
-        const subs = (await getSubscribers(bundle.id)) || [];
+      // fetch subscribers + pending (notified === false)
+      const subs = (await getSubscribers(bundle.id)) || [];
+      const seen = new Set();
+      const uniqueSubs = [];
+      for (const s of subs) {
+        const phoneKey = toE164(s?.phone || '');
+        const key = phoneKey || emailKey(s?.email);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        uniqueSubs.push(s);
+      }
+      const pending = uniqueSubs.filter(s => !s?.notified);
+      console.log(`🧾 Waitlist: total=${uniqueSubs.length} pending=${pending.length}`);
 
-        // de-dupe by normalized phone; fall back to email
-        const seen = new Set();
-        const uniqueSubs = [];
-        for (const s of subs) {
-          const phoneKey = toE164(s?.phone || '');
-          const key = phoneKey || emailKey(s?.email);
-          if (seen.has(key)) continue;
-          seen.add(key);
-          uniqueSubs.push(s); // keep reference to original object
-        }
+      // 🔔 NEW: Notify whenever stock is OK and there are pending people
+      const shouldNotify =
+        status === 'ok' && pending.length > 0;
 
+      // (If you want to also require a state change, you could do:
+      // const stateChangeToOk = (prevStatus === 'understocked' || prevStatus === 'out-of-stock') && status === 'ok';
+      // const shouldNotify = (pending.length > 0) && (status === 'ok') && (stateChangeToOk || true);
+      // The `|| true` keeps pending-first behavior.)
+
+      if (shouldNotify) {
         const productUrl = productUrlFrom(bundle.handle);
-        console.log(
-          `🔔 Back in stock — notifying ${uniqueSubs.filter(s => !s?.notified).length} unique subscribers`
-        );
+        console.log(`🔔 Back in stock — notifying ${pending.length} pending subscribers`);
 
         let processed = 0;
-        for (const sub of uniqueSubs) {
-          if (!sub || sub.notified) continue;
+        for (const sub of pending) {
           try {
             const phoneE164 = toE164(sub.phone || '');
             const smsConsent = !!sub.sms_consent && !!phoneE164;
@@ -381,22 +385,25 @@ async function auditBundles() {
               }
             });
 
-            // 4) Mark as notified and pace
+            // 4) Mark as notified + gentle pacing
             sub.notified = true;
             notificationsSent++;
             if (smsConsent) smsNotificationsSent++;
+            if (++processed % 5 === 0) await new Promise(r => setTimeout(r, 250));
 
-            if (++processed % 5 === 0) await new Promise(r => setTimeout(r, 250)); // gentle pacing
           } catch (e) {
             notificationErrors++;
             console.error(`❌ Failed for ${sub?.email || '(unknown)'}:`, e.message);
           }
         }
 
-        // persist updated notified flags back to Redis
+        // persist updated flags
         await setSubscribers(bundle.id, subs);
+      } else {
+        console.log('ℹ️ No notifications: either status != ok or no pending subscribers.');
       }
 
+      // update tags
       await updateProductTags(bundle.id, bundle.tags.split(','), status);
       apiCallsCount++;
 
@@ -439,7 +446,7 @@ export async function GET() {
     const results = await auditBundles();
     return NextResponse.json({
       success: true,
-      message: 'Audit complete and tags updated (Klaviyo Subscribe Profiles + profile props + event).',
+      message: 'Audit complete and tags updated (pending-first notify + Klaviyo Subscribe + props + event).',
       ...results,
     });
   } catch (error) {
