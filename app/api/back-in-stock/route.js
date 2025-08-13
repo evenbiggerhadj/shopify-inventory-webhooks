@@ -1,4 +1,4 @@
-// app/api/back-in-stock/route.js — WAITLIST signup (Subscribe Profiles + Redis + product props)
+// app/api/back-in-stock/route.js — WAITLIST signup (Subscribe Profiles + Redis + product props + event)
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
@@ -181,6 +181,27 @@ export async function POST(request) {
       profile_update_success = false; profile_update_status = 0; profile_update_body = e?.message || String(e);
     }
 
+    // 3) Fire metric event with product context (for event-triggered flows)
+    let event_success = false, event_status = 0, event_body = '';
+    try {
+      const out = await trackKlaviyoEvent({
+        metricName: 'Back in Stock Subscriptions',
+        email,
+        phoneE164,
+        properties: {
+          product_id: upserted.product_id,
+          product_title: upserted.product_title,
+          product_handle: upserted.product_handle,
+          product_url: upserted.product_url,
+          sms_consent: !!smsAllowed,
+          source: 'BIS modal'
+        }
+      });
+      event_success = out.ok; event_status = out.status; event_body = out.body;
+    } catch (e) {
+      event_success = false; event_status = 0; event_body = e?.message || String(e);
+    }
+
     return cors(
       NextResponse.json({
         success: true,
@@ -192,6 +213,9 @@ export async function POST(request) {
         profile_update_success,
         profile_update_status,
         profile_update_body,
+        event_success,
+        event_status,
+        event_body
       }),
       origin
     );
@@ -313,7 +337,7 @@ async function updateProfileProperties({ email, properties }) {
               type: 'profile',
               attributes: {
                 email,
-                properties, // arbitrary custom fields
+                properties,
               },
             },
           ],
@@ -336,4 +360,39 @@ async function updateProfileProperties({ email, properties }) {
   const body = await res.text();
   if (!res.ok) throw new Error(`Profile properties update failed: ${res.status} ${res.statusText} :: ${body}`);
   return { ok: true, status: res.status, body };
+}
+
+/** Send a Klaviyo metric event with product context (for event-triggered flows) */
+async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }) {
+  if (!KLAVIYO_API_KEY) throw new Error('KLAVIYO_API_KEY missing');
+  if (!metricName) throw new Error('metricName missing');
+
+  const body = {
+    data: {
+      type: 'event',
+      attributes: {
+        time: new Date().toISOString(),
+        properties: properties || {},
+        metric: { data: { type: 'metric', attributes: { name: metricName } } },
+        profile: {
+          data: { type: 'profile', attributes: { email, ...(phoneE164 ? { phone_number: phoneE164 } : {}) } }
+        }
+      }
+    }
+  };
+
+  const res = await fetch('https://a.klaviyo.com/api/events/', {
+    method: 'POST',
+    headers: {
+      Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+      accept: 'application/json',
+      'content-type': 'application/json',
+      revision: '2024-10-15'
+    },
+    body: JSON.stringify(body)
+  });
+
+  const txt = await res.text();
+  if (!res.ok) throw new Error(`Klaviyo event failed: ${res.status} ${res.statusText} :: ${txt}`);
+  return { ok: true, status: res.status, body: txt };
 }

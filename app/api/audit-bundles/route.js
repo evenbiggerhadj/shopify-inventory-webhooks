@@ -1,4 +1,4 @@
-// app/api/audit-bundles/route.js — Audit bundles + notify waitlist (Klaviyo Subscribe Profiles + profile props)
+// app/api/audit-bundles/route.js — Audit bundles + notify waitlist (Subscribe Profiles + profile props + event)
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
@@ -12,7 +12,7 @@ const SHOPIFY_STORE = process.env.SHOPIFY_STORE;                // e.g. "armadil
 const ADMIN_API_TOKEN = process.env.SHOPIFY_ADMIN_API_KEY;
 const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
 
-// ALERT list (used when stock returns to OK) — do NOT fall back to waitlist list
+// ALERT list (used when stock returns to OK)
 const ALERT_LIST_ID = process.env.KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID;
 
 const PUBLIC_STORE_DOMAIN = process.env.PUBLIC_STORE_DOMAIN || 'armadillotough.com'; // used to build product URL
@@ -42,31 +42,28 @@ const productUrlFrom = (handle) =>
   handle ? `https://${PUBLIC_STORE_DOMAIN}/products/${handle}` : '';
 
 /** Klaviyo: Subscribe Profiles bulk job — with list relationship (records consent properly). */
-async function subscribeProfilesToList({ listId, email, phoneRaw, smsConsent }) {
+async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
   if (!KLAVIYO_API_KEY) throw new Error('KLAVIYO_API_KEY missing');
   if (!listId) throw new Error('listId missing');
   if (!email) throw new Error('email missing');
 
-  const phoneE164 = toE164(phoneRaw);
   const subscriptions = { email: { marketing: { consent: 'SUBSCRIBED' } } };
-  if (smsConsent && phoneE164) subscriptions.sms = { marketing: { consent: 'SUBSCRIBED' } };
+  if (sms && phoneE164) subscriptions.sms = { marketing: { consent: 'SUBSCRIBED' } };
 
   const payload = {
     data: {
       type: 'profile-subscription-bulk-create-job',
       attributes: {
-        profiles: {
-          data: [
-            {
-              type: 'profile',
-              attributes: {
-                email,
-                ...(smsConsent && phoneE164 ? { phone_number: phoneE164 } : {}),
-                subscriptions,
-              },
+        profiles: { data: [
+          {
+            type: 'profile',
+            attributes: {
+              email,
+              ...(sms && phoneE164 ? { phone_number: phoneE164 } : {}),
+              subscriptions,
             },
-          ],
-        },
+          },
+        ]},
       },
       relationships: { list: { data: { type: 'list', id: listId } } },
     },
@@ -121,6 +118,41 @@ async function updateProfileProperties({ email, properties }) {
   const body = await res.text();
   if (!res.ok) throw new Error(`Profile properties update failed: ${res.status} ${res.statusText} :: ${body}`);
   return { ok: true, status: res.status, body };
+}
+
+/** Send a Klaviyo metric event with product context */
+async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }) {
+  if (!KLAVIYO_API_KEY) throw new Error('KLAVIYO_API_KEY missing');
+  if (!metricName) throw new Error('metricName missing');
+
+  const body = {
+    data: {
+      type: 'event',
+      attributes: {
+        time: new Date().toISOString(),
+        properties: properties || {},
+        metric: { data: { type: 'metric', attributes: { name: metricName } } },
+        profile: {
+          data: { type: 'profile', attributes: { email, ...(phoneE164 ? { phone_number: phoneE164 } : {}) } }
+        }
+      }
+    }
+  };
+
+  const res = await fetch('https://a.klaviyo.com/api/events/', {
+    method: 'POST',
+    headers: {
+      Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+      accept: 'application/json',
+      'content-type': 'application/json',
+      revision: '2024-10-15'
+    },
+    body: JSON.stringify(body)
+  });
+
+  const txt = await res.text();
+  if (!res.ok) throw new Error(`Klaviyo event failed: ${res.status} ${res.statusText} :: ${txt}`);
+  return { ok: true, status: res.status, body: txt };
 }
 
 /* ----------------- Shopify rate limiting ----------------- */
@@ -298,8 +330,8 @@ async function auditBundles() {
             await subscribeProfilesToList({
               listId: ALERT_LIST_ID,
               email: sub.email,
-              phoneRaw: phoneE164 || sub.phone || '',
-              smsConsent,
+              phoneE164,
+              sms: smsConsent,
             });
 
             // 2) Stamp product props so flow templates can show product name & URL
@@ -320,6 +352,21 @@ async function auditBundles() {
               },
             });
             profileUpdates++;
+
+            // 3) Fire event for flows/personalization
+            await trackKlaviyoEvent({
+              metricName: 'Back in Stock',
+              email: sub.email,
+              phoneE164,
+              properties: {
+                product_id: String(bundle.id),
+                product_title: stampedTitle,
+                product_handle: stampedHandle,
+                product_url: stampedUrl,
+                sms_consent: !!smsConsent,
+                source: 'bundle audit'
+              }
+            });
 
             // mark notified
             sub.notified = true;
@@ -379,7 +426,7 @@ export async function GET() {
     const results = await auditBundles();
     return NextResponse.json({
       success: true,
-      message: 'Audit complete and tags updated (Klaviyo Subscribe Profiles + profile props).',
+      message: 'Audit complete and tags updated (Klaviyo Subscribe Profiles + profile props + event).',
       ...results,
     });
   } catch (error) {
