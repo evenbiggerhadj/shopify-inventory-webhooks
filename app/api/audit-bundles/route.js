@@ -350,6 +350,8 @@ async function auditBundles() {
             const stampedTitle = sub.product_title || bundle.title || 'Unknown Product';
             const stampedHandle = sub.product_handle || bundle.handle || '';
             const stampedUrl = sub.product_url || productUrlFrom(stampedHandle) || productUrl;
+            const related_section_url = stampedUrl ? `${stampedUrl}#after-bis` : '';
+
 
             try {
               const out = await updateProfileProperties({
@@ -357,6 +359,8 @@ async function auditBundles() {
                 properties: {
                   last_back_in_stock_product_name: stampedTitle,
                   last_back_in_stock_product_url: stampedUrl,
+                  last_back_in_stock_related_section_url: related_section_url,
+
                   last_back_in_stock_product_handle: stampedHandle,
                   last_back_in_stock_product_id: String(bundle.id),
                   last_back_in_stock_notified_at: new Date().toISOString(),
@@ -377,6 +381,8 @@ async function auditBundles() {
                 product_title: stampedTitle,
                 product_handle: stampedHandle,
                 product_url: stampedUrl,
+                related_section_url: related_section_url,
+
                 sms_consent: !!smsConsent,
                 source: 'bundle audit',
               }

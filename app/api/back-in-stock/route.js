@@ -125,6 +125,8 @@ export async function POST(request) {
     const pid = normalizeProductId(product_id);
     const handle = String(product_handle || '').trim();
     const product_url = productUrlFrom(handle);
+    const related_section_url = product_url ? `${product_url}#after-bis` : '';
+
 
     // redis upsert
     try { await redis.ping(); } catch {
@@ -220,6 +222,8 @@ export async function POST(request) {
         properties: {
           last_waitlist_product_name: upserted.product_title,
           last_waitlist_product_url: upserted.product_url,
+          last_waitlist_related_section_url: related_section_url,
+
           last_waitlist_product_handle: upserted.product_handle,
           last_waitlist_product_id: upserted.product_id,
           last_waitlist_subscribed_at: upserted.subscribed_at,
@@ -243,6 +247,8 @@ export async function POST(request) {
           product_title: upserted.product_title,
           product_handle: upserted.product_handle,
           product_url: upserted.product_url,
+          related_section_url: related_section_url,
+
           sms_consent: !!smsAllowed,
           source,
         },
