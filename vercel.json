@@ -4,4 +4,3 @@
       { "path": "/api/audit-bundles", "schedule": "0 0,12 * * *" }
     ]
   }
-  
