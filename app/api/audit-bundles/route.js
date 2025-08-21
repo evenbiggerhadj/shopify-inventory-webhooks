@@ -1,4 +1,9 @@
-// app/api/audit-bundles/route.js — Audit bundles + notify waitlist (pending-first + id/handle keys)
+// app/api/audit-bundles/route.js
+
+/* ---- Vercel runtime & max duration (within your plan limits) ---- */
+export const runtime = 'nodejs';
+export const maxDuration = 300;
+
 import { NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 
@@ -13,6 +18,7 @@ const ADMIN_API_TOKEN = process.env.SHOPIFY_ADMIN_API_KEY;
 const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
 const ALERT_LIST_ID   = process.env.KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID;
 const PUBLIC_STORE_DOMAIN = process.env.PUBLIC_STORE_DOMAIN || 'armadillotough.com';
+const CRON_SECRET = process.env.CRON_SECRET || '';                 // used to authorize Vercel Cron
 
 function assertEnv() {
   const missing = [];
@@ -21,6 +27,34 @@ function assertEnv() {
   if (!KLAVIYO_API_KEY) missing.push('KLAVIYO_API_KEY');
   if (!ALERT_LIST_ID)   missing.push('KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID');
   if (missing.length) throw new Error(`Missing env: ${missing.join(', ')}`);
+}
+
+/* ----------------- Vercel Cron auth & overlap lock ----------------- */
+function unauthorized() {
+  return NextResponse.json({ success: false, error: 'unauthorized' }, { status: 401 });
+}
+
+async function ensureCronAuth(req) {
+  // If CRON_SECRET is set, require `Authorization: Bearer <CRON_SECRET>`
+  if (!CRON_SECRET) return true; // allow in dev if not configured
+  const auth = req.headers.get('authorization') || '';
+  return auth === `Bearer ${CRON_SECRET}`;
+}
+
+const LOCK_KEY = 'locks:audit-bundles';
+const LOCK_TTL_SECONDS = 15 * 60; // safety window
+
+async function acquireLock() {
+  // NX = only if not exists; EX = expire after TTL
+  try {
+    const res = await redis.set(LOCK_KEY, Date.now(), { nx: true, ex: LOCK_TTL_SECONDS });
+    return !!res; // 'OK' => true, null => false
+  } catch {
+    return false;
+  }
+}
+async function releaseLock() {
+  try { await redis.del(LOCK_KEY); } catch {}
 }
 
 /* ----------------- utils ----------------- */
@@ -352,7 +386,6 @@ async function auditBundles() {
             const stampedUrl = sub.product_url || productUrlFrom(stampedHandle) || productUrl;
             const related_section_url = stampedUrl ? `${stampedUrl}#after-bis` : '';
 
-
             try {
               const out = await updateProfileProperties({
                 email: sub.email,
@@ -443,7 +476,17 @@ async function auditBundles() {
 }
 
 /* ----------------- GET handler ----------------- */
-export async function GET() {
+export async function GET(req) {
+  // 1) Verify this came from your Vercel Cron (or allow if CRON_SECRET unset in dev)
+  const authed = await ensureCronAuth(req);
+  if (!authed) return unauthorized();
+
+  // 2) Prevent overlapping runs (cron + manual trigger or long execution)
+  const locked = await acquireLock();
+  if (!locked) {
+    return NextResponse.json({ success: false, error: 'audit already running' }, { status: 423 });
+  }
+
   try {
     const results = await auditBundles();
     return NextResponse.json({
@@ -456,5 +499,7 @@ export async function GET() {
       { success: false, error: error.message, stack: process.env.NODE_ENV === 'development' ? error.stack : undefined },
       { status: 500 }
     );
+  } finally {
+    await releaseLock();
   }
 }
