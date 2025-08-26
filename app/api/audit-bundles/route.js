@@ -13,12 +13,12 @@ const redis = new Redis({
   token: process.env.KV_REST_API_TOKEN,
 });
 
-const SHOPIFY_STORE   = process.env.SHOPIFY_STORE;                // e.g. "armadillotough.myshopify.com"
-const ADMIN_API_TOKEN = process.env.SHOPIFY_ADMIN_API_KEY;
-const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY;
-const ALERT_LIST_ID   = process.env.KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID;
-const PUBLIC_STORE_DOMAIN = process.env.PUBLIC_STORE_DOMAIN || 'armadillotough.com';
-const CRON_SECRET = process.env.CRON_SECRET || '';                 // used to authorize Vercel Cron
+const SHOPIFY_STORE         = process.env.SHOPIFY_STORE; // e.g. "armadillotough.myshopify.com"
+const ADMIN_API_TOKEN       = process.env.SHOPIFY_ADMIN_API_KEY;
+const KLAVIYO_API_KEY       = process.env.KLAVIYO_API_KEY;
+const ALERT_LIST_ID         = process.env.KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID;
+const PUBLIC_STORE_DOMAIN   = process.env.PUBLIC_STORE_DOMAIN || 'armadillotough.com';
+const CRON_SECRET           = process.env.CRON_SECRET || ''; // used to authorize Vercel Cron
 
 function assertEnv() {
   const missing = [];
@@ -45,7 +45,6 @@ const LOCK_KEY = 'locks:audit-bundles';
 const LOCK_TTL_SECONDS = 15 * 60; // safety window
 
 async function acquireLock() {
-  // NX = only if not exists; EX = expire after TTL
   try {
     const res = await redis.set(LOCK_KEY, Date.now(), { nx: true, ex: LOCK_TTL_SECONDS });
     return !!res; // 'OK' => true, null => false
@@ -75,6 +74,12 @@ function extractStatusFromTags(tagsStr) {
   if (tags.includes('bundle-understocked')) return 'understocked';
   if (tags.includes('bundle-ok')) return 'ok';
   return null;
+}
+
+// Status severity + worst-of helper
+const RANK = { 'ok': 0, 'understocked': 1, 'out-of-stock': 2 };
+function worstStatus(a = 'ok', b = 'ok') {
+  return (RANK[a] >= RANK[b]) ? a : b;
 }
 
 /* ----------------- Klaviyo ----------------- */
@@ -118,7 +123,6 @@ async function updateProfileProperties({ email, properties }) {
   if (!KLAVIYO_API_KEY) throw new Error('KLAVIYO_API_KEY missing');
   if (!email) throw new Error('email missing');
 
-  // GET profile id by email → PATCH properties
   const filter = `equals(email,"${String(email).replace(/"/g, '\\"')}")`;
   const listRes = await fetch(
     `https://a.klaviyo.com/api/profiles/?filter=${encodeURIComponent(filter)}&page[size]=1`,
@@ -231,26 +235,31 @@ async function fetchFromShopify(endpoint, method = 'GET', body = null) {
   }
   return res.json();
 }
+
 function hasBundleTag(tagsStr) {
   return String(tagsStr || '')
     .split(',')
     .map(t => t.trim().toLowerCase())
     .includes('bundle');
 }
+
 async function getProductsTaggedBundle() {
   const res = await fetchFromShopify('products.json?fields=id,title,tags,handle&limit=250');
   return res.products.filter(p => hasBundleTag(p.tags));
 }
+
 async function getProductMetafields(productId) {
   const res = await fetchFromShopify(`products/${productId}/metafields.json`);
   if (!res || !Array.isArray(res.metafields)) return null;
   return res.metafields.find(m => m.namespace === 'custom' && m.key === 'bundle_structure');
 }
+
 async function getInventoryLevel(variantId) {
   if (!variantId) return 0;
   const res = await fetchFromShopify(`variants/${variantId}.json`);
   return res.variant.inventory_quantity;
 }
+
 async function updateProductTags(productId, currentTags, status) {
   const cleaned = currentTags
     .map(t => t.trim())
@@ -260,6 +269,26 @@ async function updateProductTags(productId, currentTags, status) {
   await fetchFromShopify(`products/${productId}.json`, 'PUT', {
     product: { id: productId, tags: cleaned.join(', ') },
   });
+}
+
+// Bundle product’s own inventory summary (sum over variants)
+//   outOfStock => every variant is 0
+//   understocked => any variant negative OR total < 0
+async function getBundleOwnInventorySummary(productId) {
+  const res = await fetchFromShopify(`products/${productId}.json?fields=id,variants`);
+  const variants = res?.product?.variants || [];
+  const qtys = variants.map(v => Number(v?.inventory_quantity ?? 0));
+  const total = qtys.reduce((a, b) => a + b, 0);
+  const anyNegative = qtys.some(q => q < 0);
+  const allZero = variants.length > 0 && qtys.every(q => q === 0);
+
+  return {
+    total,
+    anyNegative,
+    variantsCount: variants.length,
+    outOfStock: allZero,
+    understocked: anyNegative || total < 0,
+  };
 }
 
 /* ----------------- Redis helpers (status + subscribers for id & handle) ----------------- */
@@ -327,39 +356,55 @@ async function auditBundles() {
       bundlesProcessed++;
       console.log(`\n📦 ${bundlesProcessed}/${bundles.length} — ${bundle.title}`);
 
+      // COMPONENTS STATUS (don’t bail if metafield missing)
+      let componentsStatus = 'ok';
       const metafield = await getProductMetafields(bundle.id);
       apiCallsCount++;
-      if (!metafield?.value) { console.log('⚠️ Skipped — no bundle_structure metafield'); continue; }
 
-      let components;
-      try { components = JSON.parse(metafield.value); }
-      catch { console.error('❌ Invalid bundle_structure JSON'); continue; }
+      if (metafield?.value) {
+        let components;
+        try { components = JSON.parse(metafield.value); }
+        catch { console.error('❌ Invalid bundle_structure JSON'); components = []; }
 
-      let under = [], out = [];
-      for (const c of components) {
-        if (!c?.variant_id) continue;
-        const qty = await getInventoryLevel(c.variant_id);
-        apiCallsCount++;
-        if (qty === 0) out.push(c.variant_id);
-        else if (qty < c.required_quantity) under.push(c.variant_id);
+        let under = [], out = [];
+        for (const c of components) {
+          if (!c?.variant_id) continue;
+          const qty = await getInventoryLevel(c.variant_id);
+          apiCallsCount++;
+          if (qty === 0) out.push(c.variant_id);
+          else if (qty < c.required_quantity) under.push(c.variant_id);
+        }
+        if (out.length) componentsStatus = 'out-of-stock';
+        else if (under.length) componentsStatus = 'understocked';
+      } else {
+        console.log('ℹ️ No bundle_structure metafield — componentsStatus defaults to OK');
       }
 
-      let status = 'ok';
-      if (out.length) status = 'out-of-stock';
-      else if (under.length) status = 'understocked';
+      // BUNDLE OWN INVENTORY STATUS
+      const ownInv = await getBundleOwnInventorySummary(bundle.id);
+      apiCallsCount++;
+      let ownStatus = 'ok';
+      if (ownInv.outOfStock) ownStatus = 'out-of-stock';
+      else if (ownInv.understocked) ownStatus = 'understocked';
 
-      // determine previous status via Redis, fallback to tags on product
+      // FINAL STATUS = worst(components, own)
+      const status = worstStatus(componentsStatus, ownStatus);
+
+      // Previous status via Redis, fallback to tags on product
       const prevObj = await getBundleStatus(bundle.id);
       const prevStatus = prevObj?.current ?? extractStatusFromTags(bundle.tags);
       await setBundleStatus(bundle.id, prevStatus || null, status);
-      console.log(`📊 ${bundle.title}: ${(prevStatus || 'unknown')} → ${status}`);
 
-      // read subscribers from both ID & HANDLE keys
+      console.log(
+        `📊 ${bundle.title}: components=${componentsStatus} | own(total=${ownInv.total}, anyNeg=${ownInv.anyNegative}, variants=${ownInv.variantsCount})=${ownStatus} ⇒ final=${status}`
+      );
+
+      // Waitlist read
       const { merged: uniqueSubs, keysTried } = await getSubscribersForBundle(bundle);
       const pending = uniqueSubs.filter(s => !s?.notified);
       console.log(`🧾 Waitlist: keys=${JSON.stringify(keysTried)} total=${uniqueSubs.length} pending=${pending.length}`);
 
-      // Notify whenever stock is OK and there are pending subscribers (pending-first)
+      // Notify when status returns to OK and there are pending subscribers (pending-first)
       const shouldNotify = (status === 'ok') && pending.length > 0;
 
       if (shouldNotify) {
@@ -372,7 +417,7 @@ async function auditBundles() {
             const phoneE164 = toE164(sub.phone || '');
             const smsConsent = !!sub.sms_consent && !!phoneE164;
 
-            // 1) Ensure they're on the ALERT list (email/sms consent honored)
+            // 1) Ensure they're on the ALERT list
             await subscribeProfilesToList({
               listId: ALERT_LIST_ID,
               email: sub.email,
@@ -393,7 +438,6 @@ async function auditBundles() {
                   last_back_in_stock_product_name: stampedTitle,
                   last_back_in_stock_product_url: stampedUrl,
                   last_back_in_stock_related_section_url: related_section_url,
-
                   last_back_in_stock_product_handle: stampedHandle,
                   last_back_in_stock_product_id: String(bundle.id),
                   last_back_in_stock_notified_at: new Date().toISOString(),
@@ -414,8 +458,7 @@ async function auditBundles() {
                 product_title: stampedTitle,
                 product_handle: stampedHandle,
                 product_url: stampedUrl,
-                related_section_url: related_section_url,
-
+                related_section_url,
                 sms_consent: !!smsConsent,
                 source: 'bundle audit',
               }
@@ -432,13 +475,13 @@ async function auditBundles() {
           }
         }
 
-        // write back to BOTH keys so future audits see consistent state
+        // Write back to BOTH keys
         await setSubscribersForBundle(bundle, uniqueSubs);
       } else {
         console.log('ℹ️ No notifications: either status != ok or no pending subscribers.');
       }
 
-      // update tags
+      // Update tags
       await updateProductTags(bundle.id, bundle.tags.split(','), status);
       apiCallsCount++;
 
@@ -477,11 +520,9 @@ async function auditBundles() {
 
 /* ----------------- GET handler ----------------- */
 export async function GET(req) {
-  // 1) Verify this came from your Vercel Cron (or allow if CRON_SECRET unset in dev)
   const authed = await ensureCronAuth(req);
   if (!authed) return unauthorized();
 
-  // 2) Prevent overlapping runs (cron + manual trigger or long execution)
   const locked = await acquireLock();
   if (!locked) {
     return NextResponse.json({ success: false, error: 'audit already running' }, { status: 423 });
@@ -491,7 +532,7 @@ export async function GET(req) {
     const results = await auditBundles();
     return NextResponse.json({
       success: true,
-      message: 'Audit complete and tags updated (pending-first + id/handle waitlist).',
+      message: 'Audit complete and tags updated (pending-first + id/handle waitlist + own inventory).',
       ...results,
     });
   } catch (error) {
