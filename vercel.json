@@ -1,6 +1,7 @@
 {
     "$schema": "https://openapi.vercel.sh/vercel.json",
     "crons": [
-      { "path": "/api/audit-bundles", "schedule": "0 0,12 * * *" }
+      { "path": "/api/audit-bundles", "schedule": "0 */12 * * *" }
     ]
   }
+
