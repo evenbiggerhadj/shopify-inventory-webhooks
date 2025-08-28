@@ -1,6 +1,26 @@
 // app/api/audit-bundles/route.js
+// Audit bundle products, compute status, update tags, and notify waitlist (pending-first).
+// ✅ Uses the bundle product’s own available inventory (Admin “Bundle with N in stock”).
+//    - Reads per-variant available via inventory_levels (sum across locations) with fallback to variant.inventory_quantity.
+//    - Optional low-stock threshold marks "understocked" even when > 0.
+//    - Optional mode to base status on own-inventory only, or worst(components, own).
+//
+// ENV (required):
+//   SHOPIFY_STORE                    e.g. "armadillotough.myshopify.com"
+//   SHOPIFY_ADMIN_API_KEY            Admin API Access Token
+//   KLAVIYO_API_KEY
+//   KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID
+//
+// ENV (optional):
+//   PUBLIC_STORE_DOMAIN              default: armadillotough.com
+//   CRON_SECRET                      bearer token to protect this route
+//   BUNDLE_LOW_STOCK_THRESHOLD       e.g. "5" => <=5 available → understocked
+//   BUNDLE_STATUS_MODE               "worst" (default) | "own"
+//
+// Vercel:
+//   export const runtime = 'nodejs'
+//   export const maxDuration = 300
 
-/* ---- Vercel runtime & max duration (within your plan limits) ---- */
 export const runtime = 'nodejs';
 export const maxDuration = 300;
 
@@ -13,12 +33,15 @@ const redis = new Redis({
   token: process.env.KV_REST_API_TOKEN,
 });
 
-const SHOPIFY_STORE         = process.env.SHOPIFY_STORE; // e.g. "armadillotough.myshopify.com"
-const ADMIN_API_TOKEN       = process.env.SHOPIFY_ADMIN_API_KEY;
-const KLAVIYO_API_KEY       = process.env.KLAVIYO_API_KEY;
-const ALERT_LIST_ID         = process.env.KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID;
-const PUBLIC_STORE_DOMAIN   = process.env.PUBLIC_STORE_DOMAIN || 'armadillotough.com';
-const CRON_SECRET           = process.env.CRON_SECRET || ''; // used to authorize Vercel Cron
+const SHOPIFY_STORE       = process.env.SHOPIFY_STORE;
+const ADMIN_API_TOKEN     = process.env.SHOPIFY_ADMIN_API_KEY;
+const KLAVIYO_API_KEY     = process.env.KLAVIYO_API_KEY;
+const ALERT_LIST_ID       = process.env.KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID;
+const PUBLIC_STORE_DOMAIN = process.env.PUBLIC_STORE_DOMAIN || 'armadillotough.com';
+const CRON_SECRET         = process.env.CRON_SECRET || '';
+
+const BUNDLE_LOW_STOCK_THRESHOLD = Number(process.env.BUNDLE_LOW_STOCK_THRESHOLD || 0); // <= threshold → understocked
+const BUNDLE_STATUS_MODE         = (process.env.BUNDLE_STATUS_MODE || 'worst').toLowerCase(); // 'worst' | 'own'
 
 function assertEnv() {
   const missing = [];
@@ -33,37 +56,31 @@ function assertEnv() {
 function unauthorized() {
   return NextResponse.json({ success: false, error: 'unauthorized' }, { status: 401 });
 }
-
 async function ensureCronAuth(req) {
-  // If CRON_SECRET is set, require `Authorization: Bearer <CRON_SECRET>`
-  if (!CRON_SECRET) return true; // allow in dev if not configured
+  if (!CRON_SECRET) return true;
   const auth = req.headers.get('authorization') || '';
   return auth === `Bearer ${CRON_SECRET}`;
 }
-
 const LOCK_KEY = 'locks:audit-bundles';
-const LOCK_TTL_SECONDS = 15 * 60; // safety window
-
+const LOCK_TTL_SECONDS = 15 * 60;
 async function acquireLock() {
   try {
     const res = await redis.set(LOCK_KEY, Date.now(), { nx: true, ex: LOCK_TTL_SECONDS });
-    return !!res; // 'OK' => true, null => false
+    return !!res;
   } catch {
     return false;
   }
 }
-async function releaseLock() {
-  try { await redis.del(LOCK_KEY); } catch {}
-}
+async function releaseLock() { try { await redis.del(LOCK_KEY); } catch {} }
 
 /* ----------------- utils ----------------- */
 function toE164(raw) {
   if (!raw) return null;
   let v = String(raw).trim().replace(/[^\d+]/g, '');
-  if (v.startsWith('+')) return /^\+\d{8,15}$/.test(v) ? v : null; // strict E.164
-  if (/^0\d{10}$/.test(v)) return '+234' + v.slice(1);            // NG local 0XXXXXXXXXX
-  if (/^(70|80|81|90|91)\d{8}$/.test(v)) return '+234' + v;       // NG 10-digit
-  if (/^\d{10}$/.test(v)) return '+1' + v;                         // US 10-digit
+  if (v.startsWith('+')) return /^\+\d{8,15}$/.test(v) ? v : null;           // strict E.164
+  if (/^0\d{10}$/.test(v)) return '+234' + v.slice(1);                       // NG local
+  if (/^(70|80|81|90|91)\d{8}$/.test(v)) return '+234' + v;                  // NG 10-digit
+  if (/^\d{10}$/.test(v)) return '+1' + v;                                   // US 10-digit
   return null;
 }
 const emailKey = (e) => `email:${String(e || '').toLowerCase()}`;
@@ -75,7 +92,6 @@ function extractStatusFromTags(tagsStr) {
   if (tags.includes('bundle-ok')) return 'ok';
   return null;
 }
-
 // Status severity + worst-of helper
 const RANK = { 'ok': 0, 'understocked': 1, 'out-of-stock': 2 };
 function worstStatus(a = 'ok', b = 'ok') {
@@ -195,7 +211,7 @@ async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }) {
 
 /* ----------------- Shopify (rate-limited) ----------------- */
 let lastApiCall = 0;
-const MIN_DELAY_MS = 600; // ~1.67 rps (safe under 2/sec)
+const MIN_DELAY_MS = 600; // ~1.67 rps
 async function rateLimitedDelay() {
   const now = Date.now();
   const dt = now - lastApiCall;
@@ -242,53 +258,57 @@ function hasBundleTag(tagsStr) {
     .map(t => t.trim().toLowerCase())
     .includes('bundle');
 }
-
 async function getProductsTaggedBundle() {
   const res = await fetchFromShopify('products.json?fields=id,title,tags,handle&limit=250');
   return res.products.filter(p => hasBundleTag(p.tags));
 }
-
 async function getProductMetafields(productId) {
   const res = await fetchFromShopify(`products/${productId}/metafields.json`);
   if (!res || !Array.isArray(res.metafields)) return null;
   return res.metafields.find(m => m.namespace === 'custom' && m.key === 'bundle_structure');
 }
 
-async function getInventoryLevel(variantId) {
-  if (!variantId) return 0;
-  const res = await fetchFromShopify(`variants/${variantId}.json`);
-  return res.variant.inventory_quantity;
+/** Read "available" for a variant across all locations (inventory_levels).
+ *  Falls back to variant.inventory_quantity if levels are not present. */
+async function getVariantAvailableFromLevels(v) {
+  const variant = typeof v === 'object' ? v : (await fetchFromShopify(`variants/${v}.json`)).variant;
+  const fallback = Number(variant?.inventory_quantity ?? 0);
+  const invItemId = variant?.inventory_item_id;
+  if (!invItemId) return fallback;
+
+  try {
+    const levels = await fetchFromShopify(`inventory_levels.json?inventory_item_ids=${invItemId}&limit=250`);
+    const available = (levels?.inventory_levels || []).reduce((sum, lvl) => sum + Number(lvl?.available ?? 0), 0);
+    return Number.isFinite(available) ? available : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
-async function updateProductTags(productId, currentTags, status) {
-  const cleaned = currentTags
-    .map(t => t.trim())
-    .filter(tag => !['bundle-ok', 'bundle-understocked', 'bundle-out-of-stock'].includes(tag.toLowerCase()))
-    .concat([`bundle-${status}`]);
-
-  await fetchFromShopify(`products/${productId}.json`, 'PUT', {
-    product: { id: productId, tags: cleaned.join(', ') },
-  });
-}
-
-// Bundle product’s own inventory summary (sum over variants)
-//   outOfStock => every variant is 0
-//   understocked => any variant negative OR total < 0
+/** Bundle product’s own inventory summary from its variants (Admin “Bundle with N in stock”)
+ *  - We compute per-variant available via inventory_levels (sum across locations).
+ *  - outOfStock: all variants available <= 0
+ *  - understocked: (any negative) OR (minAvailable > 0 and <= threshold)
+ */
 async function getBundleOwnInventorySummary(productId) {
   const res = await fetchFromShopify(`products/${productId}.json?fields=id,variants`);
   const variants = res?.product?.variants || [];
-  const qtys = variants.map(v => Number(v?.inventory_quantity ?? 0));
-  const total = qtys.reduce((a, b) => a + b, 0);
-  const anyNegative = qtys.some(q => q < 0);
-  const allZero = variants.length > 0 && qtys.every(q => q === 0);
+  if (variants.length === 0) {
+    return { total: 0, minAvailable: 0, anyNegative: false, allZero: true, variantsCount: 0 };
+  }
 
-  return {
-    total,
-    anyNegative,
-    variantsCount: variants.length,
-    outOfStock: allZero,
-    understocked: anyNegative || total < 0,
-  };
+  const availabilities = [];
+  for (const v of variants) {
+    const a = await getVariantAvailableFromLevels(v);
+    availabilities.push(Number(a || 0));
+  }
+
+  const total = availabilities.reduce((a, b) => a + b, 0);
+  const minAvailable = Math.min(...availabilities);
+  const anyNegative = availabilities.some(a => a < 0);
+  const allZero = availabilities.every(a => a <= 0);
+
+  return { total, minAvailable, anyNegative, allZero, variantsCount: variants.length };
 }
 
 /* ----------------- Redis helpers (status + subscribers for id & handle) ----------------- */
@@ -311,7 +331,6 @@ async function getSubscribersForBundle(bundle) {
     if (typeof v === 'string') { try { return JSON.parse(v); } catch { return []; } }
     return [];
   }));
-  // merge by unique key (phone E.164 > email), prefer newest re-arm/subscribed
   const map = new Map();
   const keyFor = (s) => toE164(s?.phone || '') || emailKey(s?.email);
   const ts = (s) => Date.parse(s?.last_rearmed_at || s?.subscribed_at || 0);
@@ -325,8 +344,6 @@ async function getSubscribersForBundle(bundle) {
   const merged = Array.from(map.values());
   return { merged, keysTried: keys };
 }
-
-/** Persist updated subscribers back to BOTH keys */
 async function setSubscribersForBundle(bundle, subs) {
   await Promise.all([
     redis.set(`subscribers:${bundle.id}`, subs, { ex: 90 * 24 * 60 * 60 }),
@@ -334,11 +351,23 @@ async function setSubscribersForBundle(bundle, subs) {
   ]);
 }
 
+/* ----------------- Tag writer ----------------- */
+async function updateProductTags(productId, currentTags, status) {
+  const cleaned = currentTags
+    .map(t => t.trim())
+    .filter(tag => !['bundle-ok', 'bundle-understocked', 'bundle-out-of-stock'].includes(tag.toLowerCase()))
+    .concat([`bundle-${status}`]);
+
+  await fetchFromShopify(`products/${productId}.json`, 'PUT', {
+    product: { id: productId, tags: cleaned.join(', ') },
+  });
+}
+
 /* ----------------- main audit ----------------- */
 async function auditBundles() {
   assertEnv();
 
-  console.log('🔍 Starting bundle audit (pending-first, id+handle lookup)…');
+  console.log('🔍 Starting bundle audit (pending-first, own inventory aware)…');
   const start = Date.now();
 
   const bundles = await getProductsTaggedBundle();
@@ -356,7 +385,7 @@ async function auditBundles() {
       bundlesProcessed++;
       console.log(`\n📦 ${bundlesProcessed}/${bundles.length} — ${bundle.title}`);
 
-      // COMPONENTS STATUS (don’t bail if metafield missing)
+      // 1) COMPONENTS STATUS (uses metafield, but audit can be configured to ignore via BUNDLE_STATUS_MODE='own')
       let componentsStatus = 'ok';
       const metafield = await getProductMetafields(bundle.id);
       apiCallsCount++;
@@ -369,10 +398,11 @@ async function auditBundles() {
         let under = [], out = [];
         for (const c of components) {
           if (!c?.variant_id) continue;
-          const qty = await getInventoryLevel(c.variant_id);
+          const available = await getVariantAvailableFromLevels(c.variant_id);
           apiCallsCount++;
-          if (qty === 0) out.push(c.variant_id);
-          else if (qty < c.required_quantity) under.push(c.variant_id);
+
+          if (available <= 0) out.push(c.variant_id);
+          else if (typeof c.required_quantity === 'number' && available < c.required_quantity) under.push(c.variant_id);
         }
         if (out.length) componentsStatus = 'out-of-stock';
         else if (under.length) componentsStatus = 'understocked';
@@ -380,15 +410,23 @@ async function auditBundles() {
         console.log('ℹ️ No bundle_structure metafield — componentsStatus defaults to OK');
       }
 
-      // BUNDLE OWN INVENTORY STATUS
+      // 2) BUNDLE OWN INVENTORY STATUS (Admin "Bundle with N in stock")
       const ownInv = await getBundleOwnInventorySummary(bundle.id);
       apiCallsCount++;
-      let ownStatus = 'ok';
-      if (ownInv.outOfStock) ownStatus = 'out-of-stock';
-      else if (ownInv.understocked) ownStatus = 'understocked';
 
-      // FINAL STATUS = worst(components, own)
-      const status = worstStatus(componentsStatus, ownStatus);
+      let ownStatus = 'ok';
+      if (ownInv.allZero) ownStatus = 'out-of-stock';
+      else if (
+        ownInv.anyNegative ||
+        (BUNDLE_LOW_STOCK_THRESHOLD > 0 && ownInv.minAvailable > 0 && ownInv.minAvailable <= BUNDLE_LOW_STOCK_THRESHOLD)
+      ) {
+        ownStatus = 'understocked';
+      }
+
+      // 3) FINAL STATUS
+      const status = (BUNDLE_STATUS_MODE === 'own')
+        ? ownStatus
+        : worstStatus(componentsStatus, ownStatus);
 
       // Previous status via Redis, fallback to tags on product
       const prevObj = await getBundleStatus(bundle.id);
@@ -396,15 +434,14 @@ async function auditBundles() {
       await setBundleStatus(bundle.id, prevStatus || null, status);
 
       console.log(
-        `📊 ${bundle.title}: components=${componentsStatus} | own(total=${ownInv.total}, anyNeg=${ownInv.anyNegative}, variants=${ownInv.variantsCount})=${ownStatus} ⇒ final=${status}`
+        `📊 ${bundle.title}: components=${componentsStatus} | own(min=${ownInv.minAvailable}, total=${ownInv.total}, anyNeg=${ownInv.anyNegative}, variants=${ownInv.variantsCount})=${ownStatus} ⇒ final=${status}`
       );
 
-      // Waitlist read
+      // 4) Waitlist read/notify (pending-first)
       const { merged: uniqueSubs, keysTried } = await getSubscribersForBundle(bundle);
       const pending = uniqueSubs.filter(s => !s?.notified);
       console.log(`🧾 Waitlist: keys=${JSON.stringify(keysTried)} total=${uniqueSubs.length} pending=${pending.length}`);
 
-      // Notify when status returns to OK and there are pending subscribers (pending-first)
       const shouldNotify = (status === 'ok') && pending.length > 0;
 
       if (shouldNotify) {
@@ -417,7 +454,7 @@ async function auditBundles() {
             const phoneE164 = toE164(sub.phone || '');
             const smsConsent = !!sub.sms_consent && !!phoneE164;
 
-            // 1) Ensure they're on the ALERT list
+            // 1) Ensure on ALERT list
             await subscribeProfilesToList({
               listId: ALERT_LIST_ID,
               email: sub.email,
@@ -425,10 +462,10 @@ async function auditBundles() {
               sms: smsConsent,
             });
 
-            // 2) Stamp product props (best-effort)
-            const stampedTitle = sub.product_title || bundle.title || 'Unknown Product';
+            // 2) Stamp helpful product props (best-effort)
+            const stampedTitle  = sub.product_title  || bundle.title || 'Unknown Product';
             const stampedHandle = sub.product_handle || bundle.handle || '';
-            const stampedUrl = sub.product_url || productUrlFrom(stampedHandle) || productUrl;
+            const stampedUrl    = sub.product_url    || productUrlFrom(stampedHandle) || productUrl;
             const related_section_url = stampedUrl ? `${stampedUrl}#after-bis` : '';
 
             try {
@@ -448,7 +485,7 @@ async function auditBundles() {
               console.warn('⚠️ Profile props write failed, continuing:', e.message);
             }
 
-            // 3) Fire the event used by your notification flow
+            // 3) Fire event
             await trackKlaviyoEvent({
               metricName: 'Back in Stock',
               email: sub.email,
@@ -464,7 +501,7 @@ async function auditBundles() {
               }
             });
 
-            // 4) Mark as notified + gentle pacing
+            // 4) Mark notified + soft pacing
             sub.notified = true;
             notificationsSent++;
             if (smsConsent) smsNotificationsSent++;
@@ -475,13 +512,13 @@ async function auditBundles() {
           }
         }
 
-        // Write back to BOTH keys
+        // Persist list to BOTH keys
         await setSubscribersForBundle(bundle, uniqueSubs);
       } else {
         console.log('ℹ️ No notifications: either status != ok or no pending subscribers.');
       }
 
-      // Update tags
+      // 5) Update product tags
       await updateProductTags(bundle.id, bundle.tags.split(','), status);
       apiCallsCount++;
 
@@ -532,7 +569,7 @@ export async function GET(req) {
     const results = await auditBundles();
     return NextResponse.json({
       success: true,
-      message: 'Audit complete and tags updated (pending-first + id/handle waitlist + own inventory).',
+      message: `Audit complete (mode=${BUNDLE_STATUS_MODE}, threshold=${BUNDLE_LOW_STOCK_THRESHOLD}).`,
       ...results,
     });
   } catch (error) {
@@ -544,4 +581,3 @@ export async function GET(req) {
     await releaseLock();
   }
 }
-
