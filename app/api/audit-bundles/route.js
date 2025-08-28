@@ -20,11 +20,11 @@ const ALERT_LIST_ID         = process.env.KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID;
 const PUBLIC_STORE_DOMAIN   = process.env.PUBLIC_STORE_DOMAIN || 'armadillotough.com';
 const CRON_SECRET           = process.env.CRON_SECRET || ''; // authorize Vercel Cron
 
-// NEW: Storefront for accurate bundle availability (matches "Bundle with X in stock")
+// Storefront for accurate bundle availability (“Bundle with X in stock”)
 const STOREFRONT_API_TOKEN   = process.env.SHOPIFY_STOREFRONT_API_TOKEN || '';
 const STOREFRONT_API_VERSION = process.env.SHOPIFY_STOREFRONT_API_VERSION || '2024-07';
 
-// Optional "low stock" threshold for understocked via storefront quantityAvailable
+// Optional low-stock threshold (positive values) for understocked
 const LOW_STOCK_THRESHOLD    = Number(process.env.BUNDLE_LOW_STOCK_THRESHOLD || 0);
 
 function assertEnv() {
@@ -263,7 +263,6 @@ async function getInventoryLevel(variantId) {
 async function getProductVariantsWithGids(productId) {
   const res = await fetchFromShopify(`products/${productId}.json?fields=id,variants`);
   const variants = res?.product?.variants || [];
-  // Each variant has `admin_graphql_api_id`
   return variants.map(v => ({
     id: v.id,
     gid: v.admin_graphql_api_id,
@@ -291,14 +290,13 @@ async function getQuantityAvailableForVariantGids(gids) {
     .map(n => ({ gid: n.id, quantityAvailable: Number(n.quantityAvailable ?? 0) }));
 }
 
-/** Shopify Bundles–aligned availability for the *bundle product itself* (min per variant). */
+/** Shopify Bundles–aligned availability for the bundle product itself (min per variant). */
 async function getBundleStorefrontAvailability(productId) {
   const variants = await getProductVariantsWithGids(productId);
   const gids = variants.map(v => v.gid).filter(Boolean);
   if (!gids.length) {
     return { minAvailable: 0, byVariant: [], variantsCount: 0 };
   }
-  // Storefront returns the computed availability Shopify uses on PDP/admin (“Bundle with X in stock”)
   const qtys = await getQuantityAvailableForVariantGids(gids);
   const byGid = new Map(qtys.map(x => [x.gid, x.quantityAvailable]));
   const byVariant = variants.map(v => ({
@@ -368,7 +366,7 @@ async function updateProductTags(productId, currentTags, status) {
 async function auditBundles() {
   assertEnv();
 
-  console.log('🔍 Starting bundle audit (components + own + storefront availability)…');
+  console.log('🔍 Starting bundle audit (own + storefront + components; 0=OOS, negative=UNDER)…');
   const start = Date.now();
 
   const bundles = await getProductsTaggedBundle();
@@ -386,7 +384,26 @@ async function auditBundles() {
       bundlesProcessed++;
       console.log(`\n📦 ${bundlesProcessed}/${bundles.length} — ${bundle.title}`);
 
-      /* 1) COMPONENTS (your metafield) */
+      /* A) BUNDLE OWN INVENTORY (REST snapshot) — primary gate */
+      const ownInv = await getBundleOwnInventorySummary(bundle.id);
+      apiCallsCount++;
+      let ownStatus = 'ok';
+      if (ownInv.outOfStock) ownStatus = 'out-of-stock';
+      else if (ownInv.understocked) ownStatus = 'understocked';
+
+      /* B) STOREFRONT quantityAvailable (Shopify Bundles’ computed availability) — secondary */
+      const sf = await getBundleStorefrontAvailability(bundle.id);
+      apiCallsCount++;
+      let sfStatus = 'ok';
+      if (sf.minAvailable < 0) {
+        sfStatus = 'understocked';                      // negative → UNDERSTOCKED
+      } else if (sf.minAvailable === 0) {
+        sfStatus = 'out-of-stock';                      // exactly 0 → OUT OF STOCK
+      } else if (LOW_STOCK_THRESHOLD > 0 && sf.minAvailable <= LOW_STOCK_THRESHOLD) {
+        sfStatus = 'understocked';                      // low but positive
+      }
+
+      /* C) COMPONENTS (your metafield) — tertiary */
       let componentsStatus = 'ok';
       const metafield = await getProductMetafields(bundle.id);
       apiCallsCount++;
@@ -401,39 +418,30 @@ async function auditBundles() {
           if (!c?.variant_id) continue;
           const qty = await getInventoryLevel(c.variant_id);
           apiCallsCount++;
-          if (qty <= 0) out.push(c.variant_id);
-          else if (qty < (Number(c.required_quantity) || 1)) under.push(c.variant_id);
+          if (qty === 0) {
+            out.push(c.variant_id);                     // 0 → OUT OF STOCK
+          } else if (qty < 0 || qty < (Number(c.required_quantity) || 1)) {
+            under.push(c.variant_id);                   // negative or below required → UNDERSTOCKED
+          }
         }
         if (out.length) componentsStatus = 'out-of-stock';
         else if (under.length) componentsStatus = 'understocked';
       } else {
-        console.log('ℹ️ No bundle_structure metafield — componentsStatus defaults to OK');
+        console.log('ℹ️ No bundle_structure metafield — componentsStatus=ok');
       }
 
-      /* 2) BUNDLE OWN INVENTORY (REST fallback) */
-      const ownInv = await getBundleOwnInventorySummary(bundle.id);
-      apiCallsCount++;
-      let ownStatus = 'ok';
-      if (ownInv.outOfStock) ownStatus = 'out-of-stock';
-      else if (ownInv.understocked) ownStatus = 'understocked';
+      /* FINAL decision = worst of own, storefront, components */
+      const status = worstStatus(ownStatus, sfStatus, componentsStatus);
 
-      /* 3) STOREFRONT quantityAvailable (Shopify Bundles’ computed availability) */
-      const sf = await getBundleStorefrontAvailability(bundle.id);
-      apiCallsCount++; // storefront call (batched nodes)
-      let sfStatus = 'ok';
-      if (sf.minAvailable <= 0) sfStatus = 'out-of-stock';
-      else if (LOW_STOCK_THRESHOLD > 0 && sf.minAvailable <= LOW_STOCK_THRESHOLD) sfStatus = 'understocked';
-
-      /* FINAL: worst of the three */
-      const status = worstStatus(componentsStatus, ownStatus, sfStatus);
-
-      // previous vs current (redis fallback to tags)
+      // previous vs current (Redis; fallback to tags)
       const prevObj = await getBundleStatus(bundle.id);
       const prevStatus = prevObj?.current ?? extractStatusFromTags(bundle.tags);
       await setBundleStatus(bundle.id, prevStatus || null, status);
 
       console.log(
-        `📊 ${bundle.title} ⇒ components=${componentsStatus} | own(total=${ownInv.total}, anyNeg=${ownInv.anyNegative}, variants=${ownInv.variantsCount})=${ownStatus} | storefront(minAvail=${sf.minAvailable}, variants=${sf.variantsCount})=${sfStatus} ⇒ FINAL=${status}`
+        `📊 ${bundle.title} ⇒ own(total=${ownInv.total}, anyNeg=${ownInv.anyNegative}, v=${ownInv.variantsCount})=${ownStatus} | ` +
+        `storefront(minAvail=${sf.minAvailable}, v=${sf.variantsCount})=${sfStatus} | ` +
+        `components=${componentsStatus} ⇒ FINAL=${status}`
       );
 
       /* Waitlist read */
@@ -563,7 +571,7 @@ export async function GET(req) {
     const results = await auditBundles();
     return NextResponse.json({
       success: true,
-      message: 'Audit complete and tags updated (components + own + storefront availability).',
+      message: 'Audit complete and tags updated (own + storefront + components; 0=OOS, negative=UNDER).',
       ...results,
     });
   } catch (error) {
