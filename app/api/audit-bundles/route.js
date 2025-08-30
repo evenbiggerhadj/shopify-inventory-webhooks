@@ -24,7 +24,7 @@ const CRON_SECRET           = process.env.CRON_SECRET || ''; // authorize Vercel
 const STOREFRONT_API_TOKEN   = process.env.SHOPIFY_STOREFRONT_API_TOKEN || '';
 const STOREFRONT_API_VERSION = process.env.SHOPIFY_STOREFRONT_API_VERSION || '2024-07';
 
-// Optional “low stock” threshold
+// Optional “low stock” threshold (treat snapshot <= threshold as understocked)
 const LOW_STOCK_THRESHOLD    = Number(process.env.BUNDLE_LOW_STOCK_THRESHOLD || 0);
 
 function assertEnv() {
@@ -265,7 +265,7 @@ async function getVariant(id) {
   return res.variant;
 }
 
-/* >>> NEW: multi-location accurate inventory for a variant <<< */
+/* Multi-location accurate inventory for a variant */
 async function getInventoryLevel(variantId) {
   if (!variantId) return 0;
   const v = await getVariant(variantId);
@@ -372,24 +372,29 @@ function adminIdFromGid(gid) {
 async function resolveVariantId(c) {
   if (!c) return null;
 
+  // 1) explicit variant_id wins
   if (c.variant_id) return Number(c.variant_id);
 
+  // 2) product_id (single-variant, or disambiguate with sku)
   if (c.product_id) {
-    const res = await fetchFromShopify(`products/${c.product_id}.json?fields=variants`);
+    const pid = String(c.product_id).trim();
+    const res = await fetchFromShopify(`products/${pid}.json?fields=variants`);
     const vs = res?.product?.variants || [];
     if (vs.length === 1) return vs[0].id;
     if (c.sku) {
       const match = vs.find(v => String(v.sku || '').toLowerCase() === String(c.sku).toLowerCase());
       if (match) return match.id;
     }
-    throw new Error(`product_id ${c.product_id} has ${vs.length} variants; provide variant_id (or sku to disambiguate).`);
+    throw new Error(`product_id ${pid} has ${vs.length} variants; provide variant_id or sku to disambiguate.`);
   }
 
+  // 3) sku → unique variant
   if (c.sku) {
     const res = await fetchFromShopify(`variants.json?sku=${encodeURIComponent(c.sku)}&fields=id,sku&limit=1`);
     return res?.variants?.[0]?.id || null;
   }
 
+  // 4) product_handle → first variant via Storefront GQL
   if (c.product_handle) {
     const q = `query($h:String!){ product(handle:$h){ variants(first:1){ nodes{ id } } } }`;
     const out = await fetchStorefrontGraphQL(q, { h: String(c.product_handle) });
@@ -451,26 +456,36 @@ async function auditBundles() {
         for (const c of components) {
           const reqQty = Math.max(1, Number(c.required_quantity ?? 1));
 
-          // Resolve variant path first
-          let qty = 0;
-          let label = '';
-          const vid = await resolveVariantId(c);
+          // human-readable ident for logs
+          const ident =
+            c.variant_id ? `variant_id:${c.variant_id}` :
+            c.product_id ? `product_id:${c.product_id}` :
+            c.sku ? `sku:${c.sku}` :
+            c.product_handle ? `handle:${c.product_handle}` :
+            c.virtual_key ? `virtual:${c.virtual_key}` : 'unknown';
 
-          if (vid) {
-            qty = await getInventoryLevel(vid); // multi-location total
-            apiCallsCount++;
-            label = `v${vid}`;
-          } else if (c.virtual_key) {
-            qty = await getVirtualStock(c.virtual_key);
-            label = `virt:${c.virtual_key}`;
-          } else {
-            // cannot resolve → skip component, but log it
-            console.warn('⚠️ Unresolvable component; provide variant_id/product_id/sku/product_handle OR virtual_key:', c);
+          let qty = 0;
+
+          try {
+            const vid = await resolveVariantId(c);
+            if (vid) {
+              qty = await getInventoryLevel(vid);
+              apiCallsCount++;
+              console.log(`🧩 component resolved (${ident}) → v${vid} qty=${qty} req=${reqQty}`);
+            } else if (c.virtual_key) {
+              qty = await getVirtualStock(c.virtual_key);
+              console.log(`🧩 component virtual (${ident}) qty=${qty} req=${reqQty}`);
+            } else {
+              console.warn('⚠️ Skipping unresolvable component:', c);
+              continue;
+            }
+          } catch (e) {
+            console.warn(`⚠️ Component resolve error (${ident}): ${e.message}`);
             continue;
           }
 
-          if (qty <= 0) out.push(label);
-          else if (qty < reqQty) under.push(label);
+          if (qty <= 0) out.push(ident);
+          else if (qty < reqQty) under.push(ident);
         }
 
         if (out.length) componentsStatus = 'out-of-stock';
