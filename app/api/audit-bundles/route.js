@@ -24,7 +24,7 @@ const CRON_SECRET           = process.env.CRON_SECRET || ''; // authorize Vercel
 const STOREFRONT_API_TOKEN   = process.env.SHOPIFY_STOREFRONT_API_TOKEN || '';
 const STOREFRONT_API_VERSION = process.env.SHOPIFY_STOREFRONT_API_VERSION || '2024-07';
 
-// Optional “low stock” threshold (treat snapshot <= threshold as understocked)
+// Optional “low stock” threshold
 const LOW_STOCK_THRESHOLD    = Number(process.env.BUNDLE_LOW_STOCK_THRESHOLD || 0);
 
 function assertEnv() {
@@ -259,21 +259,15 @@ async function upsertProductMetafield(productId, { namespace, key, type, value }
   return fetchFromShopify(path, existing ? 'PUT' : 'POST', body);
 }
 
-/* --- Components (bundle_structure) --- */
+/* --- Components (your bundle_structure) --- */
 async function getVariant(id) {
   const res = await fetchFromShopify(`variants/${id}.json`);
   return res.variant;
 }
-
-/* Multi-location accurate inventory for a variant */
 async function getInventoryLevel(variantId) {
   if (!variantId) return 0;
   const v = await getVariant(variantId);
-  const invItemId = v?.inventory_item_id;
-  if (!invItemId) return Number(v?.inventory_quantity ?? 0);
-  const levels = await fetchFromShopify(`inventory_levels.json?inventory_item_ids=${invItemId}&limit=250`);
-  const sum = (levels?.inventory_levels || []).reduce((a, x) => a + Number(x.available ?? 0), 0);
-  return sum;
+  return Number(v?.inventory_quantity ?? 0);
 }
 
 /* --- Bundle own availability --- */
@@ -360,58 +354,6 @@ async function setSubscribersForBundle(bundle, subs) {
   ]);
 }
 
-/* ----------------- NEW: component resolvers ----------------- */
-
-/** Convert Storefront GID -> numeric Admin ID */
-function adminIdFromGid(gid) {
-  const m = String(gid || '').match(/\/(\d+)$/) || String(gid || '').match(/ProductVariant\/(\d+)$/);
-  return m ? Number(m[1] || m[2]) : null;
-}
-
-/** Resolve a component object to a numeric variant_id if possible */
-async function resolveVariantId(c) {
-  if (!c) return null;
-
-  // 1) explicit variant_id wins
-  if (c.variant_id) return Number(c.variant_id);
-
-  // 2) product_id (single-variant, or disambiguate with sku)
-  if (c.product_id) {
-    const pid = String(c.product_id).trim();
-    const res = await fetchFromShopify(`products/${pid}.json?fields=variants`);
-    const vs = res?.product?.variants || [];
-    if (vs.length === 1) return vs[0].id;
-    if (c.sku) {
-      const match = vs.find(v => String(v.sku || '').toLowerCase() === String(c.sku).toLowerCase());
-      if (match) return match.id;
-    }
-    throw new Error(`product_id ${pid} has ${vs.length} variants; provide variant_id or sku to disambiguate.`);
-  }
-
-  // 3) sku → unique variant
-  if (c.sku) {
-    const res = await fetchFromShopify(`variants.json?sku=${encodeURIComponent(c.sku)}&fields=id,sku&limit=1`);
-    return res?.variants?.[0]?.id || null;
-  }
-
-  // 4) product_handle → first variant via Storefront GQL
-  if (c.product_handle) {
-    const q = `query($h:String!){ product(handle:$h){ variants(first:1){ nodes{ id } } } }`;
-    const out = await fetchStorefrontGraphQL(q, { h: String(c.product_handle) });
-    const gid = out?.data?.product?.variants?.nodes?.[0]?.id;
-    const adminId = adminIdFromGid(gid);
-    return adminId || null;
-  }
-
-  return null;
-}
-
-/** Virtual stock reader: redis key "virtual_stock:<key>" */
-async function getVirtualStock(key) {
-  const val = await redis.get(`virtual_stock:${String(key)}`);
-  return Number(val ?? 0);
-}
-
 /* ----------------- Tag updates ----------------- */
 async function updateProductTags(productId, currentTags, status) {
   const cleaned = currentTags
@@ -452,49 +394,18 @@ async function auditBundles() {
         let components = [];
         try { components = JSON.parse(structure.value); } catch { components = []; }
         let under = [], out = [];
-
         for (const c of components) {
-          const reqQty = Math.max(1, Number(c.required_quantity ?? 1));
-
-          // human-readable ident for logs
-          const ident =
-            c.variant_id ? `variant_id:${c.variant_id}` :
-            c.product_id ? `product_id:${c.product_id}` :
-            c.sku ? `sku:${c.sku}` :
-            c.product_handle ? `handle:${c.product_handle}` :
-            c.virtual_key ? `virtual:${c.virtual_key}` : 'unknown';
-
-          let qty = 0;
-
-          try {
-            const vid = await resolveVariantId(c);
-            if (vid) {
-              qty = await getInventoryLevel(vid);
-              apiCallsCount++;
-              console.log(`🧩 component resolved (${ident}) → v${vid} qty=${qty} req=${reqQty}`);
-            } else if (c.virtual_key) {
-              qty = await getVirtualStock(c.virtual_key);
-              console.log(`🧩 component virtual (${ident}) qty=${qty} req=${reqQty}`);
-            } else {
-              console.warn('⚠️ Skipping unresolvable component:', c);
-              continue;
-            }
-          } catch (e) {
-            console.warn(`⚠️ Component resolve error (${ident}): ${e.message}`);
-            continue;
-          }
-
-          if (qty <= 0) out.push(ident);
-          else if (qty < reqQty) under.push(ident);
+          if (!c?.variant_id) continue;
+          const qty = await getInventoryLevel(c.variant_id);
+          apiCallsCount++;
+          if (qty === 0) out.push(c.variant_id);
+          else if (qty < 0 || qty < (Number(c.required_quantity) || 1)) under.push(c.variant_id);
         }
-
         if (out.length) componentsStatus = 'out-of-stock';
         else if (under.length) componentsStatus = 'understocked';
-
-        console.log(`🧩 Components result: ${componentsStatus}`);
       }
 
-      /* 2) SNAPSHOT inventory integer (own variants) */
+      /* 2) SNAPSHOT inventory integer */
       const sf = await getBundleStorefrontAvailability(bundle.id);
       apiCallsCount++;
       const own = await getBundleOwnInventorySummary(bundle.id);
