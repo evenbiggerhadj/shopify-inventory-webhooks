@@ -27,6 +27,11 @@ const STOREFRONT_API_VERSION = process.env.SHOPIFY_STOREFRONT_API_VERSION || '20
 // Optional “low stock” threshold (diagnostics only)
 const LOW_STOCK_THRESHOLD    = Number(process.env.BUNDLE_LOW_STOCK_THRESHOLD || 0);
 
+/** Paging/time-budget to avoid 504s */
+const DEFAULT_PAGE_SIZE = Number(process.env.AUDIT_PAGE_SIZE || 20);
+const TIME_BUDGET_MS    = Number(process.env.TIME_BUDGET_MS || 55_000);
+const CURSOR_KEY        = 'cursor:audit-bundles:since_id';
+
 /** Only require what we need for tagging; Klaviyo optional */
 function assertEnvForTagging() {
   const missing = [];
@@ -231,21 +236,32 @@ const hasBundleTag = (tagsStr) => {
   return tags.some(t => t === 'bundle' || t.startsWith('bundle-'));
 };
 
-/** Page through all products; filter by bundle tags. */
-async function getProductsTaggedBundle() {
-  let sinceId = 0;
-  const matching = [];
-  for (;;) {
-    const res = await fetchFromShopify(`products.json?fields=id,title,tags,handle&limit=250&since_id=${sinceId}`);
+/** Page through products and return one page of bundle products */
+async function getProductsTaggedBundlePage({ sinceId = 0, limit = 50 }) {
+  const items = [];
+  let cursor = sinceId;
+  let lastBatchCount = 0;
+
+  while (items.length < limit) {
+    const res = await fetchFromShopify(
+      `products.json?fields=id,title,tags,handle&limit=250&since_id=${cursor}`
+    );
     const batch = res?.products || [];
+    lastBatchCount = batch.length;
     if (!batch.length) break;
+
     for (const p of batch) {
-      if (hasBundleTag(p.tags)) matching.push(p);
+      cursor = p.id;
+      if (hasBundleTag(p.tags)) items.push(p);
+      if (items.length >= limit) break;
     }
-    sinceId = batch[batch.length - 1].id;
-    if (batch.length < 250) break;
+
+    if (batch.length < 250) break; // reached end
   }
-  return matching;
+
+  // hasMore if we hit our page limit OR Shopify still had 250 in the last batch
+  const hasMore = (items.length >= limit) || (lastBatchCount === 250);
+  return { items, nextSinceId: cursor, hasMore };
 }
 
 async function getProductMetafields(productId) {
@@ -356,7 +372,6 @@ async function getInventoryForComponent(c) {
   if (c?.product_id) {
     const prod = await getProductWithVariants(c.product_id);
     let sum = 0;
-    // serial to respect rate limiting
     for (const v of (prod.variants || [])) {
       sum += await getInventoryLevel(v.id);
     }
@@ -470,15 +485,17 @@ async function updateProductTags(productId, currentTags, status) {
   await fetchFromShopify(`products/${productId}.json`, 'PUT', { product: { id: productId, tags: next.join(', ') } });
 }
 
-/* ----------------- main audit ----------------- */
-async function auditBundles() {
+/* ----------------- main audit (paged + time budget) ----------------- */
+async function auditBundles({ pageSize = DEFAULT_PAGE_SIZE, sinceId = 0 } = {}) {
   assertEnvForTagging();
 
   console.log('🔍 Starting bundle audit (components-only tagging, multi-location inventory)…');
-  const start = Date.now();
+  const started = Date.now();
 
-  const bundles = await getProductsTaggedBundle();
-  console.log(`📦 Found ${bundles.length} bundles`);
+  const { items: bundles, nextSinceId, hasMore } =
+    await getProductsTaggedBundlePage({ sinceId, limit: pageSize });
+
+  console.log(`📦 Page: found ${bundles.length} bundles (since_id=${sinceId}, pageSize=${pageSize})`);
 
   let bundlesProcessed = 0;
   let notificationsSent = 0;
@@ -488,6 +505,11 @@ async function auditBundles() {
   let apiCallsCount = 1;
 
   for (const bundle of bundles) {
+    if (Date.now() - started > TIME_BUDGET_MS) {
+      console.log('⏳ Time budget reached, stopping early');
+      break;
+    }
+
     try {
       bundlesProcessed++;
       console.log(`\n📦 ${bundlesProcessed}/${bundles.length} — ${bundle.title}`);
@@ -529,14 +551,14 @@ async function auditBundles() {
         else componentsStatus = 'ok';
       }
 
-      /* 2) SNAPSHOT inventory (diagnostics only; does not affect tags) */
+      /* 2) SNAPSHOT diagnostics (does not affect tags) */
       const sf = await getBundleStorefrontAvailability(bundle.id);
       apiCallsCount++;
       const own = await getBundleOwnInventorySummary(bundle.id);
       apiCallsCount++;
 
       let snapshot = Number.isFinite(sf.minAvailable) ? sf.minAvailable : own.total;
-      if (own.total < snapshot) snapshot = own.total; // capture negatives from REST totals
+      if (own.total < snapshot) snapshot = own.total;
 
       await upsertProductMetafield(bundle.id, {
         namespace: 'custom',
@@ -583,12 +605,11 @@ async function auditBundles() {
         `📊 ${bundle.title} ⇒ components=${componentsStatus} | snapshot=${snapshot} (${invStatus}) ⇒ FINAL_TAG=${finalStatusForTags}`
       );
 
-      /* Waitlist read */
+      /* Waitlist (optional Klaviyo) */
       const { merged: uniqueSubs, keysTried } = await getSubscribersForBundle(bundle);
       const pending = uniqueSubs.filter(s => !s?.notified);
       console.log(`🧾 Waitlist: keys=${JSON.stringify(keysTried)} total=${uniqueSubs.length} pending=${pending.length}`);
 
-      /* Notify when FINAL (tags) == ok and there are pending subscribers (only if Klaviyo is configured) */
       const shouldNotify = haveKlaviyo && (finalStatusForTags === 'ok') && pending.length > 0;
 
       if (shouldNotify) {
@@ -664,26 +685,23 @@ async function auditBundles() {
       await updateProductTags(bundle.id, bundle.tags.split(','), finalStatusForTags);
       apiCallsCount++;
 
-      const elapsed = (Date.now() - start) / 1000;
-      const avg = elapsed / bundlesProcessed;
-      const left = (bundles.length - bundlesProcessed) * avg;
-      console.log(`⏱️ ${bundlesProcessed}/${bundles.length} done — ~${Math.round(left)}s remaining`);
-      console.log(`📈 API calls so far: ${apiCallsCount} (~${(apiCallsCount / elapsed).toFixed(2)}/s)`);
-
+      const elapsed = (Date.now() - started) / 1000;
+      console.log(`⏱️ ${bundlesProcessed}/${bundles.length} processed so far · API calls ≈ ${apiCallsCount} · ${elapsed.toFixed(1)}s`);
     } catch (err) {
       console.error(`❌ Error on bundle "${bundle.title}":`, err.message);
-      // Even on error, try to force a safe tag if we can
       try { await updateProductTags(bundle.id, bundle.tags.split(','), 'understocked'); } catch {}
     }
   }
 
-  const total = (Date.now() - start) / 1000;
-  console.log('\n✅ Audit complete');
-  console.log(`📦 Bundles processed: ${bundlesProcessed}`);
+  const total = (Date.now() - started) / 1000;
+  const partial = (Date.now() - started > TIME_BUDGET_MS) || hasMore || (bundlesProcessed < bundles.length);
+
+  console.log('\n✅ Page complete');
+  console.log(`📦 Bundles processed this page: ${bundlesProcessed}`);
   console.log(`📧 Email subs: ${notificationsSent}`);
   console.log(`📱 SMS subs: ${smsNotificationsSent}`);
   console.log(`❌ Notify errors: ${notificationErrors}`);
-  console.log(`⏱️ ${Math.round(total)}s total, ${apiCallsCount} API calls`);
+  console.log(`⏱️ ${Math.round(total)}s this page, API calls ${apiCallsCount}`);
 
   return {
     bundlesProcessed,
@@ -693,12 +711,14 @@ async function auditBundles() {
     notificationErrors,
     totalTimeSeconds: total,
     apiCallsCount,
-    avgApiCallRate: apiCallsCount / total,
+    avgApiCallRate: apiCallsCount / Math.max(total, 0.001),
     timestamp: new Date().toISOString(),
+    partial,
+    nextSinceId: partial ? nextSinceId : 0,
   };
 }
 
-/* ----------------- GET handler ----------------- */
+/* ----------------- GET handler (paged; advances cursor) ----------------- */
 export async function GET(req) {
   const authed = await ensureCronAuth(req);
   if (!authed) return unauthorized();
@@ -709,10 +729,25 @@ export async function GET(req) {
   }
 
   try {
-    const results = await auditBundles();
+    const url = new URL(req.url);
+    const reset = url.searchParams.get('reset') === '1';
+    const pageSize = Number(url.searchParams.get('limit') || DEFAULT_PAGE_SIZE);
+
+    const sinceId = reset ? 0 : Number((await redis.get(CURSOR_KEY)) || 0);
+
+    const results = await auditBundles({ pageSize, sinceId });
+
+    if (results.partial && results.nextSinceId) {
+      await redis.set(CURSOR_KEY, results.nextSinceId, { ex: 24 * 60 * 60 });
+    } else {
+      await redis.del(CURSOR_KEY);
+    }
+
     return NextResponse.json({
       success: true,
-      message: 'Audit complete: components-only status tagged; snapshot stored for diagnostics.',
+      message: results.partial
+        ? `Audit running in batches (limit=${pageSize}). Next since_id=${results.nextSinceId}.`
+        : 'Audit complete for all bundles.',
       ...results,
     });
   } catch (error) {
