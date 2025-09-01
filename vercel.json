@@ -1,0 +1,12 @@
+{
+    "crons": [
+      { "path": "/api/audit-bundles?loop=1", "schedule": "*/1 * * * *" }
+    ],
+    "functions": {
+      "app/api/audit-bundles/route.js": {
+        "maxDuration": 300,
+        "memory": 1024
+      }
+    }
+  }
+  
