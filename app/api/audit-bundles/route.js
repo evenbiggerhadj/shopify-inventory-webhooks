@@ -1,11 +1,11 @@
 // app/api/audit-bundles/route.js
 
-export const runtime = 'nodejs';
-export const maxDuration = 300; // keep slices under this; we chain more slices automatically
-
 import { NextResponse, after } from 'next/server';
 import { Redis } from '@upstash/redis';
 import { randomUUID } from 'crypto';
+
+export const runtime = 'nodejs';
+export const maxDuration = 300; // chain slices; don't rely on long single runs
 
 /* ----------------- Env & Redis ----------------- */
 const redis = new Redis({
@@ -29,18 +29,17 @@ function assertEnv() {
   if (missing.length) throw new Error(`Missing env: ${missing.join(', ')}`);
 }
 
-/* ----------------- Cron auth & locking ----------------- */
+/* ----------------- Auth & locking ----------------- */
 function unauthorized() {
   return NextResponse.json({ success: false, error: 'unauthorized' }, { status: 401 });
 }
 async function ensureCronAuth(req) {
-  // Allow Vercel Cron (adds this header automatically)
-  if (req.headers.get('x-vercel-cron')) return true;
+  if (req.headers.get('x-vercel-cron')) return true; // Vercel Cron
   if (!CRON_SECRET) return true; // open if no secret configured
   const auth = req.headers.get('authorization') || '';
   if (auth === `Bearer ${CRON_SECRET}`) return true;
   const url = new URL(req.url);
-  if (url.searchParams.get('token') === CRON_SECRET) return true; // optional query token
+  if (url.searchParams.get('token') === CRON_SECRET) return true;
   return false;
 }
 
@@ -70,17 +69,17 @@ async function releaseLock(runId) {
 /* ----------------- Tunables ----------------- */
 // Shopify REST: ~2 rps. 500ms is safe.
 const MIN_DELAY_MS   = Number(process.env.SHOPIFY_THROTTLE_MS || 500);
-// Keep each slice well under 300s to avoid timeouts; chain slices as needed.
+// Keep each slice under the function ceiling (we chain slices as needed).
 const TIME_BUDGET_MS = Number(process.env.TIME_BUDGET_MS || 240000);
 
 /* ----------------- Utils ----------------- */
 function toE164(raw) {
   if (!raw) return null;
   let v = String(raw).trim().replace(/[^\d+]/g, '');
-  if (v.startsWith('+')) return /^\+\d{8,15}$/.test(v) ? v : null; // strict E.164
-  if (/^0\d{10}$/.test(v)) return '+234' + v.slice(1);            // NG 0XXXXXXXXXX
-  if (/^(70|80|81|90|91)\d{8}$/.test(v)) return '+234' + v;        // NG 10-digit
-  if (/^\d{10}$/.test(v)) return '+1' + v;                         // US 10-digit
+  if (v.startsWith('+')) return /^\+\d{8,15}$/.test(v) ? v : null;
+  if (/^0\d{10}$/.test(v)) return '+234' + v.slice(1);
+  if (/^(70|80|81|90|91)\d{8}$/.test(v)) return '+234' + v;
+  if (/^\d{10}$/.test(v)) return '+1' + v;
   return null;
 }
 const emailKey = (e) => `email:${String(e || '').toLowerCase()}`;
@@ -367,10 +366,8 @@ async function notifyPending({ allSubs, pending, keysTried, pid, title, handle, 
       const phoneE164 = toE164(sub.phone || '');
       const smsConsent = !!sub.sms_consent && !!phoneE164;
 
-      // 1) Ensure on the ALERT list
       await subscribeProfilesToList({ listId: String(ALERT_LIST_ID), email: sub.email, phoneE164, sms: smsConsent });
 
-      // 2) Stamp last back-in-stock props (best-effort)
       const stampedTitle  = sub.product_title  || title || 'Unknown Product';
       const stampedHandle = sub.product_handle || handle || '';
       const stampedUrl    = sub.product_url    || productUrlFrom(stampedHandle) || productUrl;
@@ -393,7 +390,6 @@ async function notifyPending({ allSubs, pending, keysTried, pid, title, handle, 
         console.warn('⚠️ Profile props write failed, continuing:', e?.message || e);
       }
 
-      // 3) Fire the event used by your flow
       await trackKlaviyoEvent({
         metricName: 'Back in Stock',
         email: sub.email,
@@ -409,7 +405,6 @@ async function notifyPending({ allSubs, pending, keysTried, pid, title, handle, 
         },
       });
 
-      // 4) Mark notified + gentle pacing
       sub.notified = true;
       notificationsSent++;
       if (smsConsent) smsNotificationsSent++;
@@ -455,17 +450,24 @@ async function runCatalogSlice({ runId, verbose = false }) {
   let products = [];
   let i = cursor.nextIndex || 0;
 
-  // fetch the current page
-  ({ products, nextUrl: page.nextUrl } = await fetchProductsPage(cursor.pageUrl));
+  // fetch the current page (NO invalid destructuring here)
+  {
+    const first = await fetchProductsPage(cursor.pageUrl);
+    products = first.products;
+    page.nextUrl = first.nextUrl;
+  }
 
   // process until time budget is spent
   while (true) {
     if (i >= products.length) {
-      // move to next page
-      if (!page.nextUrl) break; // no more pages => done
+      if (!page.nextUrl) break; // no more pages
       cursor = { ...cursor, pageUrl: page.nextUrl, nextIndex: 0 };
       await saveCursor(cursor);
-      ({ products, nextUrl: page.nextUrl } = await fetchProductsPage(cursor.pageUrl));
+
+      const next = await fetchProductsPage(cursor.pageUrl);
+      products = next.products;
+      page.nextUrl = next.nextUrl;
+
       i = 0;
       if (verbose) console.log(`📥 Next page: ${products.length} products`);
       if (!products.length) break;
@@ -478,7 +480,6 @@ async function runCatalogSlice({ runId, verbose = false }) {
       const handle = product.handle;
       const tagsCSV = String(product.tags || '');
 
-      // Inventory total across variants
       const total = (product.variants || []).reduce((acc, v) => acc + Number(v?.inventory_quantity ?? 0), 0);
       const prevTotal = await getPrevTotal(pid);
       const increased = prevTotal == null ? false : total > prevTotal;
@@ -487,7 +488,6 @@ async function runCatalogSlice({ runId, verbose = false }) {
       const isBundle = hasBundleTag(tagsCSV);
 
       if (isBundle) {
-        // ----- compute bundle status -----
         let componentsStatus = 'ok';
         const mf = await getProductMetafields(pid);
         if (mf?.value) {
@@ -528,7 +528,6 @@ async function runCatalogSlice({ runId, verbose = false }) {
           console.log(`📊 ${title} — bundle comp=${componentsStatus} own=${ownStatus} ⇒ ${finalStatus}; total=${total} (prev=${prevTotal ?? 'n/a'}, Δ+? ${increased})`);
         }
 
-        // Notify bundles only when back to OK + pending + (flip to ok OR increased)
         const { merged: allSubs, keysTried } = await getSubscribersForProduct({ id: pid, handle });
         const pending = allSubs.filter(s => !s?.notified);
         const prevWasOk = (prevObj?.previous ?? extractStatusFromTags(tagsCSV)) === 'ok';
@@ -543,7 +542,7 @@ async function runCatalogSlice({ runId, verbose = false }) {
         }
       } else {
         if (verbose) console.log(`📊 ${title} — non-bundle; total=${total} (prev=${prevTotal ?? 'n/a'}, Δ+? ${increased})`);
-        // Notify non-bundles on increase > 0
+
         const { merged: allSubs, keysTried } = await getSubscribersForProduct({ id: pid, handle });
         const pending = allSubs.filter(s => !s?.notified);
         const shouldNotify = (pending.length > 0) && increased && total > 0;
@@ -561,8 +560,7 @@ async function runCatalogSlice({ runId, verbose = false }) {
       console.error(`❌ Error on product "${product?.title || product?.id}":`, e?.message || e);
     }
 
-    // time budget guard
-    if (Date.now() - t0 > TIME_BUDGET_MS) break;
+    if (Date.now() - t0 > TIME_BUDGET_MS) break; // time budget guard
   }
 
   // save resume point
@@ -597,7 +595,6 @@ export async function GET(req) {
   const loop    = ['1','true','yes'].includes((url.searchParams.get('loop') || '').toLowerCase());
   const action  = (url.searchParams.get('action') || '').toLowerCase();
 
-  // Use caller's runId if provided; otherwise reuse cursor's runId or mint one
   let runId = url.searchParams.get('runId');
   if (!runId) {
     const cur = await redis.get(CURSOR_KEY);
@@ -611,27 +608,23 @@ export async function GET(req) {
     return NextResponse.json({ locked: ttl > 0, ttl, holder, cursor });
   }
 
-  // Acquire or validate the lock for this runId
   const ok = await acquireOrValidateLock(runId);
   if (!ok) return NextResponse.json({ success: false, error: 'audit already running' }, { status: 423 });
 
   try {
     const slice = await runCatalogSlice({ runId, verbose });
 
-    // If more work and loop=1, re-invoke ourselves in the background
     if (!slice.done && loop) {
       const resumeUrl =
         `${url.origin}/api/audit-bundles?loop=1&runId=${encodeURIComponent(runId)}` +
         (verbose ? '&verbose=1' : '');
       const headers = CRON_SECRET ? { authorization: `Bearer ${CRON_SECRET}` } : undefined;
       after(() => fetch(resumeUrl, { cache: 'no-store', headers }).catch(() => {}));
-      // Keep the lock alive for the next slice
       await redis.expire(LOCK_KEY, LOCK_TTL_SECONDS);
     } else if (slice.done) {
       await clearCursor();
       await releaseLock(runId);
     } else {
-      // no loop: leave the cursor saved so caller can resume manually
       await redis.expire(LOCK_KEY, LOCK_TTL_SECONDS);
     }
 
@@ -652,7 +645,6 @@ export async function GET(req) {
         : (loop ? 'Slice complete; another slice scheduled (resumable)' : 'Slice complete; call again to resume'),
     });
   } catch (error) {
-    // On error, free the lock so you’re not bricked
     await releaseLock(runId);
     return NextResponse.json(
       {
