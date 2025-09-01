@@ -20,7 +20,7 @@ const ALERT_LIST_ID         = process.env.KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID ||
 const PUBLIC_STORE_DOMAIN   = process.env.PUBLIC_STORE_DOMAIN || 'example.com';
 const CRON_SECRET           = process.env.CRON_SECRET || ''; // authorize Vercel Cron
 
-// Storefront for snapshot diagnostics
+// Storefront for snapshot diagnostics (doesn't drive tags)
 const STOREFRONT_API_TOKEN   = process.env.SHOPIFY_STOREFRONT_API_TOKEN || '';
 const STOREFRONT_API_VERSION = process.env.SHOPIFY_STOREFRONT_API_VERSION || '2024-07';
 
@@ -45,7 +45,7 @@ function assertEnvForTagging() {
 function unauthorized() {
   return NextResponse.json({ success: false, error: 'unauthorized' }, { status: 401 });
 }
-async function ensureCronAuth(req) {
+async function ensureCronAuth(req: Request) {
   if (!CRON_SECRET) return true;
   const auth = req.headers.get('authorization') || '';
   return auth === `Bearer ${CRON_SECRET}`;
@@ -59,7 +59,7 @@ async function acquireLock() {
 async function releaseLock() { try { await redis.del(LOCK_KEY); } catch {} }
 
 /* ----------------- utils ----------------- */
-function toE164(raw) {
+function toE164(raw: any) {
   if (!raw) return null;
   let v = String(raw).trim().replace(/[^\d+]/g, '');
   if (v.startsWith('+')) return /^\+\d{8,15}$/.test(v) ? v : null;
@@ -68,24 +68,26 @@ function toE164(raw) {
   if (/^\d{10}$/.test(v)) return '+1' + v;
   return null;
 }
-const emailKey = (e) => `email:${String(e || '').toLowerCase()}`;
-const productUrlFrom = (handle) => handle ? `https://${PUBLIC_STORE_DOMAIN}/products/${handle}` : '';
-function extractStatusFromTags(tagsStr) {
+const emailKey = (e: any) => `email:${String(e || '').toLowerCase()}`;
+const productUrlFrom = (handle?: string) => handle ? `https://${PUBLIC_STORE_DOMAIN}/products/${handle}` : '';
+function extractStatusFromTags(tagsStr: string) {
   const tags = String(tagsStr || '').split(',').map(t => t.trim().toLowerCase());
   if (tags.includes('bundle-out-of-stock')) return 'out-of-stock';
   if (tags.includes('bundle-understocked')) return 'understocked';
   if (tags.includes('bundle-ok')) return 'ok';
   return null;
 }
-const RANK = { 'ok': 0, 'understocked': 1, 'out-of-stock': 2 };
-const worstStatus = (...s) => s.reduce((w, x) => (RANK[x] >= RANK[w] ? x : w), 'ok');
+const RANK: Record<string, number> = { 'ok': 0, 'understocked': 1, 'out-of-stock': 2 };
+const worstStatus = (...s: string[]) => s.reduce((w, x) => (RANK[x] >= RANK[w] ? x : w), 'ok');
 
 /* ----------------- Klaviyo helpers (optional) ----------------- */
 const haveKlaviyo = !!(KLAVIYO_API_KEY && ALERT_LIST_ID);
 
-async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
+async function subscribeProfilesToList({ listId, email, phoneE164, sms }:{
+  listId: string, email: string, phoneE164?: string|null, sms?: boolean
+}) {
   if (!haveKlaviyo) return { ok: false, skipped: true };
-  const subscriptions = { email: { marketing: { consent: 'SUBSCRIBED' } } };
+  const subscriptions: any = { email: { marketing: { consent: 'SUBSCRIBED' } } };
   if (sms && phoneE164) subscriptions.sms = { marketing: { consent: 'SUBSCRIBED' } };
 
   const payload = {
@@ -114,7 +116,7 @@ async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
   return { ok: true, status: res.status, body };
 }
 
-async function updateProfileProperties({ email, properties }) {
+async function updateProfileProperties({ email, properties }:{ email: string, properties: any }) {
   if (!haveKlaviyo) return { ok: false, skipped: true };
   const filter = `equals(email,"${String(email).replace(/"/g, '\\"')}")`;
   const listRes = await fetch(
@@ -145,7 +147,9 @@ async function updateProfileProperties({ email, properties }) {
   return { ok: true, status: patchRes.status, body: txt };
 }
 
-async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }) {
+async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }:{
+  metricName: string, email?: string, phoneE164?: string|null, properties?: any
+}) {
   if (!haveKlaviyo) return { ok: false, skipped: true };
   const body = {
     data: {
@@ -184,12 +188,12 @@ async function rateLimitedDelay() {
   if (dt < MIN_DELAY_MS) await new Promise(r => setTimeout(r, MIN_DELAY_MS - dt));
   lastApiCall = Date.now();
 }
-async function fetchFromShopify(endpoint, method = 'GET', body = null) {
+async function fetchFromShopify(endpoint: string, method: string = 'GET', body: any = null) {
   if (!endpoint || typeof endpoint !== 'string') throw new Error(`Invalid endpoint: "${endpoint}"`);
   await rateLimitedDelay();
 
-  const headers = { 'X-Shopify-Access-Token': ADMIN_API_TOKEN, 'Content-Type': 'application/json' };
-  const opts = { method, headers, ...(body ? { body: JSON.stringify(body) } : {}) };
+  const headers: any = { 'X-Shopify-Access-Token': ADMIN_API_TOKEN, 'Content-Type': 'application/json' };
+  const opts: any = { method, headers, ...(body ? { body: JSON.stringify(body) } : {}) };
   const url = endpoint.startsWith('http')
     ? endpoint
     : `https://${SHOPIFY_STORE}/admin/api/2024-04/${endpoint.replace(/^\//, '')}`;
@@ -213,7 +217,7 @@ async function fetchFromShopify(endpoint, method = 'GET', body = null) {
 }
 
 /* ----------------- Shopify Storefront (GraphQL) ----------------- */
-async function fetchStorefrontGraphQL(query, variables = {}) {
+async function fetchStorefrontGraphQL(query: string, variables: any = {}) {
   const url = `https://${SHOPIFY_STORE}/api/${STOREFRONT_API_VERSION}/graphql.json`;
   const res = await fetch(url, {
     method: 'POST',
@@ -231,14 +235,14 @@ async function fetchStorefrontGraphQL(query, variables = {}) {
 }
 
 /* ----------------- Bundle discovery & data ----------------- */
-const hasBundleTag = (tagsStr) => {
+const hasBundleTag = (tagsStr: string) => {
   const tags = String(tagsStr || '').split(',').map(t => t.trim().toLowerCase());
   return tags.some(t => t === 'bundle' || t.startsWith('bundle-'));
 };
 
 /** Page through products and return one page of bundle products */
-async function getProductsTaggedBundlePage({ sinceId = 0, limit = 50 }) {
-  const items = [];
+async function getProductsTaggedBundlePage({ sinceId = 0, limit = 50 }:{ sinceId?: number, limit?: number }) {
+  const items: any[] = [];
   let cursor = sinceId;
   let lastBatchCount = 0;
 
@@ -259,20 +263,48 @@ async function getProductsTaggedBundlePage({ sinceId = 0, limit = 50 }) {
     if (batch.length < 250) break; // reached end
   }
 
-  // hasMore if we hit our page limit OR Shopify still had 250 in the last batch
   const hasMore = (items.length >= limit) || (lastBatchCount === 250);
   return { items, nextSinceId: cursor, hasMore };
 }
 
-async function getProductMetafields(productId) {
+async function getProductMetafields(productId: number) {
   const res = await fetchFromShopify(`products/${productId}/metafields.json`);
   return res?.metafields || [];
 }
-async function getSpecificProductMetafield(productId, namespace, key) {
-  const list = await getProductMetafields(productId);
-  return list.find(m => m.namespace === namespace && m.key === key) || null;
+
+/** Find a “bundle structure” metafield (flexible namespaces/keys) and parse it safely */
+async function getBundleComponents(productId: number) {
+  const metas = await getProductMetafields(productId);
+  const candidates = metas.filter((m: any) => {
+    const k = String(m?.key || '').toLowerCase();
+    return ['bundle_structure','components','bundle_components','bom','bundleitems','bundle_items'].includes(k);
+  });
+
+  for (const m of candidates) {
+    const raw = m?.value;
+    if (!raw) continue;
+    try {
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (Array.isArray(parsed)) {
+        return parsed.map((c: any) => ({
+          variant_id: c?.variant_id ?? c?.variantId ?? null,
+          product_id: c?.product_id ?? c?.productId ?? null,
+          sku:        c?.sku ?? c?.variant_sku ?? null,
+          required_quantity: Math.max(1, Number(c?.required_quantity ?? c?.qty ?? 1) || 1),
+        }));
+      }
+    } catch {
+      // try next candidate
+    }
+  }
+  return null; // not found or unparseable
 }
-async function upsertProductMetafield(productId, { namespace, key, type, value }) {
+
+async function getSpecificProductMetafield(productId: number, namespace: string, key: string) {
+  const list = await getProductMetafields(productId);
+  return list.find((m: any) => m.namespace === namespace && m.key === key) || null;
+}
+async function upsertProductMetafield(productId: number, { namespace, key, type, value }:{ namespace: string, key: string, type: string, value: string }) {
   const existing = await getSpecificProductMetafield(productId, namespace, key);
   const body = existing
     ? { metafield: { id: existing.id, value, type: existing.type || type } }
@@ -284,20 +316,20 @@ async function upsertProductMetafield(productId, { namespace, key, type, value }
 }
 
 /* --- Components & inventory helpers --- */
-async function getVariant(id) {
+async function getVariant(id: number) {
   const res = await fetchFromShopify(`variants/${id}.json`);
   return res.variant;
 }
 
 /** Multi-location safe: sum InventoryLevels.available for the variant’s inventory_item_id.
  *  If inventory isn’t tracked (inventory_management != 'shopify'), we conservatively treat as 0. */
-async function getInventoryLevel(variantId) {
+async function getInventoryLevel(variantId: number) {
   if (!variantId) return 0;
 
   const v = await getVariant(variantId);
   if (!v) return 0;
 
-  if (!v.inventory_management || v.inventory_management.toLowerCase() !== 'shopify') {
+  if (!v.inventory_management || String(v.inventory_management).toLowerCase() !== 'shopify') {
     return 0; // treat untracked as 0; change to Infinity if you want “untracked = unlimited”
   }
 
@@ -308,17 +340,17 @@ async function getInventoryLevel(variantId) {
 
   const levelsRes = await fetchFromShopify(`inventory_levels.json?inventory_item_ids=${inventoryItemId}&limit=250`);
   const levels = Array.isArray(levelsRes?.inventory_levels) ? levelsRes.inventory_levels : [];
-  const total = levels.reduce((acc, lvl) => acc + Number(lvl.available ?? 0), 0);
+  const total = levels.reduce((acc: number, lvl: any) => acc + Number(lvl.available ?? 0), 0);
 
   if (!Number.isFinite(total)) return Number(v.inventory_quantity ?? 0);
   return total;
 }
 
 /* Cache to avoid redundant product pulls */
-const productCache = new Map();
-const variantBySkuCache = new Map();
+const productCache = new Map<number, any>();
+const variantBySkuCache = new Map<string, number>();
 
-async function getProductWithVariants(productId) {
+async function getProductWithVariants(productId: number) {
   if (productCache.has(productId)) return productCache.get(productId);
   const res = await fetchFromShopify(`products/${productId}.json?fields=id,variants`);
   const p = res?.product || { id: productId, variants: [] };
@@ -330,13 +362,13 @@ async function getProductWithVariants(productId) {
  *  - { variant_id }
  *  - { product_id }       // if single-variant product
  *  - { sku } or { variant_sku } */
-async function resolveVariantIdFromComponent(c) {
+async function resolveVariantIdFromComponent(c: any) {
   if (!c || typeof c !== 'object') return null;
 
   if (c.variant_id) return Number(c.variant_id);
 
   if (c.product_id) {
-    const prod = await getProductWithVariants(c.product_id);
+    const prod = await getProductWithVariants(Number(c.product_id));
     const vars = Array.isArray(prod.variants) ? prod.variants : [];
     if (vars.length === 1) return vars[0].id;
     console.warn(`Component product ${c.product_id} is multi-variant with no variant_id/sku`);
@@ -346,9 +378,9 @@ async function resolveVariantIdFromComponent(c) {
   const sku = (c.sku || c.variant_sku || '').trim();
   if (sku) {
     const key = sku.toLowerCase();
-    if (variantBySkuCache.has(key)) return variantBySkuCache.get(key);
+    if (variantBySkuCache.has(key)) return variantBySkuCache.get(key)!;
     for (const p of productCache.values()) {
-      const match = (p.variants || []).find(v => String(v.sku || '').toLowerCase() === key);
+      const match = (p.variants || []).find((v: any) => String(v.sku || '').toLowerCase() === key);
       if (match) {
         variantBySkuCache.set(key, match.id);
         return match.id;
@@ -361,7 +393,7 @@ async function resolveVariantIdFromComponent(c) {
   return null;
 }
 
-async function getInventoryForComponent(c) {
+async function getInventoryForComponent(c: any) {
   const vid = await resolveVariantIdFromComponent(c);
   if (vid) {
     const qty = await getInventoryLevel(vid);
@@ -370,35 +402,35 @@ async function getInventoryForComponent(c) {
 
   // Fallback: product-level aggregate if product_id provided but no single variant chosen
   if (c?.product_id) {
-    const prod = await getProductWithVariants(c.product_id);
+    const prod = await getProductWithVariants(Number(c.product_id));
     let sum = 0;
     for (const v of (prod.variants || [])) {
       sum += await getInventoryLevel(v.id);
     }
-    return { qty: sum, resolved: 'product', productId: c.product_id };
+    return { qty: sum, resolved: 'product', productId: Number(c.product_id) };
   }
 
   return { qty: null, resolved: 'unresolved' };
 }
 
 /* --- Bundle own availability (diagnostics only; tags ignore this) --- */
-async function getProductVariantsWithGids(productId) {
+async function getProductVariantsWithGids(productId: number) {
   const res = await fetchFromShopify(`products/${productId}.json?fields=id,variants`);
   const variants = res?.product?.variants || [];
-  return variants.map(v => ({
+  return variants.map((v: any) => ({
     id: v.id,
     gid: v.admin_graphql_api_id,
     inventory_quantity: Number(v?.inventory_quantity ?? 0),
   }));
 }
-async function getQuantityAvailableForVariantGids(gids) {
+async function getQuantityAvailableForVariantGids(gids: string[]) {
   if (!gids.length) return [];
   const q = `query ($ids: [ID!]!) { nodes(ids: $ids) { ... on ProductVariant { id quantityAvailable } } }`;
   const out = await fetchStorefrontGraphQL(q, { ids: gids });
   const nodes = out?.data?.nodes || [];
-  return nodes.filter(Boolean).map(n => ({ gid: n.id, quantityAvailable: Number(n.quantityAvailable ?? 0) }));
+  return nodes.filter(Boolean).map((n: any) => ({ gid: n.id, quantityAvailable: Number(n.quantityAvailable ?? 0) }));
 }
-async function getBundleStorefrontAvailability(productId) {
+async function getBundleStorefrontAvailability(productId: number) {
   const variants = await getProductVariantsWithGids(productId);
   const gids = variants.map(v => v.gid).filter(Boolean);
   if (!gids.length) return { minAvailable: 0, byVariant: [], variantsCount: 0 };
@@ -412,7 +444,7 @@ async function getBundleStorefrontAvailability(productId) {
   const minAvailable = byVariant.length ? Math.min(...byVariant.map(x => x.quantityAvailable)) : 0;
   return { minAvailable, byVariant, variantsCount: byVariant.length };
 }
-async function getBundleOwnInventorySummary(productId) {
+async function getBundleOwnInventorySummary(productId: number) {
   const variants = await getProductVariantsWithGids(productId);
   const qtys = variants.map(v => Number(v.inventory_quantity || 0));
   const total = qtys.reduce((a, b) => a + b, 0);
@@ -422,7 +454,7 @@ async function getBundleOwnInventorySummary(productId) {
 }
 
 /* --- Status from the snapshot integer (diagnostics only) --- */
-function statusFromInventoryInteger(n) {
+function statusFromInventoryInteger(n: number) {
   if (!Number.isFinite(n)) return 'ok';
   if (n < 0) return 'understocked';
   if (n === 0) return 'out-of-stock';
@@ -431,13 +463,13 @@ function statusFromInventoryInteger(n) {
 }
 
 /* ----------------- Redis helpers ----------------- */
-async function getBundleStatus(productId) { return (await redis.get(`status:${productId}`)) || null; }
-async function setBundleStatus(productId, prevStatus, currStatus) {
+async function getBundleStatus(productId: number) { return (await redis.get(`status:${productId}`)) || null; }
+async function setBundleStatus(productId: number, prevStatus: string|null, currStatus: string) {
   await redis.set(`status:${productId}`, { previous: prevStatus, current: currStatus });
 }
 
 /** Read & merge subscribers saved under BOTH keys */
-async function getSubscribersForBundle(bundle) {
+async function getSubscribersForBundle(bundle: any) {
   const keys = [`subscribers:${bundle.id}`, `subscribers_handle:${bundle.handle}`];
   const lists = await Promise.all(keys.map(async (k) => {
     const v = await redis.get(k);
@@ -446,8 +478,8 @@ async function getSubscribersForBundle(bundle) {
     return [];
   }));
   const map = new Map();
-  const keyFor = (s) => toE164(s?.phone || '') || emailKey(s?.email);
-  const ts = (s) => Date.parse(s?.last_rearmed_at || s?.subscribed_at || 0);
+  const keyFor = (s: any) => toE164(s?.phone || '') || emailKey(s?.email);
+  const ts = (s: any) => Date.parse(s?.last_rearmed_at || s?.subscribed_at || 0);
   for (const list of lists) {
     for (const s of list) {
       const k = keyFor(s);
@@ -458,27 +490,28 @@ async function getSubscribersForBundle(bundle) {
   const merged = Array.from(map.values());
   return { merged, keysTried: keys };
 }
-async function setSubscribersForBundle(bundle, subs) {
+async function setSubscribersForBundle(bundle: any, subs: any[]) {
   await Promise.all([
     redis.set(`subscribers:${bundle.id}`, subs, { ex: 90 * 24 * 60 * 60 }),
     redis.set(`subscribers_handle:${bundle.handle}`, subs, { ex: 90 * 24 * 60 * 60 }),
   ]);
 }
 
-/* ----------------- Tag updates ----------------- */
-async function updateProductTags(productId, currentTags, status) {
-  const base = (Array.isArray(currentTags) ? currentTags : String(currentTags || '').split(','))
-    .map(t => t.trim())
+/* ----------------- Tag updates (fresh read) ----------------- */
+async function updateProductTags(productId: number, desiredStatus: 'ok'|'understocked'|'out-of-stock') {
+  // Always read current tags fresh to avoid staleness
+  const res = await fetchFromShopify(`products/${productId}.json?fields=id,tags`);
+  const currentTags = res?.product?.tags || '';
+
+  const base = String(currentTags || '')
+    .split(',')
+    .map((t: string) => t.trim())
     .filter(Boolean);
 
-  // Strip old status tags
   const withoutStatuses = base.filter(tag => !/^bundle-(ok|understocked|out-of-stock)$/i.test(tag));
-
-  // Keep other tags (including plain 'bundle')
   const keepers = new Set(withoutStatuses);
 
-  // Always add exactly one status tag
-  const safeStatus = ['ok','understocked','out-of-stock'].includes(status) ? status : 'ok';
+  const safeStatus = ['ok','understocked','out-of-stock'].includes(desiredStatus) ? desiredStatus : 'ok';
   keepers.add(`bundle-${safeStatus}`);
 
   const next = [...keepers];
@@ -486,7 +519,7 @@ async function updateProductTags(productId, currentTags, status) {
 }
 
 /* ----------------- main audit (paged + time budget) ----------------- */
-async function auditBundles({ pageSize = DEFAULT_PAGE_SIZE, sinceId = 0 } = {}) {
+async function auditBundles({ pageSize = DEFAULT_PAGE_SIZE, sinceId = 0 }:{ pageSize?: number, sinceId?: number } = {}) {
   assertEnvForTagging();
 
   console.log('🔍 Starting bundle audit (components-only tagging, multi-location inventory)…');
@@ -515,25 +548,19 @@ async function auditBundles({ pageSize = DEFAULT_PAGE_SIZE, sinceId = 0 } = {}) 
       console.log(`\n📦 ${bundlesProcessed}/${bundles.length} — ${bundle.title}`);
 
       /* 1) COMPONENTS status (bundle_structure) → drives tags */
-      let componentsStatus = 'ok';
-      const metas = await getProductMetafields(bundle.id);
-      apiCallsCount++;
-      const structure = metas.find(m => m.namespace === 'custom' && m.key === 'bundle_structure');
+      let componentsStatus: 'ok'|'understocked'|'out-of-stock' = 'understocked'; // safe default
+      const components = await getBundleComponents(bundle.id);
 
-      if (structure?.value) {
-        let components = [];
-        try { components = JSON.parse(structure.value); } catch { components = []; }
-
-        const under = [];
-        const out = [];
-        const unresolved = [];
+      if (Array.isArray(components) && components.length) {
+        const under: any[] = [];
+        const out: any[] = [];
+        const unresolved: any[] = [];
 
         for (const c of components) {
           const required = Math.max(1, Number(c.required_quantity || 1));
           const { qty, resolved, variantId, productId } = await getInventoryForComponent(c);
           apiCallsCount++;
 
-          // 🔎 trace
           const idLabel =
             c.variant_id ? `variant:${c.variant_id}` :
             c.sku        ? `sku:${c.sku}` :
@@ -549,6 +576,8 @@ async function auditBundles({ pageSize = DEFAULT_PAGE_SIZE, sinceId = 0 } = {}) 
         if (out.length) componentsStatus = 'out-of-stock';
         else if (under.length || unresolved.length) componentsStatus = 'understocked';
         else componentsStatus = 'ok';
+      } else {
+        console.warn(`No usable bundle structure for product ${bundle.id}; defaulting to understocked.`);
       }
 
       /* 2) SNAPSHOT diagnostics (does not affect tags) */
@@ -598,7 +627,7 @@ async function auditBundles({ pageSize = DEFAULT_PAGE_SIZE, sinceId = 0 } = {}) 
 
       // previous vs current (redis; fallback to tags)
       const prevObj = await getBundleStatus(bundle.id);
-      const prevStatus = prevObj?.current ?? extractStatusFromTags(bundle.tags);
+      const prevStatus = prevObj?.current ?? extractStatusFromTags((bundle.tags || ''));
       await setBundleStatus(bundle.id, prevStatus || null, finalStatusForTags);
 
       console.log(
@@ -607,7 +636,7 @@ async function auditBundles({ pageSize = DEFAULT_PAGE_SIZE, sinceId = 0 } = {}) 
 
       /* Waitlist (optional Klaviyo) */
       const { merged: uniqueSubs, keysTried } = await getSubscribersForBundle(bundle);
-      const pending = uniqueSubs.filter(s => !s?.notified);
+      const pending = uniqueSubs.filter((s: any) => !s?.notified);
       console.log(`🧾 Waitlist: keys=${JSON.stringify(keysTried)} total=${uniqueSubs.length} pending=${pending.length}`);
 
       const shouldNotify = haveKlaviyo && (finalStatusForTags === 'ok') && pending.length > 0;
@@ -647,7 +676,7 @@ async function auditBundles({ pageSize = DEFAULT_PAGE_SIZE, sinceId = 0 } = {}) 
                 },
               });
               if (out.ok) profileUpdates++;
-            } catch (e) {
+            } catch (e: any) {
               console.warn('⚠️ Profile props write failed (continuing):', e.message);
             }
 
@@ -670,7 +699,7 @@ async function auditBundles({ pageSize = DEFAULT_PAGE_SIZE, sinceId = 0 } = {}) 
             notificationsSent++;
             if (smsConsent) smsNotificationsSent++;
             if (++processed % 5 === 0) await new Promise(r => setTimeout(r, 250));
-          } catch (e) {
+          } catch (e: any) {
             notificationErrors++;
             console.error(`❌ Notify failed for ${sub?.email || '(unknown)'}:`, e.message);
           }
@@ -681,15 +710,15 @@ async function auditBundles({ pageSize = DEFAULT_PAGE_SIZE, sinceId = 0 } = {}) 
         console.log('ℹ️ No notifications: either FINAL != ok, no pending subs, or Klaviyo not configured.');
       }
 
-      /* Update tags — ALWAYS writes exactly one status tag */
-      await updateProductTags(bundle.id, bundle.tags.split(','), finalStatusForTags);
+      /* Update tags — ALWAYS writes exactly one status tag (fresh read) */
+      await updateProductTags(bundle.id, finalStatusForTags);
       apiCallsCount++;
 
       const elapsed = (Date.now() - started) / 1000;
       console.log(`⏱️ ${bundlesProcessed}/${bundles.length} processed so far · API calls ≈ ${apiCallsCount} · ${elapsed.toFixed(1)}s`);
-    } catch (err) {
+    } catch (err: any) {
       console.error(`❌ Error on bundle "${bundle.title}":`, err.message);
-      try { await updateProductTags(bundle.id, bundle.tags.split(','), 'understocked'); } catch {}
+      try { await updateProductTags(bundle.id, 'understocked'); } catch {}
     }
   }
 
@@ -719,7 +748,7 @@ async function auditBundles({ pageSize = DEFAULT_PAGE_SIZE, sinceId = 0 } = {}) 
 }
 
 /* ----------------- GET handler (paged; advances cursor) ----------------- */
-export async function GET(req) {
+export async function GET(req: Request) {
   const authed = await ensureCronAuth(req);
   if (!authed) return unauthorized();
 
@@ -750,7 +779,7 @@ export async function GET(req) {
         : 'Audit complete for all bundles.',
       ...results,
     });
-  } catch (error) {
+  } catch (error: any) {
     return NextResponse.json(
       { success: false, error: error.message, stack: process.env.NODE_ENV === 'development' ? error.stack : undefined },
       { status: 500 }
