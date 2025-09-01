@@ -11,20 +11,20 @@ const redis = new Redis({
   token: process.env.KV_REST_API_TOKEN,
 });
 
-const SHOPIFY_STORE         = process.env.SHOPIFY_STORE; // e.g. "armadillotough.myshopify.com"
+const SHOPIFY_STORE         = process.env.SHOPIFY_STORE; // e.g. "yourstore.myshopify.com"
 const ADMIN_API_TOKEN       = process.env.SHOPIFY_ADMIN_API_KEY;
 
 const KLAVIYO_API_KEY       = process.env.KLAVIYO_API_KEY || '';
 const ALERT_LIST_ID         = process.env.KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID || '';
 
-const PUBLIC_STORE_DOMAIN   = process.env.PUBLIC_STORE_DOMAIN || 'armadillotough.com';
+const PUBLIC_STORE_DOMAIN   = process.env.PUBLIC_STORE_DOMAIN || 'example.com';
 const CRON_SECRET           = process.env.CRON_SECRET || ''; // authorize Vercel Cron
 
 // Storefront for “Bundle with X in stock”
 const STOREFRONT_API_TOKEN   = process.env.SHOPIFY_STOREFRONT_API_TOKEN || '';
 const STOREFRONT_API_VERSION = process.env.SHOPIFY_STOREFRONT_API_VERSION || '2024-07';
 
-// Optional “low stock” threshold
+// Optional “low stock” threshold (still computed for diagnostics; tags ignore snapshot)
 const LOW_STOCK_THRESHOLD    = Number(process.env.BUNDLE_LOW_STOCK_THRESHOLD || 0);
 
 /** Only require what we need for tagging; Klaviyo is optional. */
@@ -334,7 +334,7 @@ async function getInventoryForComponent(c) {
   return await getInventoryLevel(vid);
 }
 
-/* --- Bundle own availability --- */
+/* --- Bundle own availability (for diagnostics only; tags ignore this) --- */
 async function getProductVariantsWithGids(productId) {
   const res = await fetchFromShopify(`products/${productId}.json?fields=id,variants`);
   const variants = res?.product?.variants || [];
@@ -374,7 +374,7 @@ async function getBundleOwnInventorySummary(productId) {
   return { total, anyNegative, variantsCount: variants.length, outOfStock: allZero, understocked: anyNegative || total < 0 };
 }
 
-/* --- Status from the snapshot integer --- */
+/* --- Status from the snapshot integer (diagnostics only) --- */
 function statusFromInventoryInteger(n) {
   if (!Number.isFinite(n)) return 'ok';
   if (n < 0) return 'understocked';
@@ -427,7 +427,7 @@ async function updateProductTags(productId, currentTags, status) {
   // Strip old status tags
   const withoutStatuses = base.filter(tag => !/^bundle-(ok|understocked|out-of-stock)$/i.test(tag));
 
-  // Ensure we keep any existing "bundle" tag (not required, but harmless)
+  // Keep other tags (including plain 'bundle')
   const keepers = new Set(withoutStatuses);
 
   // Always add exactly one status tag
@@ -442,7 +442,7 @@ async function updateProductTags(productId, currentTags, status) {
 async function auditBundles() {
   assertEnvForTagging();
 
-  console.log('🔍 Starting bundle audit (snapshot integer + components)…');
+  console.log('🔍 Starting bundle audit (components-only tagging)…');
   const start = Date.now();
 
   const bundles = await getProductsTaggedBundle();
@@ -460,7 +460,7 @@ async function auditBundles() {
       bundlesProcessed++;
       console.log(`\n📦 ${bundlesProcessed}/${bundles.length} — ${bundle.title}`);
 
-      /* 1) COMPONENTS status (bundle_structure) */
+      /* 1) COMPONENTS status (bundle_structure) → drives tags */
       let componentsStatus = 'ok';
       const metas = await getProductMetafields(bundle.id);
       apiCallsCount++;
@@ -480,24 +480,25 @@ async function auditBundles() {
           apiCallsCount++;
 
           if (qty == null) { unresolved.push(c); continue; }
-          if (qty === 0) out.push(c);
-          else if (qty < required) under.push(c);
+          if (qty <= 0) out.push(c);                // <= 0 ⇒ out-of-stock
+          else if (qty < required) under.push(c);   // 0 < qty < required ⇒ understocked
         }
 
         if (out.length) componentsStatus = 'out-of-stock';
         else if (under.length || unresolved.length) componentsStatus = 'understocked';
+        else componentsStatus = 'ok';
       }
 
-      /* 2) SNAPSHOT inventory integer */
+      /* 2) SNAPSHOT inventory (diagnostics only; does not affect tags) */
       const sf = await getBundleStorefrontAvailability(bundle.id);
       apiCallsCount++;
       const own = await getBundleOwnInventorySummary(bundle.id);
       apiCallsCount++;
 
       let snapshot = Number.isFinite(sf.minAvailable) ? sf.minAvailable : own.total;
-      if (own.total < snapshot) snapshot = own.total; // capture negatives from REST
+      if (own.total < snapshot) snapshot = own.total; // capture negatives from REST totals
 
-      // write snapshot + helper status metafields
+      // write snapshot + helper status metafields (for debugging/observability)
       await upsertProductMetafield(bundle.id, {
         namespace: 'custom',
         key: 'bundle_inventory_snapshot',
@@ -505,27 +506,42 @@ async function auditBundles() {
         value: String(snapshot || 0),
       });
       const invStatus = statusFromInventoryInteger(snapshot);
-      const finalStatus = worstStatus(invStatus, componentsStatus);
+
+      await upsertProductMetafield(bundle.id, {
+        namespace: 'custom',
+        key: 'bundle_status_components',
+        type: 'single_line_text_field',
+        value: componentsStatus,
+      });
+      await upsertProductMetafield(bundle.id, {
+        namespace: 'custom',
+        key: 'bundle_status_snapshot',
+        type: 'single_line_text_field',
+        value: invStatus,
+      });
+
+      // Final status FOR TAGS = components only
+      const finalStatusForTags = componentsStatus;
       await upsertProductMetafield(bundle.id, {
         namespace: 'custom',
         key: 'bundle_status_final',
         type: 'single_line_text_field',
-        value: finalStatus,
+        value: finalStatusForTags,
       });
       await upsertProductMetafield(bundle.id, {
         namespace: 'custom',
         key: 'bundle_status_source',
         type: 'single_line_text_field',
-        value: 'snapshot+components',
+        value: 'components-only',
       });
 
       // previous vs current (redis; fallback to tags)
       const prevObj = await getBundleStatus(bundle.id);
       const prevStatus = prevObj?.current ?? extractStatusFromTags(bundle.tags);
-      await setBundleStatus(bundle.id, prevStatus || null, finalStatus);
+      await setBundleStatus(bundle.id, prevStatus || null, finalStatusForTags);
 
       console.log(
-        `📊 ${bundle.title} ⇒ components=${componentsStatus} | snapshot=${snapshot} → inv=${invStatus} ⇒ FINAL=${finalStatus}`
+        `📊 ${bundle.title} ⇒ components=${componentsStatus} | snapshot=${snapshot} (${invStatus}) ⇒ FINAL_TAG=${finalStatusForTags}`
       );
 
       /* Waitlist read */
@@ -533,8 +549,8 @@ async function auditBundles() {
       const pending = uniqueSubs.filter(s => !s?.notified);
       console.log(`🧾 Waitlist: keys=${JSON.stringify(keysTried)} total=${uniqueSubs.length} pending=${pending.length}`);
 
-      /* Notify when FINAL == ok and there are pending subscribers (only if Klaviyo is configured) */
-      const shouldNotify = haveKlaviyo && (finalStatus === 'ok') && pending.length > 0;
+      /* Notify when FINAL (tags) == ok and there are pending subscribers (only if Klaviyo is configured) */
+      const shouldNotify = haveKlaviyo && (finalStatusForTags === 'ok') && pending.length > 0;
 
       if (shouldNotify) {
         const productUrl = productUrlFrom(bundle.handle);
@@ -606,7 +622,7 @@ async function auditBundles() {
       }
 
       /* Update tags — ALWAYS writes exactly one status tag */
-      await updateProductTags(bundle.id, bundle.tags.split(','), finalStatus);
+      await updateProductTags(bundle.id, bundle.tags.split(','), finalStatusForTags);
       apiCallsCount++;
 
       const elapsed = (Date.now() - start) / 1000;
@@ -657,7 +673,7 @@ export async function GET(req) {
     const results = await auditBundles();
     return NextResponse.json({
       success: true,
-      message: 'Audit complete: snapshot metafield saved, tags updated, and waitlist notifications sent when FINAL=ok.',
+      message: 'Audit complete: components-only status tagged; snapshot stored for diagnostics.',
       ...results,
     });
   } catch (error) {
