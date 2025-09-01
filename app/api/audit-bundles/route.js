@@ -20,14 +20,14 @@ const ALERT_LIST_ID         = process.env.KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID ||
 const PUBLIC_STORE_DOMAIN   = process.env.PUBLIC_STORE_DOMAIN || 'example.com';
 const CRON_SECRET           = process.env.CRON_SECRET || ''; // authorize Vercel Cron
 
-// Storefront for “Bundle with X in stock”
+// Storefront for snapshot diagnostics
 const STOREFRONT_API_TOKEN   = process.env.SHOPIFY_STOREFRONT_API_TOKEN || '';
 const STOREFRONT_API_VERSION = process.env.SHOPIFY_STOREFRONT_API_VERSION || '2024-07';
 
-// Optional “low stock” threshold (still computed for diagnostics; tags ignore snapshot)
+// Optional “low stock” threshold (diagnostics only)
 const LOW_STOCK_THRESHOLD    = Number(process.env.BUNDLE_LOW_STOCK_THRESHOLD || 0);
 
-/** Only require what we need for tagging; Klaviyo is optional. */
+/** Only require what we need for tagging; Klaviyo optional */
 function assertEnvForTagging() {
   const missing = [];
   if (!SHOPIFY_STORE)   missing.push('SHOPIFY_STORE');
@@ -272,10 +272,30 @@ async function getVariant(id) {
   const res = await fetchFromShopify(`variants/${id}.json`);
   return res.variant;
 }
+
+/** Multi-location safe: sum InventoryLevels.available for the variant’s inventory_item_id.
+ *  If inventory isn’t tracked (inventory_management != 'shopify'), we conservatively treat as 0. */
 async function getInventoryLevel(variantId) {
   if (!variantId) return 0;
+
   const v = await getVariant(variantId);
-  return Number(v?.inventory_quantity ?? 0);
+  if (!v) return 0;
+
+  if (!v.inventory_management || v.inventory_management.toLowerCase() !== 'shopify') {
+    return 0; // treat untracked as 0; change to Infinity if you want “untracked = unlimited”
+  }
+
+  const inventoryItemId = v.inventory_item_id;
+  if (!inventoryItemId) {
+    return Number(v.inventory_quantity ?? 0);
+  }
+
+  const levelsRes = await fetchFromShopify(`inventory_levels.json?inventory_item_ids=${inventoryItemId}&limit=250`);
+  const levels = Array.isArray(levelsRes?.inventory_levels) ? levelsRes.inventory_levels : [];
+  const total = levels.reduce((acc, lvl) => acc + Number(lvl.available ?? 0), 0);
+
+  if (!Number.isFinite(total)) return Number(v.inventory_quantity ?? 0);
+  return total;
 }
 
 /* Cache to avoid redundant product pulls */
@@ -293,8 +313,7 @@ async function getProductWithVariants(productId) {
 /** Resolve a variant id from component descriptor:
  *  - { variant_id }
  *  - { product_id }       // if single-variant product
- *  - { sku } or { variant_sku }
- */
+ *  - { sku } or { variant_sku } */
 async function resolveVariantIdFromComponent(c) {
   if (!c || typeof c !== 'object') return null;
 
@@ -304,7 +323,6 @@ async function resolveVariantIdFromComponent(c) {
     const prod = await getProductWithVariants(c.product_id);
     const vars = Array.isArray(prod.variants) ? prod.variants : [];
     if (vars.length === 1) return vars[0].id;
-    // Multi-variant but no selector provided → unresolved
     console.warn(`Component product ${c.product_id} is multi-variant with no variant_id/sku`);
     return null;
   }
@@ -313,7 +331,6 @@ async function resolveVariantIdFromComponent(c) {
   if (sku) {
     const key = sku.toLowerCase();
     if (variantBySkuCache.has(key)) return variantBySkuCache.get(key);
-    // Try any cached product first
     for (const p of productCache.values()) {
       const match = (p.variants || []).find(v => String(v.sku || '').toLowerCase() === key);
       if (match) {
@@ -330,11 +347,26 @@ async function resolveVariantIdFromComponent(c) {
 
 async function getInventoryForComponent(c) {
   const vid = await resolveVariantIdFromComponent(c);
-  if (!vid) return null; // unresolved
-  return await getInventoryLevel(vid);
+  if (vid) {
+    const qty = await getInventoryLevel(vid);
+    return { qty, resolved: 'variant', variantId: vid };
+  }
+
+  // Fallback: product-level aggregate if product_id provided but no single variant chosen
+  if (c?.product_id) {
+    const prod = await getProductWithVariants(c.product_id);
+    let sum = 0;
+    // serial to respect rate limiting
+    for (const v of (prod.variants || [])) {
+      sum += await getInventoryLevel(v.id);
+    }
+    return { qty: sum, resolved: 'product', productId: c.product_id };
+  }
+
+  return { qty: null, resolved: 'unresolved' };
 }
 
-/* --- Bundle own availability (for diagnostics only; tags ignore this) --- */
+/* --- Bundle own availability (diagnostics only; tags ignore this) --- */
 async function getProductVariantsWithGids(productId) {
   const res = await fetchFromShopify(`products/${productId}.json?fields=id,variants`);
   const variants = res?.product?.variants || [];
@@ -442,7 +474,7 @@ async function updateProductTags(productId, currentTags, status) {
 async function auditBundles() {
   assertEnvForTagging();
 
-  console.log('🔍 Starting bundle audit (components-only tagging)…');
+  console.log('🔍 Starting bundle audit (components-only tagging, multi-location inventory)…');
   const start = Date.now();
 
   const bundles = await getProductsTaggedBundle();
@@ -476,12 +508,20 @@ async function auditBundles() {
 
         for (const c of components) {
           const required = Math.max(1, Number(c.required_quantity || 1));
-          const qty = await getInventoryForComponent(c);
+          const { qty, resolved, variantId, productId } = await getInventoryForComponent(c);
           apiCallsCount++;
 
+          // 🔎 trace
+          const idLabel =
+            c.variant_id ? `variant:${c.variant_id}` :
+            c.sku        ? `sku:${c.sku}` :
+            c.product_id ? `product:${c.product_id}` :
+                           'unknown';
+          console.log(`component ${idLabel} → required=${required} qty=${qty === null ? 'unresolved' : qty} resolved=${resolved}${variantId ? ` v=${variantId}` : ''}${productId ? ` p=${productId}` : ''}`);
+
           if (qty == null) { unresolved.push(c); continue; }
-          if (qty <= 0) out.push(c);                // <= 0 ⇒ out-of-stock
-          else if (qty < required) under.push(c);   // 0 < qty < required ⇒ understocked
+          if (qty <= 0) out.push(c);                // ≤ 0 → out-of-stock
+          else if (qty < required) under.push(c);   // 0 < qty < required → understocked
         }
 
         if (out.length) componentsStatus = 'out-of-stock';
@@ -498,7 +538,6 @@ async function auditBundles() {
       let snapshot = Number.isFinite(sf.minAvailable) ? sf.minAvailable : own.total;
       if (own.total < snapshot) snapshot = own.total; // capture negatives from REST totals
 
-      // write snapshot + helper status metafields (for debugging/observability)
       await upsertProductMetafield(bundle.id, {
         namespace: 'custom',
         key: 'bundle_inventory_snapshot',
