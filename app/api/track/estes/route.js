@@ -3,7 +3,7 @@ import { NextResponse } from 'next/server';
 const ENDPOINT = 'https://www.estes-express.com/shipmenttracking/services/ShipmentTrackingService';
 
 function withCORS(res) {
-  res.headers.set('Access-Control-Allow-Origin', process.env.CORS_ALLOW || '*'); // permissive until you set it
+  res.headers.set('Access-Control-Allow-Origin', process.env.CORS_ALLOW || '*'); // permissive until you set it must
   res.headers.set('Access-Control-Allow-Headers', 'Content-Type');
   res.headers.set('Access-Control-Allow-Methods', 'GET,OPTIONS');
   return res;
@@ -94,3 +94,4 @@ export async function GET(req) {
     return withCORS(NextResponse.json({ error: 'Server exception', details: String(e) }, { status: 500 }));
   }
 }
+
