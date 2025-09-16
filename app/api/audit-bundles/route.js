@@ -7,7 +7,7 @@ import { NextResponse, after } from 'next/server';
 import { Redis } from '@upstash/redis';
 import { randomUUID } from 'crypto';
 
-/* ----------------- Lazy env + clients ----------------- */
+/* ----------------- Env ----------------- */
 const ENV = {
   SHOPIFY_STORE:       process.env.SHOPIFY_STORE,                  // mystore.myshopify.com
   ADMIN_API_TOKEN:     process.env.SHOPIFY_ADMIN_API_KEY,
@@ -15,79 +15,103 @@ const ENV = {
   ALERT_LIST_ID:       process.env.KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID,
   PUBLIC_STORE_DOMAIN: process.env.PUBLIC_STORE_DOMAIN || 'example.com',
   CRON_SECRET:         process.env.CRON_SECRET || '',
+  // Upstash (accept a few possible names)
   KV_URL:              process.env.KV_REST_API_URL || process.env.KV_URL || process.env.REDIS_URL || '',
   KV_TOKEN:            process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN || '',
-  SHOPIFY_REST_VER:    process.env.SHOPIFY_API_VERSION || '2025-01',
-  SHOPIFY_GQL_VER:     process.env.SHOPIFY_API_VERSION || '2025-01',
+  // Soft disable switch
+  SOFT_DISABLE_REDIS:  (process.env.SOFT_DISABLE_REDIS || '') === '1',
+  // Shopify versions / pacing
+  SHOPIFY_API_VERSION: process.env.SHOPIFY_API_VERSION || '2025-01',
   SHOPIFY_THROTTLE_MS: Number(process.env.SHOPIFY_THROTTLE_MS || 500),
   TIME_BUDGET_MS:      Number(process.env.TIME_BUDGET_MS || 240000),
 };
 
-let _redis = null;
-function getRedis() {
-  if (!_redis) {
-    if (!ENV.KV_URL || !ENV.KV_TOKEN) {
-      throw new Error('Redis misconfigured: KV_REST_API_URL/KV_URL and KV_REST_API_TOKEN are required');
-    }
-    _redis = new Redis({ url: ENV.KV_URL, token: ENV.KV_TOKEN });
-  }
-  return _redis;
-}
-
-function assertEnv() {
-  const missing = [];
-  if (!ENV.SHOPIFY_STORE)   missing.push('SHOPIFY_STORE');
-  if (!ENV.ADMIN_API_TOKEN) missing.push('SHOPIFY_ADMIN_API_KEY');
-  if (!ENV.KLAVIYO_API_KEY) missing.push('KLAVIYO_API_KEY');
-  if (!ENV.ALERT_LIST_ID)   missing.push('KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID');
-  if (!ENV.KV_URL)          missing.push('KV_REST_API_URL (or KV_URL/REDIS_URL)');
-  if (!ENV.KV_TOKEN)        missing.push('KV_REST_API_TOKEN');
-  if (missing.length) throw new Error(`Missing env: ${missing.join(', ')}`);
-}
-
-/* ----------------- Auth & locking ----------------- */
-const LOCK_KEY = 'locks:audit-bundles';
+const LOCK_KEY   = 'locks:audit-bundles';
 const CURSOR_KEY = 'audit:cursor';
 const LOCK_TTL_SECONDS = 15 * 60;
 
+const RANK = { ok: 0, understocked: 1, 'out-of-stock': 2 };
+const worstStatus = (a = 'ok', b = 'ok') => (RANK[a] >= RANK[b]) ? a : b;
+
+/* ----------------- Soft-robust Redis wrapper ----------------- */
+let _redis = null;
+let redisDisabled = ENV.SOFT_DISABLE_REDIS; // start disabled if env says so
+
+function isUpstashLimitError(e) {
+  const msg = (e?.message || e || '').toString().toLowerCase();
+  return msg.includes('max requests limit exceeded') || msg.includes('429');
+}
+function requireRedisEnv() {
+  if (!ENV.KV_URL || !ENV.KV_TOKEN) throw new Error('Redis misconfigured: KV_REST_API_URL/KV_URL and KV_REST_API_TOKEN are required');
+}
+function getRedis() {
+  if (redisDisabled) throw new Error('redis_disabled');
+  requireRedisEnv();
+  if (!_redis) _redis = new Redis({ url: ENV.KV_URL, token: ENV.KV_TOKEN });
+  return _redis;
+}
+async function RGET(key, def = null) {
+  if (redisDisabled) return def;
+  try { return await getRedis().get(key); }
+  catch (e) { if (isUpstashLimitError(e)) redisDisabled = true; return def; }
+}
+async function RSET(key, val, opts) {
+  if (redisDisabled) return null;
+  try { return await getRedis().set(key, val, opts); }
+  catch (e) { if (isUpstashLimitError(e)) redisDisabled = true; return null; }
+}
+async function RDEL(key) {
+  if (redisDisabled) return null;
+  try { return await getRedis().del(key); }
+  catch (e) { if (isUpstashLimitError(e)) redisDisabled = true; return null; }
+}
+async function REXPIRE(key, secs) {
+  if (redisDisabled) return null;
+  try { return await getRedis().expire(key, secs); }
+  catch (e) { if (isUpstashLimitError(e)) redisDisabled = true; return null; }
+}
+async function RTTL(key) {
+  if (redisDisabled) return -2;
+  try { return await getRedis().ttl(key); }
+  catch (e) { if (isUpstashLimitError(e)) redisDisabled = true; return -2; }
+}
+
+/* ----------------- Auth helpers ----------------- */
 function unauthorized() {
   return NextResponse.json({ success: false, error: 'unauthorized' }, { status: 401 });
 }
 async function ensureCronAuth(req) {
-  if (req.headers.get('x-vercel-cron')) return true; // Vercel cron
-  if (!ENV.CRON_SECRET) return true;                 // open if no secret
+  if (req.headers.get('x-vercel-cron')) return true;
+  if (!ENV.CRON_SECRET) return true;
   const auth = req.headers.get('authorization') || '';
   if (auth === `Bearer ${ENV.CRON_SECRET}`) return true;
   const url = new URL(req.url);
   if (url.searchParams.get('token') === ENV.CRON_SECRET) return true;
   return false;
 }
+
+/* ----------------- Lock (no-op if redis disabled) ----------------- */
 async function acquireOrValidateLock(runId) {
-  const redis = getRedis();
-  const holder = await redis.get(LOCK_KEY);
+  if (redisDisabled) return true; // allow single slice without Redis
+  const holder = await RGET(LOCK_KEY);
   if (!holder) {
-    const res = await redis.set(LOCK_KEY, runId, { nx: true, ex: LOCK_TTL_SECONDS });
+    const res = await RSET(LOCK_KEY, runId, { nx: true, ex: LOCK_TTL_SECONDS });
     return !!res;
   }
   if (holder === runId) {
-    await redis.expire(LOCK_KEY, LOCK_TTL_SECONDS);
+    await REXPIRE(LOCK_KEY, LOCK_TTL_SECONDS);
     return true;
   }
   return false;
 }
 async function releaseLock(runId) {
-  try {
-    const redis = getRedis();
-    const holder = await redis.get(LOCK_KEY);
-    if (holder === runId) await redis.del(LOCK_KEY);
-  } catch {}
+  if (redisDisabled) return;
+  const holder = await RGET(LOCK_KEY);
+  if (holder === runId) await RDEL(LOCK_KEY);
 }
 
 /* ----------------- Small utils ----------------- */
 const productUrlFrom = (handle) => (handle ? `https://${ENV.PUBLIC_STORE_DOMAIN}/products/${handle}` : '');
-const RANK = { ok: 0, understocked: 1, 'out-of-stock': 2 };
-const worstStatus = (a = 'ok', b = 'ok') => (RANK[a] >= RANK[b]) ? a : b;
-
 function hasBundleTag(tagsStr) {
   return String(tagsStr || '')
     .split(',')
@@ -111,7 +135,7 @@ function toE164(raw) {
   return null;
 }
 
-/* ----------------- Klaviyo (unchanged helpers) ----------------- */
+/* ----------------- Klaviyo (same as before) ----------------- */
 async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
   if (!ENV.KLAVIYO_API_KEY) throw new Error('KLAVIYO_API_KEY missing');
   if (!listId) throw new Error('listId missing');
@@ -206,14 +230,10 @@ let lastApiCall = 0;
 async function rateLimitedDelay() {
   const now = Date.now();
   const dt = now - lastApiCall;
-  const min = ENV.SHOPIFY_THROTTLE_MS;
-  if (dt < min) await new Promise(r => setTimeout(r, min - dt));
+  if (dt < ENV.SHOPIFY_THROTTLE_MS) await new Promise(r => setTimeout(r, ENV.SHOPIFY_THROTTLE_MS - dt));
   lastApiCall = Date.now();
 }
 async function fetchShopifyREST(endpointOrUrl, method = 'GET', body = null, raw = false) {
-  if (!endpointOrUrl || typeof endpointOrUrl !== 'string') {
-    throw new Error(`fetchShopifyREST invalid endpoint: "${endpointOrUrl}"`);
-  }
   await rateLimitedDelay();
   const headers = {
     'X-Shopify-Access-Token': String(ENV.ADMIN_API_TOKEN),
@@ -222,7 +242,7 @@ async function fetchShopifyREST(endpointOrUrl, method = 'GET', body = null, raw 
   const opts = { method, headers, ...(body ? { body: JSON.stringify(body) } : {}) };
   const url = endpointOrUrl.startsWith('http')
     ? endpointOrUrl
-    : `https://${ENV.SHOPIFY_STORE}/admin/api/${ENV.SHOPIFY_REST_VER}/${endpointOrUrl.replace(/^\//, '')}`;
+    : `https://${ENV.SHOPIFY_STORE}/admin/api/${ENV.SHOPIFY_API_VERSION}/${endpointOrUrl.replace(/^\//, '')}`;
   const res = await fetch(url, opts);
   if (!res.ok) {
     if (res.status === 429) {
@@ -242,7 +262,7 @@ async function fetchShopifyREST(endpointOrUrl, method = 'GET', body = null, raw 
 }
 async function fetchShopifyGQL(query, variables = {}) {
   await rateLimitedDelay();
-  const url = `https://${ENV.SHOPIFY_STORE}/admin/api/${ENV.SHOPIFY_GQL_VER}/graphql.json`;
+  const url = `https://${ENV.SHOPIFY_STORE}/admin/api/${ENV.SHOPIFY_API_VERSION}/graphql.json`;
   const res = await fetch(url, {
     method: 'POST',
     headers: {
@@ -257,9 +277,6 @@ async function fetchShopifyGQL(query, variables = {}) {
   }
   return json.data;
 }
-const toGid = (type, id) => `gid://shopify/${type}/${id}`;
-
-// REST pagination helpers
 function extractNextUrlFromLinkHeader(linkHeader) {
   if (!linkHeader) return '';
   const parts = linkHeader.split(',');
@@ -292,34 +309,29 @@ async function updateProductTags(productId, currentTagsCSV, status) {
   });
 }
 
-/* ----------------- Redis helpers ----------------- */
+/* ----------------- Redis-backed helpers (all softened) ----------------- */
 async function getStatus(productId) {
-  const redis = getRedis();
-  return (await redis.get(`status:${productId}`)) || null;
+  return (await RGET(`status:${productId}`)) || null;
 }
 async function setStatus(productId, prevStatus, currStatus) {
-  const redis = getRedis();
-  await redis.set(`status:${productId}`, { previous: prevStatus, current: currStatus });
+  await RSET(`status:${productId}`, { previous: prevStatus, current: currStatus });
 }
 async function getPrevTotal(productId) {
-  const redis = getRedis();
-  const v = await redis.get(`inv_total:${productId}`);
+  const v = await RGET(`inv_total:${productId}`);
   if (v == null) return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 }
 async function setCurrTotal(productId, total) {
-  const redis = getRedis();
-  await redis.set(`inv_total:${productId}`, total);
+  await RSET(`inv_total:${productId}`, total);
 }
 
-/* ----------------- Waitlist subscribers ----------------- */
+/* Waitlist subscribers (no-op if redis disabled) */
 const emailKey = (e) => `email:${String(e || '').toLowerCase()}`;
 async function getSubscribersForProduct(prod) {
-  const redis = getRedis();
   const keys = [`subscribers:${prod.id}`, `subscribers_handle:${prod.handle || ''}`];
   const lists = await Promise.all(keys.map(async (k) => {
-    const v = await redis.get(k);
+    const v = await RGET(k);
     if (Array.isArray(v)) return v;
     if (typeof v === 'string') { try { return JSON.parse(v); } catch { return []; } }
     return [];
@@ -338,16 +350,14 @@ async function getSubscribersForProduct(prod) {
   return { merged: Array.from(map.values()), keysTried: keys };
 }
 async function setSubscribersForProduct(prod, subs) {
-  const redis = getRedis();
   await Promise.all([
-    redis.set(`subscribers:${prod.id}`, subs, { ex: 90 * 24 * 60 * 60 }),
-    redis.set(`subscribers_handle:${prod.handle || ''}`, subs, { ex: 90 * 24 * 60 * 60 }),
+    RSET(`subscribers:${prod.id}`, subs, { ex: 90 * 24 * 60 * 60 }),
+    RSET(`subscribers_handle:${prod.handle || ''}`, subs, { ex: 90 * 24 * 60 * 60 }),
   ]);
 }
 
-/* ----------------- Native bundle status via GraphQL ----------------- */
+/* ----------------- Native bundle status (GraphQL) ----------------- */
 async function getBundleStatusFromGraphQL(productId) {
-  const gid = toGid('Product', productId);
   const query = `
     query ProductBundles($id: ID!, $vv: Int!, $cp: Int!) {
       product(id: $id) {
@@ -373,6 +383,7 @@ async function getBundleStatusFromGraphQL(productId) {
       }
     }
   `;
+  const gid = `gid://shopify/Product/${productId}`;
   const data = await fetchShopifyGQL(query, { id: gid, vv: 100, cp: 50 });
   const edges = data?.product?.variants?.edges || [];
   const variantResults = [];
@@ -401,8 +412,9 @@ async function getBundleStatusFromGraphQL(productId) {
   return { ok: true, variantResults, totalBuildable, finalStatus };
 }
 
-/* ----------------- Notify helpers ----------------- */
-async function notifyPending({ allSubs, pending, keysTried, pid, title, handle, isBundle }) {
+/* ----------------- Notify (skips when redis disabled) ----------------- */
+async function notifyPending({ allSubs, pending, pid, title, handle, isBundle }) {
+  if (redisDisabled) return { notificationsSent: 0, smsNotificationsSent: 0, notificationErrors: 0, profileUpdates: 0 };
   let notificationsSent = 0, smsNotificationsSent = 0, notificationErrors = 0, profileUpdates = 0;
   const productUrl = productUrlFrom(handle);
   let processedSubs = 0;
@@ -449,42 +461,44 @@ async function notifyPending({ allSubs, pending, keysTried, pid, title, handle, 
       if (++processedSubs % 5 === 0) await new Promise(r => setTimeout(r, 250));
     } catch (e) {
       notificationErrors++;
-      console.error(`Notify failed for ${sub?.email || '(unknown)'}:`, e?.message || e);
     }
   }
   await setSubscribersForProduct({ id: pid, handle }, allSubs);
   return { notificationsSent, smsNotificationsSent, notificationErrors, profileUpdates };
 }
 
-/* ----------------- Cursor helpers ----------------- */
+/* ----------------- Cursor (no-op if redis disabled) ----------------- */
 async function loadCursor(runId) {
-  const redis = getRedis();
-  const cur = await redis.get(CURSOR_KEY);
+  if (redisDisabled) return { runId, pageUrl: '', nextIndex: 0, startedAt: new Date().toISOString() };
+  const cur = await RGET(CURSOR_KEY);
   if (cur && cur.runId === runId) return cur;
   return { runId, pageUrl: '', nextIndex: 0, startedAt: new Date().toISOString() };
 }
 async function saveCursor(cursor) {
-  const redis = getRedis();
-  await redis.set(CURSOR_KEY, cursor, { ex: 60 * 60 });
+  if (redisDisabled) return;
+  await RSET(CURSOR_KEY, cursor, { ex: 60 * 60 });
 }
 async function clearCursor() {
-  try { const redis = getRedis(); await redis.del(CURSOR_KEY); } catch {}
+  if (redisDisabled) return;
+  await RDEL(CURSOR_KEY);
 }
 
-/* ----------------- Slice ----------------- */
+/* ----------------- Time-bounded catalog slice ----------------- */
 async function runCatalogSlice({ runId, verbose = false }) {
-  assertEnv();
+  // Only the Shopify pieces are strictly required
+  if (!ENV.SHOPIFY_STORE) throw new Error('Missing env: SHOPIFY_STORE');
+  if (!ENV.ADMIN_API_TOKEN) throw new Error('Missing env: SHOPIFY_ADMIN_API_KEY');
+
   const t0 = Date.now();
   let processed = 0, tagsUpdated = 0, notificationsSent = 0, smsNotificationsSent = 0, notificationErrors = 0, profileUpdates = 0;
 
   let cursor = await loadCursor(runId);
-  if (verbose) console.log(`Slice start runId=${runId} pageUrl=${cursor.pageUrl || '(first)'} idx=${cursor.nextIndex}`);
+  if (verbose) console.log(`Slice start runId=${runId} pageUrl=${cursor.pageUrl || '(first)'} idx=${cursor.nextIndex}, redisDisabled=${redisDisabled}`);
 
   let page = { products: [], nextUrl: '' };
   let products = [];
   let i = cursor.nextIndex || 0;
 
-  // fetch current page
   {
     const pageRes = await fetchProductsPage(cursor.pageUrl);
     products = pageRes.products;
@@ -510,22 +524,21 @@ async function runCatalogSlice({ runId, verbose = false }) {
       const title = product.title;
       const handle = product.handle;
       const tagsCSV = String(product.tags || '');
-      const looksLikeBundle = hasBundleTag(tagsCSV);
+      const isBundle = hasBundleTag(tagsCSV);
 
-      // track buildable / total for notify logic
-      const restTotal = (product.variants || []).reduce((acc, v) => acc + Number(v?.inventory_quantity ?? 0), 0);
-      const prevTotal = await getPrevTotal(pid);
+      // For non-bundles we don’t need Redis: we’re not notifying here.
+      if (isBundle) {
+        const restTotal = (product.variants || []).reduce((acc, v) => acc + Number(v?.inventory_quantity ?? 0), 0);
+        const prevTotal = await getPrevTotal(pid);
 
-      let finalStatus = null;
-      let totalBuildable = 0;
+        let finalStatus = null;
+        let totalBuildable = 0;
 
-      if (looksLikeBundle) {
         const summary = await getBundleStatusFromGraphQL(pid);
         if (summary.ok) {
           finalStatus = summary.finalStatus;            // 'ok' | 'understocked' | 'out-of-stock'
           totalBuildable = Number(summary.totalBuildable || 0);
         } else {
-          // Fallback if no native components returned
           finalStatus =
             (product.variants || []).length > 0 &&
             (product.variants || []).every(v => Number(v?.inventory_quantity ?? 0) === 0)
@@ -533,9 +546,7 @@ async function runCatalogSlice({ runId, verbose = false }) {
               : 'ok';
           totalBuildable = restTotal;
         }
-      }
 
-      if (finalStatus) {
         const increased = prevTotal == null ? false : totalBuildable > prevTotal;
         await setCurrTotal(pid, totalBuildable);
 
@@ -546,24 +557,22 @@ async function runCatalogSlice({ runId, verbose = false }) {
         await updateProductTags(pid, tagsCSV, finalStatus);
         tagsUpdated++;
 
-        if (verbose) {
-          console.log(`📊 ${title} — final=${finalStatus}; buildable=${totalBuildable} (prev=${prevTotal ?? 'n/a'}, Δ+? ${increased})`);
-        }
+        if (verbose) console.log(`📊 ${title} — status=${finalStatus}; buildable=${totalBuildable} (prev=${prevTotal ?? 'n/a'}) redisDisabled=${redisDisabled}`);
 
-        const { merged: allSubs, keysTried } = await getSubscribersForProduct({ id: pid, handle });
-        const pending = allSubs.filter(s => !s?.notified);
-        const prevWasOk = (prevObj?.previous ?? extractStatusFromTags(tagsCSV)) === 'ok';
-        const shouldNotify = (finalStatus === 'ok') && pending.length > 0 && (!prevWasOk || increased);
-
-        if (shouldNotify) {
-          const counts = await notifyPending({ allSubs, pending, keysTried, pid, title, handle, isBundle: true });
-          notificationsSent    += counts.notificationsSent;
-          smsNotificationsSent += counts.smsNotificationsSent;
-          notificationErrors   += counts.notificationErrors;
-          profileUpdates       += counts.profileUpdates;
+        // Notifications are skipped if redisDisabled (there’s nowhere to read/write subs)
+        if (!redisDisabled) {
+          const { merged: allSubs } = await getSubscribersForProduct({ id: pid, handle });
+          const pending = allSubs.filter(s => !s?.notified);
+          const prevWasOk = (prevObj?.previous ?? extractStatusFromTags(tagsCSV)) === 'ok';
+          const shouldNotify = (finalStatus === 'ok') && pending.length > 0 && (!prevWasOk || increased);
+          if (shouldNotify) {
+            const counts = await notifyPending({ allSubs, pending, pid, title, handle, isBundle: true });
+            notificationsSent    += counts.notificationsSent;
+            smsNotificationsSent += counts.smsNotificationsSent;
+            notificationErrors   += counts.notificationErrors;
+            profileUpdates       += counts.profileUpdates;
+          }
         }
-      } else {
-        await setCurrTotal(pid, restTotal);
       }
 
       processed++;
@@ -592,15 +601,18 @@ async function runCatalogSlice({ runId, verbose = false }) {
     profileUpdates,
     nextCursor: { ...nextCursor, runId },
     sliceMs: Date.now() - t0,
+    redisDisabled,
   };
 }
 
 /* ----------------- GET handler ----------------- */
 export async function GET(req) {
   try {
-    // quick self-test path (helps avoid blank 500s)
     const url = new URL(req.url);
-    if ((url.searchParams.get('action') || '').toLowerCase() === 'selftest') {
+    const q = (k) => (url.searchParams.get(k) || '').toLowerCase();
+
+    // Self-test: don’t throw; show env + redis state
+    if (q('action') === 'selftest') {
       const out = {
         env_ok: true,
         has_store: !!ENV.SHOPIFY_STORE,
@@ -609,37 +621,35 @@ export async function GET(req) {
         has_alert_list: !!ENV.ALERT_LIST_ID,
         has_kv_url: !!ENV.KV_URL,
         has_kv_token: !!ENV.KV_TOKEN,
-        runtime: 'nodejs',
+        redisDisabled,
+        reason: redisDisabled ? 'soft-disabled (limit or env switch)' : 'enabled',
       };
-      try { await getRedis().ping(); out.redis_ping = 'ok'; } catch (e) { out.redis_ping = `fail: ${e?.message || e}`; }
+      if (!redisDisabled) {
+        try { await getRedis().ping(); out.redis_ping = 'ok'; }
+        catch (e) { out.redis_ping = `fail: ${e?.message || e}`; if (isUpstashLimitError(e)) { redisDisabled = true; out.redisDisabled = true; } }
+      }
       return NextResponse.json(out);
     }
 
     const authed = await ensureCronAuth(req);
     if (!authed) return unauthorized();
 
-    const verbose = ['1','true','yes'].includes((new URL(req.url).searchParams.get('verbose') || '').toLowerCase());
-    const loop    = ['1','true','yes'].includes((new URL(req.url).searchParams.get('loop') || '').toLowerCase());
-    const action  = (new URL(req.url).searchParams.get('action') || '').toLowerCase();
+    const verbose = ['1','true','yes'].includes(q('verbose'));
+    const loop    = (!redisDisabled) && ['1','true','yes'].includes(q('loop')); // don’t loop if redis is off
+    const action  = q('action');
 
-    // Use caller's runId if provided; otherwise reuse cursor runId or mint one
-    let runId = new URL(req.url).searchParams.get('runId');
+    // runId selection
+    let runId = url.searchParams.get('runId');
     if (!runId) {
-      try {
-        const redis = getRedis();
-        const cur = await redis.get(CURSOR_KEY);
-        runId = cur?.runId || randomUUID();
-      } catch {
-        runId = randomUUID();
-      }
+      const cur = await RGET(CURSOR_KEY);
+      runId = cur?.runId || randomUUID();
     }
 
     if (action === 'status') {
-      const redis = getRedis();
-      const ttl = await redis.ttl(LOCK_KEY);
-      const holder = await redis.get(LOCK_KEY);
-      const cursor = await redis.get(CURSOR_KEY);
-      return NextResponse.json({ locked: ttl > 0, ttl, holder, cursor });
+      const ttl = await RTTL(LOCK_KEY);
+      const holder = await RGET(LOCK_KEY);
+      const cursor = await RGET(CURSOR_KEY);
+      return NextResponse.json({ locked: ttl > 0, ttl, holder, cursor, redisDisabled });
     }
 
     const ok = await acquireOrValidateLock(runId);
@@ -649,18 +659,18 @@ export async function GET(req) {
       const slice = await runCatalogSlice({ runId, verbose });
 
       if (!slice.done && loop) {
-        const base = new URL(req.url);
-        base.searchParams.set('loop', '1');
-        base.searchParams.set('runId', runId);
-        if (verbose) base.searchParams.set('verbose', '1');
+        const resumeUrl = new URL(req.url);
+        resumeUrl.searchParams.set('loop', '1');
+        resumeUrl.searchParams.set('runId', runId);
+        if (verbose) resumeUrl.searchParams.set('verbose', '1');
         const headers = ENV.CRON_SECRET ? { authorization: `Bearer ${ENV.CRON_SECRET}` } : undefined;
-        after(() => fetch(base.toString(), { cache: 'no-store', headers }).catch(() => {}));
-        await getRedis().expire(LOCK_KEY, LOCK_TTL_SECONDS);
+        after(() => fetch(resumeUrl.toString(), { cache: 'no-store', headers }).catch(() => {}));
+        await REXPIRE(LOCK_KEY, LOCK_TTL_SECONDS);
       } else if (slice.done) {
         await clearCursor();
         await releaseLock(runId);
       } else {
-        await getRedis().expire(LOCK_KEY, LOCK_TTL_SECONDS);
+        await REXPIRE(LOCK_KEY, LOCK_TTL_SECONDS);
       }
 
       return NextResponse.json({
@@ -675,22 +685,16 @@ export async function GET(req) {
         profileUpdatesInThisSlice: slice.profileUpdates,
         sliceMs: slice.sliceMs,
         nextCursor: slice.nextCursor,
+        redisDisabled: slice.redisDisabled,
         message: slice.done
-          ? 'Catalog sweep complete (resumable)'
-          : (loop ? 'Slice complete; another slice scheduled (resumable)' : 'Slice complete; call again to resume'),
+          ? 'Catalog sweep complete'
+          : (loop ? 'Slice complete; another slice scheduled' : 'Slice complete; call again to resume'),
       });
     } catch (e) {
       await releaseLock(runId);
-      return NextResponse.json(
-        { success: false, error: e?.message || String(e) },
-        { status: 500 }
-      );
+      return NextResponse.json({ success: false, error: e?.message || String(e) }, { status: 500 });
     }
   } catch (fatal) {
-    // catches init-time issues (e.g., bad Redis env) so you see JSON instead of a blank 500
-    return NextResponse.json(
-      { success: false, error: fatal?.message || String(fatal) },
-      { status: 500 }
-    );
+    return NextResponse.json({ success: false, error: fatal?.message || String(fatal) }, { status: 500 });
   }
 }
