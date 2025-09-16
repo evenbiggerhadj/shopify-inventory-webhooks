@@ -1,24 +1,24 @@
 // app/api/audit-bundles/route.js
+export const runtime = 'nodejs';
+export const maxDuration = 300;
 
 import { NextResponse, after } from 'next/server';
 import { Redis } from '@upstash/redis';
 import { randomUUID } from 'crypto';
 
-export const runtime = 'nodejs';
-export const maxDuration = 300; // chain slices; don't rely on long single runs
-
 /* ----------------- Env & Redis ----------------- */
 const redis = new Redis({
-  url: process.env.KV_REST_API_URL,
-  token: process.env.KV_REST_API_TOKEN,
+  // Support either KV_REST_API_URL or KV_URL naming
+  url: process.env.KV_REST_API_URL || process.env.KV_URL,
+  token: process.env.KV_REST_API_TOKEN, // require write token
 });
 
-const SHOPIFY_STORE       = process.env.SHOPIFY_STORE; // e.g. "yourstore.myshopify.com"
+const SHOPIFY_STORE       = process.env.SHOPIFY_STORE; // "yourstore.myshopify.com"
 const ADMIN_API_TOKEN     = process.env.SHOPIFY_ADMIN_API_KEY;
 const KLAVIYO_API_KEY     = process.env.KLAVIYO_API_KEY;
 const ALERT_LIST_ID       = process.env.KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID;
 const PUBLIC_STORE_DOMAIN = process.env.PUBLIC_STORE_DOMAIN || 'example.com';
-const CRON_SECRET         = process.env.CRON_SECRET || ''; // optional; if unset, no auth required
+const CRON_SECRET         = process.env.CRON_SECRET || '';
 
 function assertEnv() {
   const missing = [];
@@ -26,16 +26,18 @@ function assertEnv() {
   if (!ADMIN_API_TOKEN) missing.push('SHOPIFY_ADMIN_API_KEY');
   if (!KLAVIYO_API_KEY) missing.push('KLAVIYO_API_KEY');
   if (!ALERT_LIST_ID)   missing.push('KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID');
+  if (!process.env.KV_REST_API_URL && !process.env.KV_URL) missing.push('KV_REST_API_URL');
+  if (!process.env.KV_REST_API_TOKEN) missing.push('KV_REST_API_TOKEN');
   if (missing.length) throw new Error(`Missing env: ${missing.join(', ')}`);
 }
 
-/* ----------------- Auth & locking ----------------- */
+/* ----------------- Cron auth & locking ----------------- */
 function unauthorized() {
   return NextResponse.json({ success: false, error: 'unauthorized' }, { status: 401 });
 }
 async function ensureCronAuth(req) {
-  if (req.headers.get('x-vercel-cron')) return true; // Vercel Cron
-  if (!CRON_SECRET) return true; // open if no secret configured
+  if (req.headers.get('x-vercel-cron')) return true;
+  if (!CRON_SECRET) return true;
   const auth = req.headers.get('authorization') || '';
   if (auth === `Bearer ${CRON_SECRET}`) return true;
   const url = new URL(req.url);
@@ -44,8 +46,8 @@ async function ensureCronAuth(req) {
 }
 
 const LOCK_KEY    = 'locks:audit-bundles';
-const CURSOR_KEY  = 'audit:cursor'; // { runId, pageUrl, nextIndex, startedAt }
-const LOCK_TTL_SECONDS = 15 * 60;   // 15 minutes
+const CURSOR_KEY  = 'audit:cursor';
+const LOCK_TTL_SECONDS = 15 * 60;
 
 async function acquireOrValidateLock(runId) {
   const holder = await redis.get(LOCK_KEY);
@@ -67,23 +69,12 @@ async function releaseLock(runId) {
 }
 
 /* ----------------- Tunables ----------------- */
-// Shopify REST: ~2 rps. 500ms is safe.
 const MIN_DELAY_MS   = Number(process.env.SHOPIFY_THROTTLE_MS || 500);
-// Keep each slice under the function ceiling (we chain slices as needed).
 const TIME_BUDGET_MS = Number(process.env.TIME_BUDGET_MS || 240000);
 
-/* ----------------- Utils ----------------- */
-function toE164(raw) {
-  if (!raw) return null;
-  let v = String(raw).trim().replace(/[^\d+]/g, '');
-  if (v.startsWith('+')) return /^\+\d{8,15}$/.test(v) ? v : null;
-  if (/^0\d{10}$/.test(v)) return '+234' + v.slice(1);
-  if (/^(70|80|81|90|91)\d{8}$/.test(v)) return '+234' + v;
-  if (/^\d{10}$/.test(v)) return '+1' + v;
-  return null;
-}
-const emailKey = (e) => `email:${String(e || '').toLowerCase()}`;
-const productUrlFrom = (handle) => (handle ? `https://${PUBLIC_STORE_DOMAIN}/products/${handle}` : '');
+/* ----------------- Small utils ----------------- */
+const productUrlFrom = (handle) =>
+  handle ? `https://${PUBLIC_STORE_DOMAIN}/products/${handle}` : '';
 
 function hasBundleTag(tagsStr) {
   return String(tagsStr || '')
@@ -91,6 +82,10 @@ function hasBundleTag(tagsStr) {
     .map(t => t.trim().toLowerCase())
     .includes('bundle');
 }
+
+const RANK = { ok: 0, understocked: 1, 'out-of-stock': 2 };
+const worstStatus = (a = 'ok', b = 'ok') => (RANK[a] >= RANK[b]) ? a : b;
+
 function extractStatusFromTags(tagsStr) {
   const tags = String(tagsStr || '').split(',').map(t => t.trim().toLowerCase());
   if (tags.includes('bundle-out-of-stock')) return 'out-of-stock';
@@ -98,12 +93,8 @@ function extractStatusFromTags(tagsStr) {
   if (tags.includes('bundle-ok'))           return 'ok';
   return null;
 }
-const RANK = { ok: 0, understocked: 1, 'out-of-stock': 2 };
-function worstStatus(a = 'ok', b = 'ok') {
-  return (RANK[a] >= RANK[b]) ? a : b;
-}
 
-/* ----------------- Klaviyo ----------------- */
+/* ----------------- Klaviyo helpers ----------------- */
 async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
   if (!KLAVIYO_API_KEY) throw new Error('KLAVIYO_API_KEY missing');
   if (!listId) throw new Error('listId missing');
@@ -202,7 +193,7 @@ async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }) {
   return { ok: true, status: res.status, body: txt };
 }
 
-/* ----------------- Shopify (rate-limited) ----------------- */
+/* ----------------- Shopify helpers ----------------- */
 let lastApiCall = 0;
 async function rateLimitedDelay() {
   const now = Date.now();
@@ -211,9 +202,11 @@ async function rateLimitedDelay() {
   lastApiCall = Date.now();
 }
 
-async function fetchShopify(endpointOrUrl, method = 'GET', body = null, raw = false) {
+// REST (list products, update tags, etc.)
+const REST_VERSION = '2025-01';
+async function fetchShopifyREST(endpointOrUrl, method = 'GET', body = null, raw = false) {
   if (!endpointOrUrl || typeof endpointOrUrl !== 'string') {
-    throw new Error(`fetchShopify called with invalid endpoint: "${endpointOrUrl}"`);
+    throw new Error(`fetchShopifyREST called with invalid endpoint: "${endpointOrUrl}"`);
   }
   await rateLimitedDelay();
 
@@ -221,11 +214,10 @@ async function fetchShopify(endpointOrUrl, method = 'GET', body = null, raw = fa
     'X-Shopify-Access-Token': String(ADMIN_API_TOKEN),
     'Content-Type': 'application/json',
   };
-
   const opts = { method, headers, ...(body ? { body: JSON.stringify(body) } : {}) };
   const url = endpointOrUrl.startsWith('http')
     ? endpointOrUrl
-    : `https://${SHOPIFY_STORE}/admin/api/2024-04/${endpointOrUrl.replace(/^\//, '')}`;
+    : `https://${SHOPIFY_STORE}/admin/api/${REST_VERSION}/${endpointOrUrl.replace(/^\//, '')}`;
 
   const res = await fetch(url, opts);
   if (!res.ok) {
@@ -235,17 +227,39 @@ async function fetchShopify(endpointOrUrl, method = 'GET', body = null, raw = fa
       const retry = await fetch(url, opts);
       if (!retry.ok) {
         const t = await retry.text();
-        throw new Error(`Shopify API error after retry: ${retry.status} ${retry.statusText} - ${t}`);
+        throw new Error(`Shopify REST error after retry: ${retry.status} ${retry.statusText} - ${t}`);
       }
       return raw ? retry : retry.json();
     }
     const t = await res.text();
-    throw new Error(`Shopify API error: ${res.status} ${res.statusText} - ${t}`);
+    throw new Error(`Shopify REST error: ${res.status} ${res.statusText} - ${t}`);
   }
   return raw ? res : res.json();
 }
 
-// Parse Shopify Link header; return absolute next URL or '' (none)
+// GraphQL (native Bundles)
+const GQL_VERSION = '2025-01';
+async function fetchShopifyGQL(query, variables = {}) {
+  await rateLimitedDelay();
+  const url = `https://${SHOPIFY_STORE}/admin/api/${GQL_VERSION}/graphql.json`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'X-Shopify-Access-Token': String(ADMIN_API_TOKEN),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  const json = await res.json();
+  if (!res.ok || json.errors) {
+    throw new Error(`Shopify GraphQL error: ${res.status} ${res.statusText} - ${JSON.stringify(json.errors || json)}`);
+  }
+  return json.data;
+}
+
+const toGid = (type, id) => `gid://shopify/${type}/${id}`;
+
+// Parse REST Link header
 function extractNextUrlFromLinkHeader(linkHeader) {
   if (!linkHeader) return '';
   const parts = linkHeader.split(',');
@@ -258,26 +272,19 @@ function extractNextUrlFromLinkHeader(linkHeader) {
   return '';
 }
 
-// Fetch a single page of products (id,title,handle,tags,variants)
+// Fetch one REST page of products
 async function fetchProductsPage(pageUrl) {
   const fields = encodeURIComponent('id,title,handle,tags,variants');
   const first = `products.json?limit=250&fields=${fields}`;
-
-  const res = await fetchShopify(pageUrl || first, 'GET', null, true); // raw Response
+  const res = await fetchShopifyREST(pageUrl || first, 'GET', null, true); // raw Response
   const json = await res.json();
   const products = Array.isArray(json?.products) ? json.products : [];
-
   const link = res.headers.get('link') || res.headers.get('Link');
   const nextUrl = extractNextUrlFromLinkHeader(link);
   return { products, nextUrl };
 }
 
-async function getProductMetafields(productId) {
-  const res = await fetchShopify(`products/${productId}/metafields.json`);
-  if (!res || !Array.isArray(res.metafields)) return null;
-  return res.metafields.find((m) => m.namespace === 'custom' && m.key === 'bundle_structure');
-}
-
+// Update product tags (replace any prior bundle-* tag)
 async function updateProductTags(productId, currentTagsCSV, status) {
   const cleaned = String(currentTagsCSV || '')
     .split(',')
@@ -285,23 +292,18 @@ async function updateProductTags(productId, currentTagsCSV, status) {
     .filter(tag => !['bundle-ok', 'bundle-understocked', 'bundle-out-of-stock'].includes(tag.toLowerCase()))
     .concat([`bundle-${status}`]);
 
-  await fetchShopify(`products/${productId}.json`, 'PUT', { product: { id: productId, tags: cleaned.join(', ') } });
+  await fetchShopifyREST(`products/${productId}.json`, 'PUT', {
+    product: { id: productId, tags: cleaned.join(', ') },
+  });
 }
 
-// Fallback — when a component variant wasn’t on the current page
-async function fetchVariantQty(variantId) {
-  const res = await fetchShopify(`variants/${variantId}.json`);
-  return Number(res?.variant?.inventory_quantity ?? 0);
-}
-
-/* ----------------- Redis helpers (status + subscribers + inv totals) ----------------- */
+/* ----------------- Redis helpers ----------------- */
 async function getStatus(productId) {
   return (await redis.get(`status:${productId}`)) || null;
 }
 async function setStatus(productId, prevStatus, currStatus) {
   await redis.set(`status:${productId}`, { previous: prevStatus, current: currStatus });
 }
-
 async function getPrevTotal(productId) {
   const v = await redis.get(`inv_total:${productId}`);
   if (v == null) return null;
@@ -312,7 +314,18 @@ async function setCurrTotal(productId, total) {
   await redis.set(`inv_total:${productId}`, total);
 }
 
-/** Read & merge subscribers saved under BOTH keys */
+/* ----------------- Subscribers (same behavior) ----------------- */
+function toE164(raw) {
+  if (!raw) return null;
+  let v = String(raw).trim().replace(/[^\d+]/g, '');
+  if (v.startsWith('+')) return /^\+\d{8,15}$/.test(v) ? v : null;
+  if (/^0\d{10}$/.test(v)) return '+234' + v.slice(1);
+  if (/^(70|80|81|90|91)\d{8}$/.test(v)) return '+234' + v;
+  if (/^\d{10}$/.test(v)) return '+1' + v;
+  return null;
+}
+const emailKey = (e) => `email:${String(e || '').toLowerCase()}`;
+
 async function getSubscribersForProduct(prod) {
   const keys = [
     `subscribers:${prod.id}`,
@@ -341,8 +354,6 @@ async function getSubscribersForProduct(prod) {
   const merged = Array.from(map.values());
   return { merged, keysTried: keys };
 }
-
-/** Persist updated subscribers back to BOTH keys */
 async function setSubscribersForProduct(prod, subs) {
   await Promise.all([
     redis.set(`subscribers:${prod.id}`, subs, { ex: 90 * 24 * 60 * 60 }),
@@ -350,7 +361,100 @@ async function setSubscribersForProduct(prod, subs) {
   ]);
 }
 
-/* ----------------- Notification helper (writes back all subs) ----------------- */
+/* ----------------- Bundle status via GraphQL (native Bundles) ----------------- */
+/**
+ * Returns:
+ * {
+ *   ok: Boolean, // has at least one bundle variant
+ *   variantResults: [ { variantId, buildable, status } ],
+ *   totalBuildable: Number, // sum buildable across bundle variants
+ * }
+ *
+ * Status per variant:
+ * - OUT-OF-STOCK if any component have <= 0
+ * - UNDERSTOCKED if none are 0 but some have < required
+ * - OK otherwise
+ */
+async function getBundleStatusFromGraphQL(productId) {
+  const gid = toGid('Product', productId);
+  const query = `
+    query ProductBundles($id: ID!, $vv: Int!, $cp: Int!) {
+      product(id: $id) {
+        id
+        handle
+        variants(first: $vv) {
+          edges {
+            node {
+              id
+              sku
+              title
+              productVariantComponents(first: $cp) {
+                nodes {
+                  quantity
+                  productVariant {
+                    id
+                    sku
+                    title
+                    sellableOnlineQuantity
+                    product { handle }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const data = await fetchShopifyGQL(query, { id: gid, vv: 100, cp: 50 });
+  const edges = data?.product?.variants?.edges || [];
+  const variantResults = [];
+
+  for (const e of edges) {
+    const v = e?.node;
+    const comps = v?.productVariantComponents?.nodes || [];
+    if (!comps.length) continue; // not a bundle variant
+
+    let anyZero = false, anyInsufficient = false;
+    let minBuildable = Infinity;
+
+    for (const c of comps) {
+      const have = Number(c?.productVariant?.sellableOnlineQuantity ?? 0);
+      const need = Math.max(1, Number(c?.quantity ?? 1));
+
+      if (have <= 0) anyZero = true;
+      else if (have < need) anyInsufficient = true;
+
+      const buildableForComp = Math.floor(have / need);
+      minBuildable = Math.min(minBuildable, buildableForComp);
+    }
+
+    const buildable = Number.isFinite(minBuildable) ? minBuildable : 0;
+    const status = anyZero ? 'out-of-stock' : (anyInsufficient ? 'understocked' : 'ok');
+
+    variantResults.push({
+      variantId: v.id,
+      buildable,
+      status,
+    });
+  }
+
+  if (!variantResults.length) {
+    return { ok: false, variantResults: [], totalBuildable: 0, finalStatus: null };
+  }
+
+  // Product final = worst across bundle variants
+  let finalStatus = 'ok';
+  let totalBuildable = 0;
+  for (const r of variantResults) {
+    finalStatus = worstStatus(finalStatus, r.status);
+    totalBuildable += Number(r.buildable || 0);
+  }
+  return { ok: true, variantResults, totalBuildable, finalStatus };
+}
+
+/* ----------------- Notifications ----------------- */
 async function notifyPending({ allSubs, pending, keysTried, pid, title, handle, isBundle }) {
   let notificationsSent = 0;
   let smsNotificationsSent = 0;
@@ -358,7 +462,6 @@ async function notifyPending({ allSubs, pending, keysTried, pid, title, handle, 
   let profileUpdates = 0;
 
   const productUrl = productUrlFrom(handle);
-  console.log(`🔔 Back in stock — ${title} — notifying ${pending.length} pending subscribers (keys: ${JSON.stringify(keysTried)})`);
   let processedSubs = 0;
 
   for (const sub of pending) {
@@ -366,7 +469,12 @@ async function notifyPending({ allSubs, pending, keysTried, pid, title, handle, 
       const phoneE164 = toE164(sub.phone || '');
       const smsConsent = !!sub.sms_consent && !!phoneE164;
 
-      await subscribeProfilesToList({ listId: String(ALERT_LIST_ID), email: sub.email, phoneE164, sms: smsConsent });
+      await subscribeProfilesToList({
+        listId: String(ALERT_LIST_ID),
+        email: sub.email,
+        phoneE164,
+        sms: smsConsent
+      });
 
       const stampedTitle  = sub.product_title  || title || 'Unknown Product';
       const stampedHandle = sub.product_handle || handle || '';
@@ -387,7 +495,7 @@ async function notifyPending({ allSubs, pending, keysTried, pid, title, handle, 
         });
         if (out.ok) profileUpdates++;
       } catch (e) {
-        console.warn('⚠️ Profile props write failed, continuing:', e?.message || e);
+        console.warn('Profile props write failed, continuing:', e?.message || e);
       }
 
       await trackKlaviyoEvent({
@@ -401,7 +509,7 @@ async function notifyPending({ allSubs, pending, keysTried, pid, title, handle, 
           product_url: stampedUrl,
           related_section_url,
           sms_consent: !!smsConsent,
-          source: isBundle ? 'bundle audit (catalog slice)' : 'catalog slice',
+          source: isBundle ? 'bundle audit (native components)' : 'catalog slice',
         },
       });
 
@@ -411,7 +519,7 @@ async function notifyPending({ allSubs, pending, keysTried, pid, title, handle, 
       if (++processedSubs % 5 === 0) await new Promise(r => setTimeout(r, 250));
     } catch (e) {
       notificationErrors++;
-      console.error(`❌ Notify failed for ${sub?.email || '(unknown)'}:`, e?.message || e);
+      console.error(`Notify failed for ${sub?.email || '(unknown)'}:`, e?.message || e);
     }
   }
 
@@ -426,7 +534,7 @@ async function loadCursor(runId) {
   return { runId, pageUrl: '', nextIndex: 0, startedAt: new Date().toISOString() };
 }
 async function saveCursor(cursor) {
-  await redis.set(CURSOR_KEY, cursor, { ex: 60 * 60 }); // keep for 1h
+  await redis.set(CURSOR_KEY, cursor, { ex: 60 * 60 });
 }
 async function clearCursor() {
   try { await redis.del(CURSOR_KEY); } catch {}
@@ -444,32 +552,22 @@ async function runCatalogSlice({ runId, verbose = false }) {
   let profileUpdates = 0;
 
   let cursor = await loadCursor(runId);
-  if (verbose) console.log(`🔎 Slice start runId=${runId} pageUrl=${cursor.pageUrl || '(first)'} idx=${cursor.nextIndex}`);
+  if (verbose) console.log(`Slice start runId=${runId} pageUrl=${cursor.pageUrl || '(first)'} idx=${cursor.nextIndex}`);
 
   let page = { products: [], nextUrl: '' };
   let products = [];
   let i = cursor.nextIndex || 0;
 
-  // fetch the current page (NO invalid destructuring here)
-  {
-    const first = await fetchProductsPage(cursor.pageUrl);
-    products = first.products;
-    page.nextUrl = first.nextUrl;
-  }
+  ({ products, nextUrl: page.nextUrl } = await fetchProductsPage(cursor.pageUrl));
 
-  // process until time budget is spent
   while (true) {
     if (i >= products.length) {
-      if (!page.nextUrl) break; // no more pages
+      if (!page.nextUrl) break;
       cursor = { ...cursor, pageUrl: page.nextUrl, nextIndex: 0 };
       await saveCursor(cursor);
-
-      const next = await fetchProductsPage(cursor.pageUrl);
-      products = next.products;
-      page.nextUrl = next.nextUrl;
-
+      ({ products, nextUrl: page.nextUrl } = await fetchProductsPage(cursor.pageUrl));
       i = 0;
-      if (verbose) console.log(`📥 Next page: ${products.length} products`);
+      if (verbose) console.log(`Next page: ${products.length} products`);
       if (!products.length) break;
     }
 
@@ -480,54 +578,57 @@ async function runCatalogSlice({ runId, verbose = false }) {
       const handle = product.handle;
       const tagsCSV = String(product.tags || '');
 
-      const total = (product.variants || []).reduce((acc, v) => acc + Number(v?.inventory_quantity ?? 0), 0);
+      // We still paginate via REST, but only run the expensive GraphQL
+      // component check when this looks like a bundle (by tag).
+      // (You can remove this gate to check every product; GraphQL cost will rise.)
+      const looksLikeBundle = hasBundleTag(tagsCSV);
+
+      // Sum of variant inventory (REST) is still kept for "increased" fallback
+      const restTotal = (product.variants || []).reduce((acc, v) => acc + Number(v?.inventory_quantity ?? 0), 0);
       const prevTotal = await getPrevTotal(pid);
-      const increased = prevTotal == null ? false : total > prevTotal;
-      await setCurrTotal(pid, total);
 
-      const isBundle = hasBundleTag(tagsCSV);
+      let finalStatus = null;
+      let totalBuildable = 0;
 
-      if (isBundle) {
-        let componentsStatus = 'ok';
-        const mf = await getProductMetafields(pid);
-        if (mf?.value) {
-          let comps = [];
-          try { comps = JSON.parse(mf.value); } catch { comps = []; }
-          const under = [], out = [];
-          for (const c of comps) {
-            if (!c?.variant_id) continue;
-            const vLocal = (product.variants || []).find(v => String(v.id) === String(c.variant_id));
-            let qty = vLocal ? Number(vLocal?.inventory_quantity ?? 0) : await fetchVariantQty(Number(c.variant_id));
-            const req = Number(c?.required_quantity ?? 1);
-            if (qty === 0) out.push(c.variant_id);
-            else if (qty < req) under.push(c.variant_id);
-          }
-          if (out.length) componentsStatus = 'out-of-stock';
-          else if (under.length) componentsStatus = 'understocked';
+      if (looksLikeBundle) {
+        // 🔴 Native Bundles via GraphQL — same logic as your Sheet
+        const summary = await getBundleStatusFromGraphQL(pid);
+
+        if (summary.ok) {
+          finalStatus = summary.finalStatus;           // 'ok' | 'understocked' | 'out-of-stock'
+          totalBuildable = Number(summary.totalBuildable || 0);
+        } else {
+          // Tagged as bundle but no native components — fall back to REST totals:
+          finalStatus =
+            (product.variants || []).length > 0 &&
+            (product.variants || []).every(v => Number(v?.inventory_quantity ?? 0) === 0)
+              ? 'out-of-stock'
+              : 'ok';
+          totalBuildable = restTotal;
         }
+      } else {
+        // Non-bundle: we don't tag bundle-* statuses
+        if (verbose) console.log(`Non-bundle: ${title}`);
+      }
 
-        const qtys = (product.variants || []).map(v => Number(v?.inventory_quantity ?? 0));
-        const ownTotal = qtys.reduce((a, b) => a + b, 0);
-        const anyNeg  = qtys.some(q => q < 0);
-        const allZero = (product.variants || []).length > 0 && qtys.every(q => q === 0);
-        const ownStatus =
-          allZero ? 'out-of-stock'
-          : (anyNeg || ownTotal < 0) ? 'understocked'
-          : 'ok';
-
-        const finalStatus = worstStatus(componentsStatus, ownStatus);
+      // Persist & notify only for bundles (we manage bundle-* tags)
+      if (finalStatus) {
+        const increased = prevTotal == null ? false : totalBuildable > prevTotal;
+        await setCurrTotal(pid, totalBuildable);
 
         const prevObj = await getStatus(pid);
         const prevStatus = (prevObj?.current ?? extractStatusFromTags(tagsCSV)) || null;
         await setStatus(pid, prevStatus, finalStatus);
 
+        // Update bundle-* tag on product
         await updateProductTags(pid, tagsCSV, finalStatus);
         tagsUpdated++;
 
         if (verbose) {
-          console.log(`📊 ${title} — bundle comp=${componentsStatus} own=${ownStatus} ⇒ ${finalStatus}; total=${total} (prev=${prevTotal ?? 'n/a'}, Δ+? ${increased})`);
+          console.log(`📊 ${title} — final=${finalStatus}; buildable=${totalBuildable} (prev=${prevTotal ?? 'n/a'}, Δ+? ${increased})`);
         }
 
+        // Notify when flips to OK (or buildable increased)
         const { merged: allSubs, keysTried } = await getSubscribersForProduct({ id: pid, handle });
         const pending = allSubs.filter(s => !s?.notified);
         const prevWasOk = (prevObj?.previous ?? extractStatusFromTags(tagsCSV)) === 'ok';
@@ -541,29 +642,18 @@ async function runCatalogSlice({ runId, verbose = false }) {
           profileUpdates       += counts.profileUpdates;
         }
       } else {
-        if (verbose) console.log(`📊 ${title} — non-bundle; total=${total} (prev=${prevTotal ?? 'n/a'}, Δ+? ${increased})`);
-
-        const { merged: allSubs, keysTried } = await getSubscribersForProduct({ id: pid, handle });
-        const pending = allSubs.filter(s => !s?.notified);
-        const shouldNotify = (pending.length > 0) && increased && total > 0;
-        if (shouldNotify) {
-          const counts = await notifyPending({ allSubs, pending, keysTried, pid, title, handle, isBundle: false });
-          notificationsSent    += counts.notificationsSent;
-          smsNotificationsSent += counts.smsNotificationsSent;
-          notificationErrors   += counts.notificationErrors;
-          profileUpdates       += counts.profileUpdates;
-        }
+        // Keep prevTotal tracking even for non-bundles (optional; harmless)
+        await setCurrTotal(pid, restTotal);
       }
 
       processed++;
     } catch (e) {
-      console.error(`❌ Error on product "${product?.title || product?.id}":`, e?.message || e);
+      console.error(`Error on product "${product?.title || product?.id}":`, e?.message || e);
     }
 
-    if (Date.now() - t0 > TIME_BUDGET_MS) break; // time budget guard
+    if (Date.now() - t0 > TIME_BUDGET_MS) break;
   }
 
-  // save resume point
   const pageConsumed = i >= products.length;
   const nextCursor = pageConsumed
     ? { ...cursor, pageUrl: page.nextUrl, nextIndex: 0 }
@@ -585,7 +675,7 @@ async function runCatalogSlice({ runId, verbose = false }) {
   };
 }
 
-/* ----------------- GET handler (resumable, self-reinvoking) ----------------- */
+/* ----------------- GET handler ----------------- */
 export async function GET(req) {
   const authed = await ensureCronAuth(req);
   if (!authed) return unauthorized();
