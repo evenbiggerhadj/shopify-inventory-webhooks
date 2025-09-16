@@ -8,9 +8,8 @@ import { randomUUID } from 'crypto';
 
 /* ----------------- Env & Redis ----------------- */
 const redis = new Redis({
-  // Support either KV_REST_API_URL or KV_URL naming
   url: process.env.KV_REST_API_URL || process.env.KV_URL,
-  token: process.env.KV_REST_API_TOKEN, // require write token
+  token: process.env.KV_REST_API_TOKEN,
 });
 
 const SHOPIFY_STORE       = process.env.SHOPIFY_STORE; // "yourstore.myshopify.com"
@@ -82,7 +81,6 @@ function hasBundleTag(tagsStr) {
     .map(t => t.trim().toLowerCase())
     .includes('bundle');
 }
-
 const RANK = { ok: 0, understocked: 1, 'out-of-stock': 2 };
 const worstStatus = (a = 'ok', b = 'ok') => (RANK[a] >= RANK[b]) ? a : b;
 
@@ -202,7 +200,7 @@ async function rateLimitedDelay() {
   lastApiCall = Date.now();
 }
 
-// REST (list products, update tags, etc.)
+// REST
 const REST_VERSION = '2025-01';
 async function fetchShopifyREST(endpointOrUrl, method = 'GET', body = null, raw = false) {
   if (!endpointOrUrl || typeof endpointOrUrl !== 'string') {
@@ -284,7 +282,7 @@ async function fetchProductsPage(pageUrl) {
   return { products, nextUrl };
 }
 
-// Update product tags (replace any prior bundle-* tag)
+// Update product tags
 async function updateProductTags(productId, currentTagsCSV, status) {
   const cleaned = String(currentTagsCSV || '')
     .split(',')
@@ -314,7 +312,7 @@ async function setCurrTotal(productId, total) {
   await redis.set(`inv_total:${productId}`, total);
 }
 
-/* ----------------- Subscribers (same behavior) ----------------- */
+/* ----------------- Subscribers ----------------- */
 function toE164(raw) {
   if (!raw) return null;
   let v = String(raw).trim().replace(/[^\d+]/g, '');
@@ -361,20 +359,7 @@ async function setSubscribersForProduct(prod, subs) {
   ]);
 }
 
-/* ----------------- Bundle status via GraphQL (native Bundles) ----------------- */
-/**
- * Returns:
- * {
- *   ok: Boolean, // has at least one bundle variant
- *   variantResults: [ { variantId, buildable, status } ],
- *   totalBuildable: Number, // sum buildable across bundle variants
- * }
- *
- * Status per variant:
- * - OUT-OF-STOCK if any component have <= 0
- * - UNDERSTOCKED if none are 0 but some have < required
- * - OK otherwise
- */
+/* ----------------- Bundle status via GraphQL ----------------- */
 async function getBundleStatusFromGraphQL(productId) {
   const gid = toGid('Product', productId);
   const query = `
@@ -414,7 +399,7 @@ async function getBundleStatusFromGraphQL(productId) {
   for (const e of edges) {
     const v = e?.node;
     const comps = v?.productVariantComponents?.nodes || [];
-    if (!comps.length) continue; // not a bundle variant
+    if (!comps.length) continue;
 
     let anyZero = false, anyInsufficient = false;
     let minBuildable = Infinity;
@@ -444,7 +429,6 @@ async function getBundleStatusFromGraphQL(productId) {
     return { ok: false, variantResults: [], totalBuildable: 0, finalStatus: null };
   }
 
-  // Product final = worst across bundle variants
   let finalStatus = 'ok';
   let totalBuildable = 0;
   for (const r of variantResults) {
@@ -558,14 +542,21 @@ async function runCatalogSlice({ runId, verbose = false }) {
   let products = [];
   let i = cursor.nextIndex || 0;
 
-  ({ products, nextUrl: page.nextUrl } = await fetchProductsPage(cursor.pageUrl));
+  // ✅ fixed: no invalid destructuring target
+  {
+    const pageRes = await fetchProductsPage(cursor.pageUrl);
+    products = pageRes.products;
+    page.nextUrl = pageRes.nextUrl;
+  }
 
   while (true) {
     if (i >= products.length) {
       if (!page.nextUrl) break;
       cursor = { ...cursor, pageUrl: page.nextUrl, nextIndex: 0 };
       await saveCursor(cursor);
-      ({ products, nextUrl: page.nextUrl } = await fetchProductsPage(cursor.pageUrl));
+      const pageRes = await fetchProductsPage(cursor.pageUrl); // ✅ fixed here too
+      products = pageRes.products;
+      page.nextUrl = pageRes.nextUrl;
       i = 0;
       if (verbose) console.log(`Next page: ${products.length} products`);
       if (!products.length) break;
@@ -578,12 +569,9 @@ async function runCatalogSlice({ runId, verbose = false }) {
       const handle = product.handle;
       const tagsCSV = String(product.tags || '');
 
-      // We still paginate via REST, but only run the expensive GraphQL
-      // component check when this looks like a bundle (by tag).
-      // (You can remove this gate to check every product; GraphQL cost will rise.)
       const looksLikeBundle = hasBundleTag(tagsCSV);
 
-      // Sum of variant inventory (REST) is still kept for "increased" fallback
+      // Keep a simple total around for “increased” checks
       const restTotal = (product.variants || []).reduce((acc, v) => acc + Number(v?.inventory_quantity ?? 0), 0);
       const prevTotal = await getPrevTotal(pid);
 
@@ -591,14 +579,12 @@ async function runCatalogSlice({ runId, verbose = false }) {
       let totalBuildable = 0;
 
       if (looksLikeBundle) {
-        // 🔴 Native Bundles via GraphQL — same logic as your Sheet
         const summary = await getBundleStatusFromGraphQL(pid);
 
         if (summary.ok) {
           finalStatus = summary.finalStatus;           // 'ok' | 'understocked' | 'out-of-stock'
           totalBuildable = Number(summary.totalBuildable || 0);
         } else {
-          // Tagged as bundle but no native components — fall back to REST totals:
           finalStatus =
             (product.variants || []).length > 0 &&
             (product.variants || []).every(v => Number(v?.inventory_quantity ?? 0) === 0)
@@ -607,11 +593,9 @@ async function runCatalogSlice({ runId, verbose = false }) {
           totalBuildable = restTotal;
         }
       } else {
-        // Non-bundle: we don't tag bundle-* statuses
         if (verbose) console.log(`Non-bundle: ${title}`);
       }
 
-      // Persist & notify only for bundles (we manage bundle-* tags)
       if (finalStatus) {
         const increased = prevTotal == null ? false : totalBuildable > prevTotal;
         await setCurrTotal(pid, totalBuildable);
@@ -620,7 +604,6 @@ async function runCatalogSlice({ runId, verbose = false }) {
         const prevStatus = (prevObj?.current ?? extractStatusFromTags(tagsCSV)) || null;
         await setStatus(pid, prevStatus, finalStatus);
 
-        // Update bundle-* tag on product
         await updateProductTags(pid, tagsCSV, finalStatus);
         tagsUpdated++;
 
@@ -628,7 +611,6 @@ async function runCatalogSlice({ runId, verbose = false }) {
           console.log(`📊 ${title} — final=${finalStatus}; buildable=${totalBuildable} (prev=${prevTotal ?? 'n/a'}, Δ+? ${increased})`);
         }
 
-        // Notify when flips to OK (or buildable increased)
         const { merged: allSubs, keysTried } = await getSubscribersForProduct({ id: pid, handle });
         const pending = allSubs.filter(s => !s?.notified);
         const prevWasOk = (prevObj?.previous ?? extractStatusFromTags(tagsCSV)) === 'ok';
@@ -642,7 +624,6 @@ async function runCatalogSlice({ runId, verbose = false }) {
           profileUpdates       += counts.profileUpdates;
         }
       } else {
-        // Keep prevTotal tracking even for non-bundles (optional; harmless)
         await setCurrTotal(pid, restTotal);
       }
 
