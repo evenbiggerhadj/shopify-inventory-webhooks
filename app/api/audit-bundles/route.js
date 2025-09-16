@@ -1,4 +1,3 @@
-// app/api/audit-bundles/route.js
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 export const maxDuration = 300;
@@ -9,20 +8,17 @@ import { randomUUID } from 'crypto';
 
 /* ----------------- Env ----------------- */
 const ENV = {
-  SHOPIFY_STORE:       process.env.SHOPIFY_STORE,                  // mystore.myshopify.com
+  SHOPIFY_STORE:       process.env.SHOPIFY_STORE,
   ADMIN_API_TOKEN:     process.env.SHOPIFY_ADMIN_API_KEY,
   KLAVIYO_API_KEY:     process.env.KLAVIYO_API_KEY,
   ALERT_LIST_ID:       process.env.KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID,
   PUBLIC_STORE_DOMAIN: process.env.PUBLIC_STORE_DOMAIN || 'example.com',
   CRON_SECRET:         process.env.CRON_SECRET || '',
-  // Upstash (accept a few possible names)
   KV_URL:              process.env.KV_REST_API_URL || process.env.KV_URL || process.env.REDIS_URL || '',
   KV_TOKEN:            process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN || '',
-  // Soft disable switch
   SOFT_DISABLE_REDIS:  (process.env.SOFT_DISABLE_REDIS || '') === '1',
-  // Shopify versions / pacing
   SHOPIFY_API_VERSION: process.env.SHOPIFY_API_VERSION || '2025-01',
-  SHOPIFY_THROTTLE_MS: Number(process.env.SHOPIFY_THROTTLE_MS || 500),
+  SHOPIFY_THROTTLE_MS: Number(process.env.SHOPIFY_THROTTLE_MS || 800), // ← safer than 500
   TIME_BUDGET_MS:      Number(process.env.TIME_BUDGET_MS || 240000),
 };
 
@@ -35,14 +31,14 @@ const worstStatus = (a = 'ok', b = 'ok') => (RANK[a] >= RANK[b]) ? a : b;
 
 /* ----------------- Soft-robust Redis wrapper ----------------- */
 let _redis = null;
-let redisDisabled = ENV.SOFT_DISABLE_REDIS; // start disabled if env says so
+let redisDisabled = ENV.SOFT_DISABLE_REDIS;
 
 function isUpstashLimitError(e) {
   const msg = (e?.message || e || '').toString().toLowerCase();
   return msg.includes('max requests limit exceeded') || msg.includes('429');
 }
 function requireRedisEnv() {
-  if (!ENV.KV_URL || !ENV.KV_TOKEN) throw new Error('Redis misconfigured: KV_REST_API_URL/KV_URL and KV_REST_API_TOKEN are required');
+  if (!ENV.KV_URL || !ENV.KV_TOKEN) throw new Error('Redis misconfigured');
 }
 function getRedis() {
   if (redisDisabled) throw new Error('redis_disabled');
@@ -50,84 +46,52 @@ function getRedis() {
   if (!_redis) _redis = new Redis({ url: ENV.KV_URL, token: ENV.KV_TOKEN });
   return _redis;
 }
-async function RGET(key, def = null) {
-  if (redisDisabled) return def;
-  try { return await getRedis().get(key); }
-  catch (e) { if (isUpstashLimitError(e)) redisDisabled = true; return def; }
-}
-async function RSET(key, val, opts) {
-  if (redisDisabled) return null;
-  try { return await getRedis().set(key, val, opts); }
-  catch (e) { if (isUpstashLimitError(e)) redisDisabled = true; return null; }
-}
-async function RDEL(key) {
-  if (redisDisabled) return null;
-  try { return await getRedis().del(key); }
-  catch (e) { if (isUpstashLimitError(e)) redisDisabled = true; return null; }
-}
-async function REXPIRE(key, secs) {
-  if (redisDisabled) return null;
-  try { return await getRedis().expire(key, secs); }
-  catch (e) { if (isUpstashLimitError(e)) redisDisabled = true; return null; }
-}
-async function RTTL(key) {
-  if (redisDisabled) return -2;
-  try { return await getRedis().ttl(key); }
-  catch (e) { if (isUpstashLimitError(e)) redisDisabled = true; return -2; }
-}
+async function RGET(k, d=null){ if (redisDisabled) return d; try{ return await getRedis().get(k);}catch(e){ if(isUpstashLimitError(e)) redisDisabled=true; return d; } }
+async function RSET(k,v,o){ if (redisDisabled) return null; try{ return await getRedis().set(k,v,o);}catch(e){ if(isUpstashLimitError(e)) redisDisabled=true; return null; } }
+async function RDEL(k){ if (redisDisabled) return null; try{ return await getRedis().del(k);}catch(e){ if(isUpstashLimitError(e)) redisDisabled=true; return null; } }
+async function REXPIRE(k,s){ if (redisDisabled) return null; try{ return await getRedis().expire(k,s);}catch(e){ if(isUpstashLimitError(e)) redisDisabled=true; return null; } }
+async function RTTL(k){ if (redisDisabled) return -2; try{ return await getRedis().ttl(k);}catch(e){ if(isUpstashLimitError(e)) redisDisabled=true; return -2; } }
 
 /* ----------------- Auth helpers ----------------- */
-function unauthorized() {
-  return NextResponse.json({ success: false, error: 'unauthorized' }, { status: 401 });
-}
-async function ensureCronAuth(req) {
+function unauthorized(){ return NextResponse.json({ success:false, error:'unauthorized' },{ status:401 }); }
+async function ensureCronAuth(req){
   if (req.headers.get('x-vercel-cron')) return true;
   if (!ENV.CRON_SECRET) return true;
-  const auth = req.headers.get('authorization') || '';
-  if (auth === `Bearer ${ENV.CRON_SECRET}`) return true;
+  const a = req.headers.get('authorization') || '';
+  if (a === `Bearer ${ENV.CRON_SECRET}`) return true;
   const url = new URL(req.url);
   if (url.searchParams.get('token') === ENV.CRON_SECRET) return true;
   return false;
 }
 
 /* ----------------- Lock (no-op if redis disabled) ----------------- */
-async function acquireOrValidateLock(runId) {
-  if (redisDisabled) return true; // allow single slice without Redis
+async function acquireOrValidateLock(runId){
+  if (redisDisabled) return true;
   const holder = await RGET(LOCK_KEY);
   if (!holder) {
-    const res = await RSET(LOCK_KEY, runId, { nx: true, ex: LOCK_TTL_SECONDS });
+    const res = await RSET(LOCK_KEY, runId, { nx:true, ex: LOCK_TTL_SECONDS });
     return !!res;
   }
-  if (holder === runId) {
-    await REXPIRE(LOCK_KEY, LOCK_TTL_SECONDS);
-    return true;
-  }
+  if (holder === runId) { await REXPIRE(LOCK_KEY, LOCK_TTL_SECONDS); return true; }
   return false;
 }
-async function releaseLock(runId) {
-  if (redisDisabled) return;
-  const holder = await RGET(LOCK_KEY);
-  if (holder === runId) await RDEL(LOCK_KEY);
-}
+async function releaseLock(runId){ if (redisDisabled) return; const holder = await RGET(LOCK_KEY); if (holder === runId) await RDEL(LOCK_KEY); }
 
-/* ----------------- Small utils ----------------- */
+/* ----------------- Utils ----------------- */
 const productUrlFrom = (handle) => (handle ? `https://${ENV.PUBLIC_STORE_DOMAIN}/products/${handle}` : '');
-function hasBundleTag(tagsStr) {
-  return String(tagsStr || '')
-    .split(',')
-    .map(t => t.trim().toLowerCase())
-    .includes('bundle');
+function hasBundleTag(tagsStr){
+  return String(tagsStr||'').split(',').map(t=>t.trim().toLowerCase()).includes('bundle');
 }
-function extractStatusFromTags(tagsStr) {
-  const tags = String(tagsStr || '').split(',').map(t => t.trim().toLowerCase());
+function extractStatusFromTags(tagsStr){
+  const tags = String(tagsStr||'').split(',').map(t=>t.trim().toLowerCase());
   if (tags.includes('bundle-out-of-stock')) return 'out-of-stock';
   if (tags.includes('bundle-understocked')) return 'understocked';
-  if (tags.includes('bundle-ok'))           return 'ok';
+  if (tags.includes('bundle-ok')) return 'ok';
   return null;
 }
-function toE164(raw) {
+function toE164(raw){
   if (!raw) return null;
-  let v = String(raw).trim().replace(/[^\d+]/g, '');
+  let v = String(raw).trim().replace(/[^\d+]/g,'');
   if (v.startsWith('+')) return /^\+\d{8,15}$/.test(v) ? v : null;
   if (/^0\d{10}$/.test(v)) return '+234' + v.slice(1);
   if (/^(70|80|81|90|91)\d{8}$/.test(v)) return '+234' + v;
@@ -135,160 +99,125 @@ function toE164(raw) {
   return null;
 }
 
-/* ----------------- Klaviyo (same as before) ----------------- */
+/* ----------------- Klaviyo (unchanged) ----------------- */
 async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
   if (!ENV.KLAVIYO_API_KEY) throw new Error('KLAVIYO_API_KEY missing');
   if (!listId) throw new Error('listId missing');
   if (!email) throw new Error('email missing');
   const subscriptions = { email: { marketing: { consent: 'SUBSCRIBED' } } };
   if (sms && phoneE164) subscriptions.sms = { marketing: { consent: 'SUBSCRIBED' } };
-  const payload = {
-    data: {
-      type: 'profile-subscription-bulk-create-job',
-      attributes: { profiles: { data: [ { type: 'profile', attributes: { email, ...(sms && phoneE164 ? { phone_number: phoneE164 } : {}), subscriptions } } ] } },
-      relationships: { list: { data: { type: 'list', id: listId } } },
-    },
-  };
-  const res = await fetch('https://a.klaviyo.com/api/profile-subscription-bulk-create-jobs/', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Klaviyo-API-Key ${ENV.KLAVIYO_API_KEY}`,
-      'accept': 'application/json',
-      'content-type': 'application/json',
-      'revision': '2023-10-15',
-    },
+  const payload = { data: { type:'profile-subscription-bulk-create-job',
+    attributes:{ profiles:{ data:[{ type:'profile', attributes:{ email, ...(sms&&phoneE164?{ phone_number: phoneE164 }:{}), subscriptions } }] } },
+    relationships:{ list:{ data:{ type:'list', id:listId } } } } };
+  const res = await fetch('https://a.klaviyo.com/api/profile-subscription-bulk-create-jobs/',{
+    method:'POST',
+    headers:{ 'Authorization':`Klaviyo-API-Key ${ENV.KLAVIYO_API_KEY}`,'accept':'application/json','content-type':'application/json','revision':'2023-10-15' },
     body: JSON.stringify(payload),
   });
   const body = await res.text();
   if (!res.ok) throw new Error(`Klaviyo subscribe failed: ${res.status} ${res.statusText} :: ${body}`);
-  return { ok: true, status: res.status, body };
+  return { ok:true, status:res.status, body };
 }
 async function updateProfileProperties({ email, properties }) {
   if (!ENV.KLAVIYO_API_KEY) throw new Error('KLAVIYO_API_KEY missing');
   if (!email) throw new Error('email missing');
-  const filter = `equals(email,"${String(email).replace(/"/g, '\\"')}")`;
-  const listRes = await fetch(`https://a.klaviyo.com/api/profiles/?filter=${encodeURIComponent(filter)}&page[size]=1`, {
-    method: 'GET',
-    headers: {
-      'Authorization': `Klaviyo-API-Key ${ENV.KLAVIYO_API_KEY}`,
-      'accept': 'application/json',
-      'revision': '2023-10-15',
-    },
-  });
-  if (!listRes.ok) {
-    const txt = await listRes.text();
-    throw new Error(`Profiles lookup failed: ${listRes.status} ${listRes.statusText} :: ${txt}`);
-  }
+  const filter = `equals(email,"${String(email).replace(/"/g,'\\"')}")`;
+  const listRes = await fetch(`https://a.klaviyo.com/api/profiles/?filter=${encodeURIComponent(filter)}&page[size]=1`,{
+    method:'GET', headers:{ 'Authorization':`Klaviyo-API-Key ${ENV.KLAVIYO_API_KEY}`,'accept':'application/json','revision':'2023-10-15' } });
+  if (!listRes.ok){ const txt = await listRes.text(); throw new Error(`Profiles lookup failed: ${listRes.status} ${listRes.statusText} :: ${txt}`); }
   const listJson = await listRes.json();
   const id = listJson?.data?.[0]?.id;
-  if (!id) return { ok: false, status: 404, body: 'profile_not_found', skipped: true };
+  if (!id) return { ok:false, status:404, body:'profile_not_found', skipped:true };
   const patchRes = await fetch(`https://a.klaviyo.com/api/profiles/${id}/`, {
-    method: 'PATCH',
-    headers: {
-      'Authorization': `Klaviyo-API-Key ${ENV.KLAVIYO_API_KEY}`,
-      'accept': 'application/json',
-      'content-type': 'application/json',
-      'revision': '2023-10-15',
-    },
-    body: JSON.stringify({ data: { type: 'profile', id, attributes: { properties } } }),
+    method:'PATCH',
+    headers:{ 'Authorization':`Klaviyo-API-Key ${ENV.KLAVIYO_API_KEY}`,'accept':'application/json','content-type':'application/json','revision':'2023-10-15' },
+    body: JSON.stringify({ data:{ type:'profile', id, attributes:{ properties } } }),
   });
   const txt = await patchRes.text();
   if (!patchRes.ok) throw new Error(`Profile PATCH failed: ${patchRes.status} ${patchRes.statusText} :: ${txt}`);
-  return { ok: true, status: patchRes.status, body: txt };
+  return { ok:true, status:patchRes.status, body:txt };
 }
 async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }) {
   if (!ENV.KLAVIYO_API_KEY) throw new Error('KLAVIYO_API_KEY missing');
   if (!metricName) throw new Error('metricName missing');
-  const body = {
-    data: {
-      type: 'event',
-      attributes: {
-        time: new Date().toISOString(),
-        properties: properties || {},
-        metric: { data: { type: 'metric', attributes: { name: metricName } } },
-        profile: { data: { type: 'profile', attributes: { email, ...(phoneE164 ? { phone_number: phoneE164 } : {}) } } },
-      },
-    },
-  };
-  const res = await fetch('https://a.klaviyo.com/api/events/', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Klaviyo-API-Key ${ENV.KLAVIYO_API_KEY}`,
-      'accept': 'application/json',
-      'content-type': 'application/json',
-      'revision': '2023-10-15',
-    },
-    body: JSON.stringify(body),
-  });
+  const body = { data:{ type:'event', attributes:{ time:new Date().toISOString(), properties:properties||{}, metric:{ data:{ type:'metric', attributes:{ name:metricName } } }, profile:{ data:{ type:'profile', attributes:{ email, ...(phoneE164?{ phone_number: phoneE164 }:{}) } } } } } };
+  const res = await fetch('https://a.klaviyo.com/api/events/',{
+    method:'POST', headers:{ 'Authorization':`Klaviyo-API-Key ${ENV.KLAVIYO_API_KEY}`,'accept':'application/json','content-type':'application/json','revision':'2023-10-15' }, body: JSON.stringify(body) });
   const txt = await res.text();
   if (!res.ok) throw new Error(`Klaviyo event failed: ${res.status} ${res.statusText} :: ${txt}`);
-  return { ok: true, status: res.status, body: txt };
+  return { ok:true, status:res.status, body:txt };
 }
 
-/* ----------------- Shopify helpers ----------------- */
+/* ----------------- Shopify helpers with safer throttling ----------------- */
 let lastApiCall = 0;
-async function rateLimitedDelay() {
+function jitter(ms){ return ms + Math.floor(Math.random()*120); } // avoid alignment
+async function rateLimitedDelay(){
   const now = Date.now();
   const dt = now - lastApiCall;
-  if (dt < ENV.SHOPIFY_THROTTLE_MS) await new Promise(r => setTimeout(r, ENV.SHOPIFY_THROTTLE_MS - dt));
+  const min = ENV.SHOPIFY_THROTTLE_MS;
+  if (dt < min) await new Promise(r => setTimeout(r, jitter(min - dt)));
   lastApiCall = Date.now();
 }
-async function fetchShopifyREST(endpointOrUrl, method = 'GET', body = null, raw = false) {
-  await rateLimitedDelay();
-  const headers = {
-    'X-Shopify-Access-Token': String(ENV.ADMIN_API_TOKEN),
-    'Content-Type': 'application/json',
-  };
-  const opts = { method, headers, ...(body ? { body: JSON.stringify(body) } : {}) };
+
+async function fetchShopifyREST(endpointOrUrl, method='GET', body=null, raw=false){
+  const headers = { 'X-Shopify-Access-Token': String(ENV.ADMIN_API_TOKEN), 'Content-Type':'application/json' };
   const url = endpointOrUrl.startsWith('http')
     ? endpointOrUrl
-    : `https://${ENV.SHOPIFY_STORE}/admin/api/${ENV.SHOPIFY_API_VERSION}/${endpointOrUrl.replace(/^\//, '')}`;
-  const res = await fetch(url, opts);
-  if (!res.ok) {
-    if (res.status === 429) {
-      await new Promise(r => setTimeout(r, 2000));
+    : `https://${ENV.SHOPIFY_STORE}/admin/api/${ENV.SHOPIFY_API_VERSION}/${endpointOrUrl.replace(/^\//,'')}`;
+  const optsBase = { method, headers, ...(body ? { body: JSON.stringify(body) } : {}) };
+
+  let attempt = 0;
+  while (true) {
+    await rateLimitedDelay();
+    const res = await fetch(url, optsBase);
+    if (res.ok) return raw ? res : res.json();
+
+    if (res.status === 429 && attempt < 5) {
+      const ra = Number(res.headers.get('retry-after') || 0);
+      const wait = ra ? (ra*1000) : (1500 + attempt*600 + Math.floor(Math.random()*300));
+      await new Promise(r => setTimeout(r, wait));
       lastApiCall = Date.now();
-      const retry = await fetch(url, opts);
-      if (!retry.ok) {
-        const t = await retry.text();
-        throw new Error(`Shopify REST error after retry: ${retry.status} ${retry.statusText} - ${t}`);
-      }
-      return raw ? retry : retry.json();
+      attempt++;
+      continue;
     }
+
     const t = await res.text();
-    throw new Error(`Shopify REST error: ${res.status} ${res.statusText} - ${t}`);
+    throw new Error(`Shopify REST error${attempt? ' after retry':''}: ${res.status} ${res.statusText} - ${t}`);
   }
-  return raw ? res : res.json();
 }
-async function fetchShopifyGQL(query, variables = {}) {
-  await rateLimitedDelay();
+
+async function fetchShopifyGQL(query, variables={}){
   const url = `https://${ENV.SHOPIFY_STORE}/admin/api/${ENV.SHOPIFY_API_VERSION}/graphql.json`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'X-Shopify-Access-Token': String(ENV.ADMIN_API_TOKEN),
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-  const json = await res.json();
-  if (!res.ok || json.errors) {
-    throw new Error(`Shopify GraphQL error: ${res.status} ${res.statusText} - ${JSON.stringify(json.errors || json)}`);
+  const opts = { method:'POST', headers:{ 'X-Shopify-Access-Token': String(ENV.ADMIN_API_TOKEN),'Content-Type':'application/json' }, body: JSON.stringify({ query, variables }) };
+
+  let attempt = 0;
+  while (true) {
+    await rateLimitedDelay();
+    const res = await fetch(url, opts);
+    const json = await res.json().catch(() => ({}));
+    if (res.ok && !json.errors) return json.data;
+
+    if (res.status === 429 && attempt < 5) {
+      const ra = Number(res.headers.get('retry-after') || 0);
+      const wait = ra ? (ra*1000) : (1500 + attempt*600 + Math.floor(Math.random()*300));
+      await new Promise(r => setTimeout(r, wait));
+      lastApiCall = Date.now();
+      attempt++;
+      continue;
+    }
+
+    throw new Error(`Shopify GraphQL error${attempt? ' after retry':''}: ${res.status} ${res.statusText} - ${JSON.stringify(json.errors || json)}`);
   }
-  return json.data;
 }
-function extractNextUrlFromLinkHeader(linkHeader) {
+
+function extractNextUrlFromLinkHeader(linkHeader){
   if (!linkHeader) return '';
   const parts = linkHeader.split(',');
-  for (const p of parts) {
-    if (p.toLowerCase().includes('rel="next"')) {
-      const m = p.match(/<([^>]+)>/);
-      if (m && m[1]) return m[1];
-    }
-  }
+  for (const p of parts) if (p.toLowerCase().includes('rel="next"')){ const m = p.match(/<([^>]+)>/); if (m && m[1]) return m[1]; }
   return '';
 }
-async function fetchProductsPage(pageUrl) {
+
+async function fetchProductsPage(pageUrl){
   const fields = encodeURIComponent('id,title,handle,tags,variants');
   const first = `products.json?limit=250&fields=${fields}`;
   const res = await fetchShopifyREST(pageUrl || first, 'GET', null, true);
@@ -298,66 +227,50 @@ async function fetchProductsPage(pageUrl) {
   const nextUrl = extractNextUrlFromLinkHeader(link);
   return { products, nextUrl };
 }
-async function updateProductTags(productId, currentTagsCSV, status) {
-  const cleaned = String(currentTagsCSV || '')
-    .split(',')
-    .map(t => t.trim())
-    .filter(tag => !['bundle-ok', 'bundle-understocked', 'bundle-out-of-stock'].includes(tag.toLowerCase()))
+
+async function updateProductTags(productId, currentTagsCSV, status){
+  const cleaned = String(currentTagsCSV||'')
+    .split(',').map(t => t.trim())
+    .filter(tag => !['bundle-ok','bundle-understocked','bundle-out-of-stock'].includes(tag.toLowerCase()))
     .concat([`bundle-${status}`]);
-  await fetchShopifyREST(`products/${productId}.json`, 'PUT', {
-    product: { id: productId, tags: cleaned.join(', ') },
-  });
+  await fetchShopifyREST(`products/${productId}.json`, 'PUT', { product:{ id: productId, tags: cleaned.join(', ') } });
 }
 
-/* ----------------- Redis-backed helpers (all softened) ----------------- */
-async function getStatus(productId) {
-  return (await RGET(`status:${productId}`)) || null;
-}
-async function setStatus(productId, prevStatus, currStatus) {
-  await RSET(`status:${productId}`, { previous: prevStatus, current: currStatus });
-}
-async function getPrevTotal(productId) {
-  const v = await RGET(`inv_total:${productId}`);
-  if (v == null) return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-async function setCurrTotal(productId, total) {
-  await RSET(`inv_total:${productId}`, total);
-}
+/* ----------------- Redis-backed helpers ----------------- */
+async function getStatus(productId){ return (await RGET(`status:${productId}`)) || null; }
+async function setStatus(productId, prevStatus, currStatus){ await RSET(`status:${productId}`, { previous: prevStatus, current: currStatus }); }
+async function getPrevTotal(productId){ const v = await RGET(`inv_total:${productId}`); if (v==null) return null; const n = Number(v); return Number.isFinite(n)?n:null; }
+async function setCurrTotal(productId, total){ await RSET(`inv_total:${productId}`, total); }
 
-/* Waitlist subscribers (no-op if redis disabled) */
-const emailKey = (e) => `email:${String(e || '').toLowerCase()}`;
-async function getSubscribersForProduct(prod) {
-  const keys = [`subscribers:${prod.id}`, `subscribers_handle:${prod.handle || ''}`];
-  const lists = await Promise.all(keys.map(async (k) => {
+/* Waitlist subscribers (skips when redis disabled) */
+const emailKey = (e) => `email:${String(e||'').toLowerCase()}`;
+async function getSubscribersForProduct(prod){
+  const keys = [`subscribers:${prod.id}`, `subscribers_handle:${prod.handle||''}`];
+  const lists = await Promise.all(keys.map(async k => {
     const v = await RGET(k);
     if (Array.isArray(v)) return v;
     if (typeof v === 'string') { try { return JSON.parse(v); } catch { return []; } }
     return [];
   }));
   const map = new Map();
-  const keyFor = (s) => toE164(s?.phone || '') || emailKey(s?.email);
+  const keyFor = (s) => toE164(s?.phone||'') || emailKey(s?.email);
   const ts = (s) => Date.parse(s?.last_rearmed_at || s?.subscribed_at || 0);
-  for (const list of lists) {
-    for (const s of list) {
-      const k = keyFor(s);
-      if (!k) continue;
-      const prev = map.get(k);
-      if (!prev || ts(s) >= ts(prev)) map.set(k, s);
-    }
+  for (const list of lists) for (const s of list){
+    const k = keyFor(s); if (!k) continue;
+    const prev = map.get(k);
+    if (!prev || ts(s) >= ts(prev)) map.set(k, s);
   }
   return { merged: Array.from(map.values()), keysTried: keys };
 }
-async function setSubscribersForProduct(prod, subs) {
+async function setSubscribersForProduct(prod, subs){
   await Promise.all([
-    RSET(`subscribers:${prod.id}`, subs, { ex: 90 * 24 * 60 * 60 }),
-    RSET(`subscribers_handle:${prod.handle || ''}`, subs, { ex: 90 * 24 * 60 * 60 }),
+    RSET(`subscribers:${prod.id}`, subs, { ex: 90*24*60*60 }),
+    RSET(`subscribers_handle:${prod.handle||''}`, subs, { ex: 90*24*60*60 }),
   ]);
 }
 
 /* ----------------- Native bundle status (GraphQL) ----------------- */
-async function getBundleStatusFromGraphQL(productId) {
+async function getBundleStatusFromGraphQL(productId){
   const query = `
     query ProductBundles($id: ID!, $vv: Int!, $cp: Int!) {
       product(id: $id) {
@@ -391,43 +304,40 @@ async function getBundleStatusFromGraphQL(productId) {
     const v = e?.node;
     const comps = v?.productVariantComponents?.nodes || [];
     if (!comps.length) continue;
-    let anyZero = false, anyInsufficient = false, minBuildable = Infinity;
+    let anyZero=false, anyInsufficient=false, minBuildable=Infinity;
     for (const c of comps) {
       const have = Number(c?.productVariant?.sellableOnlineQuantity ?? 0);
       const need = Math.max(1, Number(c?.quantity ?? 1));
       if (have <= 0) anyZero = true;
       else if (have < need) anyInsufficient = true;
-      minBuildable = Math.min(minBuildable, Math.floor(have / need));
+      minBuildable = Math.min(minBuildable, Math.floor(have/need));
     }
     const buildable = Number.isFinite(minBuildable) ? minBuildable : 0;
     const status = anyZero ? 'out-of-stock' : (anyInsufficient ? 'understocked' : 'ok');
     variantResults.push({ buildable, status });
   }
-  if (!variantResults.length) return { ok: false, variantResults: [], totalBuildable: 0, finalStatus: null };
-  let finalStatus = 'ok', totalBuildable = 0;
-  for (const r of variantResults) {
-    finalStatus = worstStatus(finalStatus, r.status);
-    totalBuildable += Number(r.buildable || 0);
-  }
-  return { ok: true, variantResults, totalBuildable, finalStatus };
+  if (!variantResults.length) return { ok:false, variantResults:[], totalBuildable:0, finalStatus:null };
+  let finalStatus='ok', totalBuildable=0;
+  for (const r of variantResults){ finalStatus = worstStatus(finalStatus, r.status); totalBuildable += Number(r.buildable||0); }
+  return { ok:true, variantResults, totalBuildable, finalStatus };
 }
 
 /* ----------------- Notify (skips when redis disabled) ----------------- */
-async function notifyPending({ allSubs, pending, pid, title, handle, isBundle }) {
-  if (redisDisabled) return { notificationsSent: 0, smsNotificationsSent: 0, notificationErrors: 0, profileUpdates: 0 };
-  let notificationsSent = 0, smsNotificationsSent = 0, notificationErrors = 0, profileUpdates = 0;
+async function notifyPending({ allSubs, pending, pid, title, handle, isBundle }){
+  if (redisDisabled) return { notificationsSent:0, smsNotificationsSent:0, notificationErrors:0, profileUpdates:0 };
+  let notificationsSent=0, smsNotificationsSent=0, notificationErrors=0, profileUpdates=0;
   const productUrl = productUrlFrom(handle);
-  let processedSubs = 0;
+  let processed=0;
   for (const sub of pending) {
     try {
-      const phoneE164 = toE164(sub.phone || '');
+      const phoneE164 = toE164(sub.phone||'');
       const smsConsent = !!sub.sms_consent && !!phoneE164;
-      await subscribeProfilesToList({ listId: String(ENV.ALERT_LIST_ID), email: sub.email, phoneE164, sms: smsConsent });
-      const stampedTitle  = sub.product_title  || title || 'Unknown Product';
+      await subscribeProfilesToList({ listId:String(ENV.ALERT_LIST_ID), email:sub.email, phoneE164, sms:smsConsent });
+      const stampedTitle = sub.product_title || title || 'Unknown Product';
       const stampedHandle = sub.product_handle || handle || '';
-      const stampedUrl    = sub.product_url    || productUrlFrom(stampedHandle) || productUrl;
+      const stampedUrl = sub.product_url || productUrlFrom(stampedHandle) || productUrl;
       const related_section_url = stampedUrl ? `${stampedUrl}#after-bis` : '';
-      try {
+      try{
         const out = await updateProfileProperties({
           email: sub.email,
           properties: {
@@ -440,70 +350,44 @@ async function notifyPending({ allSubs, pending, pid, title, handle, isBundle })
           },
         });
         if (out.ok) profileUpdates++;
-      } catch {}
+      }catch{}
       await trackKlaviyoEvent({
-        metricName: 'Back in Stock',
+        metricName:'Back in Stock',
         email: sub.email,
         phoneE164,
-        properties: {
-          product_id: String(pid),
-          product_title: stampedTitle,
-          product_handle: stampedHandle,
-          product_url: stampedUrl,
-          related_section_url,
-          sms_consent: !!smsConsent,
-          source: isBundle ? 'bundle audit (native components)' : 'catalog slice',
-        },
+        properties:{ product_id:String(pid), product_title:stampedTitle, product_handle:stampedHandle, product_url:stampedUrl, related_section_url, sms_consent:!!smsConsent, source: isBundle ? 'bundle audit (native components)' : 'catalog slice' },
       });
       sub.notified = true;
       notificationsSent++;
       if (smsConsent) smsNotificationsSent++;
-      if (++processedSubs % 5 === 0) await new Promise(r => setTimeout(r, 250));
-    } catch (e) {
-      notificationErrors++;
-    }
+      if (++processed % 5 === 0) await new Promise(r => setTimeout(r, 250));
+    }catch{ notificationErrors++; }
   }
-  await setSubscribersForProduct({ id: pid, handle }, allSubs);
+  await setSubscribersForProduct({ id:pid, handle }, allSubs);
   return { notificationsSent, smsNotificationsSent, notificationErrors, profileUpdates };
 }
 
 /* ----------------- Cursor (no-op if redis disabled) ----------------- */
-async function loadCursor(runId) {
-  if (redisDisabled) return { runId, pageUrl: '', nextIndex: 0, startedAt: new Date().toISOString() };
-  const cur = await RGET(CURSOR_KEY);
-  if (cur && cur.runId === runId) return cur;
-  return { runId, pageUrl: '', nextIndex: 0, startedAt: new Date().toISOString() };
-}
-async function saveCursor(cursor) {
-  if (redisDisabled) return;
-  await RSET(CURSOR_KEY, cursor, { ex: 60 * 60 });
-}
-async function clearCursor() {
-  if (redisDisabled) return;
-  await RDEL(CURSOR_KEY);
-}
+async function loadCursor(runId){ if (redisDisabled) return { runId, pageUrl:'', nextIndex:0, startedAt:new Date().toISOString() }; const cur = await RGET(CURSOR_KEY); if (cur && cur.runId === runId) return cur; return { runId, pageUrl:'', nextIndex:0, startedAt:new Date().toISOString() }; }
+async function saveCursor(cursor){ if (redisDisabled) return; await RSET(CURSOR_KEY, cursor, { ex: 60*60 }); }
+async function clearCursor(){ if (redisDisabled) return; await RDEL(CURSOR_KEY); }
 
 /* ----------------- Time-bounded catalog slice ----------------- */
-async function runCatalogSlice({ runId, verbose = false }) {
-  // Only the Shopify pieces are strictly required
+async function runCatalogSlice({ runId, verbose=false }){
   if (!ENV.SHOPIFY_STORE) throw new Error('Missing env: SHOPIFY_STORE');
   if (!ENV.ADMIN_API_TOKEN) throw new Error('Missing env: SHOPIFY_ADMIN_API_KEY');
 
   const t0 = Date.now();
-  let processed = 0, tagsUpdated = 0, notificationsSent = 0, smsNotificationsSent = 0, notificationErrors = 0, profileUpdates = 0;
+  let processed=0, tagsUpdated=0, notificationsSent=0, smsNotificationsSent=0, notificationErrors=0, profileUpdates=0;
 
   let cursor = await loadCursor(runId);
-  if (verbose) console.log(`Slice start runId=${runId} pageUrl=${cursor.pageUrl || '(first)'} idx=${cursor.nextIndex}, redisDisabled=${redisDisabled}`);
+  if (verbose) console.log(`Slice start runId=${runId} pageUrl=${cursor.pageUrl||'(first)'} idx=${cursor.nextIndex} redisDisabled=${redisDisabled}`);
 
-  let page = { products: [], nextUrl: '' };
+  let page = { products:[], nextUrl:'' };
   let products = [];
   let i = cursor.nextIndex || 0;
 
-  {
-    const pageRes = await fetchProductsPage(cursor.pageUrl);
-    products = pageRes.products;
-    page.nextUrl = pageRes.nextUrl;
-  }
+  { const pageRes = await fetchProductsPage(cursor.pageUrl); products = pageRes.products; page.nextUrl = pageRes.nextUrl; }
 
   while (true) {
     if (i >= products.length) {
@@ -511,8 +395,7 @@ async function runCatalogSlice({ runId, verbose = false }) {
       cursor = { ...cursor, pageUrl: page.nextUrl, nextIndex: 0 };
       await saveCursor(cursor);
       const pageRes = await fetchProductsPage(cursor.pageUrl);
-      products = pageRes.products;
-      page.nextUrl = pageRes.nextUrl;
+      products = pageRes.products; page.nextUrl = pageRes.nextUrl;
       i = 0;
       if (verbose) console.log(`Next page: ${products.length} products`);
       if (!products.length) break;
@@ -526,47 +409,39 @@ async function runCatalogSlice({ runId, verbose = false }) {
       const tagsCSV = String(product.tags || '');
       const isBundle = hasBundleTag(tagsCSV);
 
-      // For non-bundles we don’t need Redis: we’re not notifying here.
       if (isBundle) {
-        const restTotal = (product.variants || []).reduce((acc, v) => acc + Number(v?.inventory_quantity ?? 0), 0);
+        const restTotal = (product.variants || []).reduce((acc,v)=>acc+Number(v?.inventory_quantity??0),0);
         const prevTotal = await getPrevTotal(pid);
 
-        let finalStatus = null;
-        let totalBuildable = 0;
-
+        let finalStatus=null, totalBuildable=0;
         const summary = await getBundleStatusFromGraphQL(pid);
-        if (summary.ok) {
-          finalStatus = summary.finalStatus;            // 'ok' | 'understocked' | 'out-of-stock'
-          totalBuildable = Number(summary.totalBuildable || 0);
-        } else {
-          finalStatus =
-            (product.variants || []).length > 0 &&
-            (product.variants || []).every(v => Number(v?.inventory_quantity ?? 0) === 0)
-              ? 'out-of-stock'
-              : 'ok';
-          totalBuildable = restTotal;
-        }
+        if (summary.ok){ finalStatus = summary.finalStatus; totalBuildable = Number(summary.totalBuildable||0); }
+        else { finalStatus = ((product.variants||[]).length>0 && (product.variants||[]).every(v=>Number(v?.inventory_quantity??0)===0)) ? 'out-of-stock' : 'ok'; totalBuildable = restTotal; }
 
         const increased = prevTotal == null ? false : totalBuildable > prevTotal;
         await setCurrTotal(pid, totalBuildable);
 
         const prevObj = await getStatus(pid);
-        const prevStatus = (prevObj?.current ?? extractStatusFromTags(tagsCSV)) || null;
+        const prevStatusStored = prevObj?.current || null;
+        const prevStatusFromTags = extractStatusFromTags(tagsCSV);
+        const prevStatus = prevStatusStored || prevStatusFromTags || null;
         await setStatus(pid, prevStatus, finalStatus);
 
-        await updateProductTags(pid, tagsCSV, finalStatus);
-        tagsUpdated++;
+        // Only PUT tags if status changed
+        if (prevStatusFromTags !== finalStatus) {
+          await updateProductTags(pid, tagsCSV, finalStatus);
+          tagsUpdated++;
+        }
 
-        if (verbose) console.log(`📊 ${title} — status=${finalStatus}; buildable=${totalBuildable} (prev=${prevTotal ?? 'n/a'}) redisDisabled=${redisDisabled}`);
+        if (verbose) console.log(`📊 ${title} — status=${finalStatus}; buildable=${totalBuildable} (prev=${prevTotal ?? 'n/a'})`);
 
-        // Notifications are skipped if redisDisabled (there’s nowhere to read/write subs)
         if (!redisDisabled) {
           const { merged: allSubs } = await getSubscribersForProduct({ id: pid, handle });
           const pending = allSubs.filter(s => !s?.notified);
-          const prevWasOk = (prevObj?.previous ?? extractStatusFromTags(tagsCSV)) === 'ok';
+          const prevWasOk = (prevObj?.previous ?? prevStatusFromTags) === 'ok';
           const shouldNotify = (finalStatus === 'ok') && pending.length > 0 && (!prevWasOk || increased);
           if (shouldNotify) {
-            const counts = await notifyPending({ allSubs, pending, pid, title, handle, isBundle: true });
+            const counts = await notifyPending({ allSubs, pending, pid, title, handle, isBundle:true });
             notificationsSent    += counts.notificationsSent;
             smsNotificationsSent += counts.smsNotificationsSent;
             notificationErrors   += counts.notificationErrors;
@@ -584,34 +459,19 @@ async function runCatalogSlice({ runId, verbose = false }) {
   }
 
   const pageConsumed = i >= products.length;
-  const nextCursor = pageConsumed
-    ? { ...cursor, pageUrl: page.nextUrl, nextIndex: 0 }
-    : { ...cursor, nextIndex: i };
-
+  const nextCursor = pageConsumed ? { ...cursor, pageUrl: page.nextUrl, nextIndex: 0 } : { ...cursor, nextIndex: i };
   await saveCursor(nextCursor);
 
   const done = pageConsumed && !page.nextUrl;
-  return {
-    done,
-    processed,
-    tagsUpdated,
-    notificationsSent,
-    smsNotificationsSent,
-    notificationErrors,
-    profileUpdates,
-    nextCursor: { ...nextCursor, runId },
-    sliceMs: Date.now() - t0,
-    redisDisabled,
-  };
+  return { done, processed, tagsUpdated, notificationsSent, smsNotificationsSent, notificationErrors, profileUpdates, nextCursor:{ ...nextCursor, runId }, sliceMs: Date.now()-t0, redisDisabled };
 }
 
 /* ----------------- GET handler ----------------- */
-export async function GET(req) {
+export async function GET(req){
   try {
     const url = new URL(req.url);
     const q = (k) => (url.searchParams.get(k) || '').toLowerCase();
 
-    // Self-test: don’t throw; show env + redis state
     if (q('action') === 'selftest') {
       const out = {
         env_ok: true,
@@ -622,7 +482,6 @@ export async function GET(req) {
         has_kv_url: !!ENV.KV_URL,
         has_kv_token: !!ENV.KV_TOKEN,
         redisDisabled,
-        reason: redisDisabled ? 'soft-disabled (limit or env switch)' : 'enabled',
       };
       if (!redisDisabled) {
         try { await getRedis().ping(); out.redis_ping = 'ok'; }
@@ -635,10 +494,9 @@ export async function GET(req) {
     if (!authed) return unauthorized();
 
     const verbose = ['1','true','yes'].includes(q('verbose'));
-    const loop    = (!redisDisabled) && ['1','true','yes'].includes(q('loop')); // don’t loop if redis is off
-    const action  = q('action');
+    const loop = (!redisDisabled) && ['1','true','yes'].includes(q('loop'));
+    const action = q('action');
 
-    // runId selection
     let runId = url.searchParams.get('runId');
     if (!runId) {
       const cur = await RGET(CURSOR_KEY);
@@ -653,18 +511,18 @@ export async function GET(req) {
     }
 
     const ok = await acquireOrValidateLock(runId);
-    if (!ok) return NextResponse.json({ success: false, error: 'audit already running' }, { status: 423 });
+    if (!ok) return NextResponse.json({ success:false, error:'audit already running' }, { status:423 });
 
     try {
       const slice = await runCatalogSlice({ runId, verbose });
 
       if (!slice.done && loop) {
         const resumeUrl = new URL(req.url);
-        resumeUrl.searchParams.set('loop', '1');
+        resumeUrl.searchParams.set('loop','1');
         resumeUrl.searchParams.set('runId', runId);
-        if (verbose) resumeUrl.searchParams.set('verbose', '1');
-        const headers = ENV.CRON_SECRET ? { authorization: `Bearer ${ENV.CRON_SECRET}` } : undefined;
-        after(() => fetch(resumeUrl.toString(), { cache: 'no-store', headers }).catch(() => {}));
+        if (verbose) resumeUrl.searchParams.set('verbose','1');
+        const headers = ENV.CRON_SECRET ? { authorization:`Bearer ${ENV.CRON_SECRET}` } : undefined;
+        after(() => fetch(resumeUrl.toString(), { cache:'no-store', headers }).catch(() => {}));
         await REXPIRE(LOCK_KEY, LOCK_TTL_SECONDS);
       } else if (slice.done) {
         await clearCursor();
@@ -674,7 +532,7 @@ export async function GET(req) {
       }
 
       return NextResponse.json({
-        success: true,
+        success:true,
         runId,
         done: slice.done,
         processedInThisSlice: slice.processed,
@@ -686,15 +544,14 @@ export async function GET(req) {
         sliceMs: slice.sliceMs,
         nextCursor: slice.nextCursor,
         redisDisabled: slice.redisDisabled,
-        message: slice.done
-          ? 'Catalog sweep complete'
+        message: slice.done ? 'Catalog sweep complete'
           : (loop ? 'Slice complete; another slice scheduled' : 'Slice complete; call again to resume'),
       });
     } catch (e) {
       await releaseLock(runId);
-      return NextResponse.json({ success: false, error: e?.message || String(e) }, { status: 500 });
+      return NextResponse.json({ success:false, error: e?.message || String(e) }, { status:500 });
     }
   } catch (fatal) {
-    return NextResponse.json({ success: false, error: fatal?.message || String(fatal) }, { status: 500 });
+    return NextResponse.json({ success:false, error: fatal?.message || String(fatal) }, { status:500 });
   }
 }
