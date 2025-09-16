@@ -18,7 +18,7 @@ const ENV = {
   KV_TOKEN:            process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN || '',
   SOFT_DISABLE_REDIS:  (process.env.SOFT_DISABLE_REDIS || '') === '1',
   SHOPIFY_API_VERSION: process.env.SHOPIFY_API_VERSION || '2025-01',
-  SHOPIFY_THROTTLE_MS: Number(process.env.SHOPIFY_THROTTLE_MS || 800), // ← safer than 500
+  SHOPIFY_THROTTLE_MS: Number(process.env.SHOPIFY_THROTTLE_MS || 800),
   TIME_BUDGET_MS:      Number(process.env.TIME_BUDGET_MS || 240000),
 };
 
@@ -99,7 +99,7 @@ function toE164(raw){
   return null;
 }
 
-/* ----------------- Klaviyo (unchanged) ----------------- */
+/* ----------------- Klaviyo ----------------- */
 async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
   if (!ENV.KLAVIYO_API_KEY) throw new Error('KLAVIYO_API_KEY missing');
   if (!listId) throw new Error('listId missing');
@@ -148,9 +148,9 @@ async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }) {
   return { ok:true, status:res.status, body:txt };
 }
 
-/* ----------------- Shopify helpers with safer throttling ----------------- */
+/* ----------------- Shopify helpers (throttle + backoff) ----------------- */
 let lastApiCall = 0;
-function jitter(ms){ return ms + Math.floor(Math.random()*120); } // avoid alignment
+function jitter(ms){ return ms + Math.floor(Math.random()*120); }
 async function rateLimitedDelay(){
   const now = Date.now();
   const dt = now - lastApiCall;
@@ -269,7 +269,7 @@ async function setSubscribersForProduct(prod, subs){
   ]);
 }
 
-/* ----------------- Native bundle status (GraphQL) ----------------- */
+/* ----------------- Component-based bundle status (GraphQL) ----------------- */
 async function getBundleStatusFromGraphQL(productId){
   const query = `
     query ProductBundles($id: ID!, $vv: Int!, $cp: Int!) {
@@ -300,71 +300,40 @@ async function getBundleStatusFromGraphQL(productId){
   const data = await fetchShopifyGQL(query, { id: gid, vv: 100, cp: 50 });
   const edges = data?.product?.variants?.edges || [];
   const variantResults = [];
+
   for (const e of edges) {
-    const v = e?.node;
-    const comps = v?.productVariantComponents?.nodes || [];
+    const comps = e?.node?.productVariantComponents?.nodes || [];
     if (!comps.length) continue;
-    let anyZero=false, anyInsufficient=false, minBuildable=Infinity;
+
+    let anyZeroOrNeg = false;
+    let anyInsufficient = false;
+    let minBuildable = Infinity;
+
     for (const c of comps) {
-      const have = Number(c?.productVariant?.sellableOnlineQuantity ?? 0);
-      const need = Math.max(1, Number(c?.quantity ?? 1));
-      if (have <= 0) anyZero = true;
-      else if (have < need) anyInsufficient = true;
-      minBuildable = Math.min(minBuildable, Math.floor(have/need));
+      const rawHave = Number(c?.productVariant?.sellableOnlineQuantity ?? 0);
+      const have = Math.max(0, rawHave);                  // clamp negatives to 0
+      const need = Math.max(1, Number(c?.quantity ?? 1)); // at least 1 per component
+
+      if (have <= 0) anyZeroOrNeg = true;                 // ≤ 0 -> OOS
+      else if (have < need) anyInsufficient = true;       // (0, need) -> understocked
+
+      minBuildable = Math.min(minBuildable, Math.floor(have / need));
     }
-    const buildable = Number.isFinite(minBuildable) ? minBuildable : 0;
-    const status = anyZero ? 'out-of-stock' : (anyInsufficient ? 'understocked' : 'ok');
+
+    const buildable = Number.isFinite(minBuildable) ? Math.max(0, minBuildable) : 0;
+    const status = anyZeroOrNeg ? 'out-of-stock' : (anyInsufficient ? 'understocked' : 'ok');
     variantResults.push({ buildable, status });
   }
-  if (!variantResults.length) return { ok:false, variantResults:[], totalBuildable:0, finalStatus:null };
-  let finalStatus='ok', totalBuildable=0;
-  for (const r of variantResults){ finalStatus = worstStatus(finalStatus, r.status); totalBuildable += Number(r.buildable||0); }
-  return { ok:true, variantResults, totalBuildable, finalStatus };
-}
 
-/* ----------------- Notify (skips when redis disabled) ----------------- */
-async function notifyPending({ allSubs, pending, pid, title, handle, isBundle }){
-  if (redisDisabled) return { notificationsSent:0, smsNotificationsSent:0, notificationErrors:0, profileUpdates:0 };
-  let notificationsSent=0, smsNotificationsSent=0, notificationErrors=0, profileUpdates=0;
-  const productUrl = productUrlFrom(handle);
-  let processed=0;
-  for (const sub of pending) {
-    try {
-      const phoneE164 = toE164(sub.phone||'');
-      const smsConsent = !!sub.sms_consent && !!phoneE164;
-      await subscribeProfilesToList({ listId:String(ENV.ALERT_LIST_ID), email:sub.email, phoneE164, sms:smsConsent });
-      const stampedTitle = sub.product_title || title || 'Unknown Product';
-      const stampedHandle = sub.product_handle || handle || '';
-      const stampedUrl = sub.product_url || productUrlFrom(stampedHandle) || productUrl;
-      const related_section_url = stampedUrl ? `${stampedUrl}#after-bis` : '';
-      try{
-        const out = await updateProfileProperties({
-          email: sub.email,
-          properties: {
-            last_back_in_stock_product_name: stampedTitle,
-            last_back_in_stock_product_url: stampedUrl,
-            last_back_in_stock_related_section_url: related_section_url,
-            last_back_in_stock_product_handle: stampedHandle,
-            last_back_in_stock_product_id: String(pid),
-            last_back_in_stock_notified_at: new Date().toISOString(),
-          },
-        });
-        if (out.ok) profileUpdates++;
-      }catch{}
-      await trackKlaviyoEvent({
-        metricName:'Back in Stock',
-        email: sub.email,
-        phoneE164,
-        properties:{ product_id:String(pid), product_title:stampedTitle, product_handle:stampedHandle, product_url:stampedUrl, related_section_url, sms_consent:!!smsConsent, source: isBundle ? 'bundle audit (native components)' : 'catalog slice' },
-      });
-      sub.notified = true;
-      notificationsSent++;
-      if (smsConsent) smsNotificationsSent++;
-      if (++processed % 5 === 0) await new Promise(r => setTimeout(r, 250));
-    }catch{ notificationErrors++; }
+  if (!variantResults.length) return { ok:false, variantResults:[], totalBuildable:0, finalStatus:null };
+
+  let finalStatus = 'ok';
+  let totalBuildable = 0;
+  for (const r of variantResults) {
+    totalBuildable += r.buildable;
+    finalStatus = worstStatus(finalStatus, r.status);
   }
-  await setSubscribersForProduct({ id:pid, handle }, allSubs);
-  return { notificationsSent, smsNotificationsSent, notificationErrors, profileUpdates };
+  return { ok:true, variantResults, totalBuildable, finalStatus };
 }
 
 /* ----------------- Cursor (no-op if redis disabled) ----------------- */
@@ -410,30 +379,36 @@ async function runCatalogSlice({ runId, verbose=false }){
       const isBundle = hasBundleTag(tagsCSV);
 
       if (isBundle) {
-        const restTotal = (product.variants || []).reduce((acc,v)=>acc+Number(v?.inventory_quantity??0),0);
+        // REST total is only a fallback; clamp to avoid negatives
+        const restTotal = (product.variants || []).reduce(
+          (acc, v) => acc + Math.max(0, Number(v?.inventory_quantity ?? 0)),
+          0
+        );
         const prevTotal = await getPrevTotal(pid);
 
         let finalStatus=null, totalBuildable=0;
         const summary = await getBundleStatusFromGraphQL(pid);
         if (summary.ok){ finalStatus = summary.finalStatus; totalBuildable = Number(summary.totalBuildable||0); }
-        else { finalStatus = ((product.variants||[]).length>0 && (product.variants||[]).every(v=>Number(v?.inventory_quantity??0)===0)) ? 'out-of-stock' : 'ok'; totalBuildable = restTotal; }
+        else {
+          // If GraphQL not available, treat any all-zeros as OOS; otherwise OK.
+          finalStatus = ((product.variants||[]).length>0 && (product.variants||[]).every(v=>Math.max(0, Number(v?.inventory_quantity??0))===0)) ? 'out-of-stock' : 'ok';
+          totalBuildable = restTotal;
+        }
 
         const increased = prevTotal == null ? false : totalBuildable > prevTotal;
         await setCurrTotal(pid, totalBuildable);
 
         const prevObj = await getStatus(pid);
-        const prevStatusStored = prevObj?.current || null;
         const prevStatusFromTags = extractStatusFromTags(tagsCSV);
-        const prevStatus = prevStatusStored || prevStatusFromTags || null;
+        const prevStatus = prevObj?.current || prevStatusFromTags || null;
         await setStatus(pid, prevStatus, finalStatus);
 
-        // Only PUT tags if status changed
         if (prevStatusFromTags !== finalStatus) {
           await updateProductTags(pid, tagsCSV, finalStatus);
           tagsUpdated++;
         }
 
-        if (verbose) console.log(`📊 ${title} — status=${finalStatus}; buildable=${totalBuildable} (prev=${prevTotal ?? 'n/a'})`);
+        if (verbose) console.log(`📦 ${title} — status=${finalStatus}; buildable=${totalBuildable} (prev=${prevTotal ?? 'n/a'})`);
 
         if (!redisDisabled) {
           const { merged: allSubs } = await getSubscribersForProduct({ id: pid, handle });
@@ -464,6 +439,51 @@ async function runCatalogSlice({ runId, verbose=false }){
 
   const done = pageConsumed && !page.nextUrl;
   return { done, processed, tagsUpdated, notificationsSent, smsNotificationsSent, notificationErrors, profileUpdates, nextCursor:{ ...nextCursor, runId }, sliceMs: Date.now()-t0, redisDisabled };
+}
+
+/* ----------------- Notify (skips when redis disabled) ----------------- */
+async function notifyPending({ allSubs, pending, pid, title, handle, isBundle }){
+  if (redisDisabled) return { notificationsSent:0, smsNotificationsSent:0, notificationErrors:0, profileUpdates:0 };
+  let notificationsSent=0, smsNotificationsSent=0, notificationErrors=0, profileUpdates=0;
+  const productUrl = productUrlFrom(handle);
+  let processed=0;
+  for (const sub of pending) {
+    try {
+      const phoneE164 = toE164(sub.phone||'');
+      const smsConsent = !!sub.sms_consent && !!phoneE164;
+      await subscribeProfilesToList({ listId:String(ENV.ALERT_LIST_ID), email:sub.email, phoneE164, sms:smsConsent });
+      const stampedTitle = sub.product_title || title || 'Unknown Product';
+      const stampedHandle = sub.product_handle || handle || '';
+      const stampedUrl = sub.product_url || productUrlFrom(stampedHandle) || productUrl;
+      const related_section_url = stampedUrl ? `${stampedUrl}#after-bis` : '';
+      try{
+        const out = await updateProfileProperties({
+          email: sub.email,
+          properties: {
+            last_back_in_stock_product_name: stampedTitle,
+            last_back_in_stock_product_url: stampedUrl,
+            last_back_in_stock_related_section_url: related_section_url,
+            last_back_in_stock_product_handle: stampedHandle,
+            last_back_in_stock_product_id: String(pid),
+            last_back_in_stock_notified_at: new Date().toISOString(),
+          },
+        });
+        if (out.ok) profileUpdates++;
+      }catch{}
+      await trackKlaviyoEvent({
+        metricName:'Back in Stock',
+        email: sub.email,
+        phoneE164,
+        properties:{ product_id:String(pid), product_title:stampedTitle, product_handle:stampedHandle, product_url:stampedUrl, related_section_url, sms_consent:!!smsConsent, source: isBundle ? 'bundle audit (native components)' : 'catalog slice' },
+      });
+      sub.notified = true;
+      notificationsSent++;
+      if (smsConsent) smsNotificationsSent++;
+      if (++processed % 5 === 0) await new Promise(r => setTimeout(r, 250));
+    }catch{ notificationErrors++; }
+  }
+  await setSubscribersForProduct({ id:pid, handle }, allSubs);
+  return { notificationsSent, smsNotificationsSent, notificationErrors, profileUpdates };
 }
 
 /* ----------------- GET handler ----------------- */
