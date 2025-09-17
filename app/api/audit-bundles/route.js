@@ -6,7 +6,7 @@ import { NextResponse, after } from 'next/server';
 import { Redis } from '@upstash/redis';
 import { randomUUID } from 'crypto';
 
-/* ----------------- Env ----------------- */
+/* ============================ Env ============================ */
 const ENV = {
   SHOPIFY_STORE:       process.env.SHOPIFY_STORE,
   ADMIN_API_TOKEN:     process.env.SHOPIFY_ADMIN_API_KEY,
@@ -14,6 +14,7 @@ const ENV = {
   ALERT_LIST_ID:       process.env.KLAVIYO_BACK_IN_STOCK_ALERT_LIST_ID,
   PUBLIC_STORE_DOMAIN: process.env.PUBLIC_STORE_DOMAIN || 'example.com',
   CRON_SECRET:         process.env.CRON_SECRET || '',
+  PUBLIC_PROBE_TOKEN:  process.env.PUBLIC_PROBE_TOKEN || '',
   KV_URL:              process.env.KV_REST_API_URL || process.env.KV_URL || process.env.REDIS_URL || '',
   KV_TOKEN:            process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN || '',
   SOFT_DISABLE_REDIS:  (process.env.SOFT_DISABLE_REDIS || '') === '1',
@@ -29,7 +30,7 @@ const LOCK_TTL_SECONDS = 15 * 60;
 const RANK = { ok: 0, understocked: 1, 'out-of-stock': 2 };
 const worstStatus = (a = 'ok', b = 'ok') => (RANK[a] >= RANK[b]) ? a : b;
 
-/* ----------------- Soft-robust Redis wrapper ----------------- */
+/* ====================== Soft-robust Redis ===================== */
 let _redis = null;
 let redisDisabled = ENV.SOFT_DISABLE_REDIS;
 
@@ -52,7 +53,7 @@ async function RDEL(k){ if (redisDisabled) return null; try{ return await getRed
 async function REXPIRE(k,s){ if (redisDisabled) return null; try{ return await getRedis().expire(k,s);}catch(e){ if(isUpstashLimitError(e)) redisDisabled=true; return null; } }
 async function RTTL(k){ if (redisDisabled) return -2; try{ return await getRedis().ttl(k);}catch(e){ if(isUpstashLimitError(e)) redisDisabled=true; return -2; } }
 
-/* ----------------- Auth helpers ----------------- */
+/* =========================== Auth ============================ */
 function unauthorized(){ return NextResponse.json({ success:false, error:'unauthorized' },{ status:401 }); }
 async function ensureCronAuth(req){
   if (req.headers.get('x-vercel-cron')) return true;
@@ -64,7 +65,7 @@ async function ensureCronAuth(req){
   return false;
 }
 
-/* ----------------- Lock (no-op if redis disabled) ----------------- */
+/* =========================== Lock ============================ */
 async function acquireOrValidateLock(runId){
   if (redisDisabled) return true;
   const holder = await RGET(LOCK_KEY);
@@ -77,7 +78,7 @@ async function acquireOrValidateLock(runId){
 }
 async function releaseLock(runId){ if (redisDisabled) return; const holder = await RGET(LOCK_KEY); if (holder === runId) await RDEL(LOCK_KEY); }
 
-/* ----------------- Utils ----------------- */
+/* =========================== Utils =========================== */
 const productUrlFrom = (handle) => (handle ? `https://${ENV.PUBLIC_STORE_DOMAIN}/products/${handle}` : '');
 function hasBundleTag(tagsStr){
   return String(tagsStr||'').split(',').map(t=>t.trim().toLowerCase()).includes('bundle');
@@ -99,7 +100,7 @@ function toE164(raw){
   return null;
 }
 
-/* ----------------- Klaviyo ----------------- */
+/* ========================= Klaviyo =========================== */
 async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
   if (!ENV.KLAVIYO_API_KEY) throw new Error('KLAVIYO_API_KEY missing');
   if (!listId) throw new Error('listId missing');
@@ -148,7 +149,7 @@ async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }) {
   return { ok:true, status:res.status, body:txt };
 }
 
-/* ----------------- Shopify helpers (throttle + backoff) ----------------- */
+/* ===================== Shopify helpers ======================= */
 let lastApiCall = 0;
 function jitter(ms){ return ms + Math.floor(Math.random()*120); }
 async function rateLimitedDelay(){
@@ -210,51 +211,6 @@ async function fetchShopifyGQL(query, variables={}){
   }
 }
 
-/* ----------------- Bundle ETA writer ----------------- */
-/** Writes or clears:
- *  - custom.bundle_next_ship_date   (type: date)
- *  - custom.bundle_next_ship_source (type: single_line_text_field)
- */
-async function setBundleNextShipDate(productGid, isoDateOrNull, source) {
-  if (!isoDateOrNull) {
-    // Fetch current metafield IDs to delete by ID
-    const q = `
-      query($id: ID!) {
-        product(id: $id) {
-          id
-          dateMf:  metafield(namespace:"custom", key:"bundle_next_ship_date")   { id }
-          srcMf:   metafield(namespace:"custom", key:"bundle_next_ship_source") { id }
-        }
-      }`;
-    const d = await fetchShopifyGQL(q, { id: productGid });
-    const ids = [d?.product?.dateMf?.id, d?.product?.srcMf?.id].filter(Boolean);
-    if (ids.length) {
-      const del = `
-        mutation($ids:[ID!]!) {
-          metafieldsDelete(ids:$ids) { deletedIds userErrors { field message } }
-        }`;
-      try { await fetchShopifyGQL(del, { ids }); } catch {}
-    }
-    return;
-  }
-
-  const dateOnly = isoDateOrNull.slice(0, 10); // type "date" needs YYYY-MM-DD
-  const srcText = source
-    ? `${source.handle || ''} | ${source.variantGid || ''} | ${dateOnly}`.trim()
-    : 'computed';
-
-  const m = `
-    mutation setBundleDate($owner: ID!, $date: String!, $source: String) {
-      metafieldsSet(metafields: [
-        { ownerId:$owner, namespace:"custom", key:"bundle_next_ship_date",  type:"date", value:$date },
-        { ownerId:$owner, namespace:"custom", key:"bundle_next_ship_source", type:"single_line_text_field", value:$source }
-      ]) {
-        userErrors { field message }
-      }
-    }`;
-  await fetchShopifyGQL(m, { owner: productGid, date: dateOnly, source: srcText });
-}
-
 function extractNextUrlFromLinkHeader(linkHeader){
   if (!linkHeader) return '';
   const parts = linkHeader.split(',');
@@ -281,13 +237,13 @@ async function updateProductTags(productId, currentTagsCSV, status){
   await fetchShopifyREST(`products/${productId}.json`, 'PUT', { product:{ id: productId, tags: cleaned.join(', ') } });
 }
 
-/* ----------------- Redis-backed helpers ----------------- */
+/* ===================== Redis helpers ========================= */
 async function getStatus(productId){ return (await RGET(`status:${productId}`)) || null; }
 async function setStatus(productId, prevStatus, currStatus){ await RSET(`status:${productId}`, { previous: prevStatus, current: currStatus }); }
 async function getPrevTotal(productId){ const v = await RGET(`inv_total:${productId}`); if (v==null) return null; const n = Number(v); return Number.isFinite(n)?n:null; }
 async function setCurrTotal(productId, total){ await RSET(`inv_total:${productId}`, total); }
 
-/* Waitlist subscribers (skips when redis disabled) */
+/* ================== Subscribers (Redis) ====================== */
 const emailKey = (e) => `email:${String(e||'').toLowerCase()}`;
 async function getSubscribersForProduct(prod){
   const keys = [`subscribers:${prod.id}`, `subscribers_handle:${prod.handle||''}`];
@@ -314,7 +270,7 @@ async function setSubscribersForProduct(prod, subs){
   ]);
 }
 
-/* ----------------- Component-based bundle status (GraphQL) ----------------- */
+/* ================== Bundle ETA summarizer ==================== */
 async function getBundleStatusFromGraphQL(productId){
   const query = `
     query ProductBundles($id: ID!, $vv: Int!, $cp: Int!) {
@@ -333,8 +289,8 @@ async function getBundleStatusFromGraphQL(productId){
                     availableForSale
                     inventoryPolicy
                     sellableOnlineQuantity
-                    metafield(namespace:"custom", key:"restock_date") { value }  # variant-level ETA
-                    product { handle }
+                    metafield(namespace:"custom", key:"restock_date") { value }
+                    product { handle metafield(namespace:"custom", key:"restock_date") { value } }
                   }
                 }
               }
@@ -345,15 +301,19 @@ async function getBundleStatusFromGraphQL(productId){
     }
   `;
   const gid = `gid://shopify/Product/${productId}`;
-  const data = await fetchShopifyGQL(query, { id: gid, vv: 100, cp: 100 });
-  const edges = data?.product?.variants?.edges || [];
-  const variantResults = [];
+  let data;
+  try { data = await fetchShopifyGQL(query, { id: gid, vv: 100, cp: 100 }); }
+  catch { return { ok:false, hasComponents:false, variantResults:[], totalBuildable:0, finalStatus:null, earliestISO:null, earliestSource:null }; }
 
+  const edges = data?.product?.variants?.edges || [];
+  let hasComponents = false;
+  const variantResults = [];
   let earliestISO = null;
   let earliestSource = null;
 
   for (const e of edges) {
     const comps = e?.node?.productVariantComponents?.nodes || [];
+    if (comps.length) hasComponents = true;
     if (!comps.length) continue;
 
     let anyZeroOrNeg = false;
@@ -361,20 +321,17 @@ async function getBundleStatusFromGraphQL(productId){
     let minBuildable = Infinity;
 
     for (const c of comps) {
-      const pv = c?.productVariant;
-      if (!pv) continue;
-
+      const pv = c?.productVariant; if (!pv) continue;
       const have = Math.max(0, Number(pv.sellableOnlineQuantity ?? 0));
       const need = Math.max(1, Number(c?.quantity ?? 1));
+      const policy = String(pv.inventoryPolicy || '').toUpperCase();
 
-      if (have <= 0) anyZeroOrNeg = true;
-      else if (have < need) anyInsufficient = true;
+      const isOOS = (pv.availableForSale === false) || (have <= 0 && (policy === 'DENY' || policy === 'CONTINUE'));
 
+      if (have <= 0) anyZeroOrNeg = true; else if (have < need) anyInsufficient = true;
       minBuildable = Math.min(minBuildable, Math.floor(have / need));
 
-      // Track earliest ETA among components that are effectively OOS/backorder
-      const isOOS = (pv.availableForSale === false) || (pv.inventoryPolicy === 'CONTINUE' && have <= 0);
-      const raw = pv.metafield?.value; // "YYYY-MM-DD" or ISO
+      const raw = pv.metafield?.value || pv.product?.metafield?.value || null;
       if (isOOS && raw) {
         const iso = raw.length === 10 ? `${raw}T00:00:00Z` : raw;
         if (!earliestISO || new Date(iso) < new Date(earliestISO)) {
@@ -390,24 +347,59 @@ async function getBundleStatusFromGraphQL(productId){
   }
 
   if (!variantResults.length) {
-    return { ok:false, variantResults:[], totalBuildable:0, finalStatus:null, earliestISO:null, earliestSource:null };
+    return { ok:true, hasComponents, variantResults:[], totalBuildable:0, finalStatus:'ok', earliestISO:null, earliestSource:null };
   }
 
   let finalStatus = 'ok';
   let totalBuildable = 0;
-  for (const r of variantResults) {
-    totalBuildable += r.buildable;
-    finalStatus = worstStatus(finalStatus, r.status);
-  }
-  return { ok:true, variantResults, totalBuildable, finalStatus, earliestISO, earliestSource };
+  for (const r of variantResults) { totalBuildable += r.buildable; finalStatus = worstStatus(finalStatus, r.status); }
+  return { ok:true, hasComponents, variantResults, totalBuildable, finalStatus, earliestISO, earliestSource };
 }
 
-/* ----------------- Cursor (no-op if redis disabled) ----------------- */
-async function loadCursor(runId){ if (redisDisabled) return { runId, pageUrl:'', nextIndex:0, startedAt:new Date().toISOString() }; const cur = await RGET(CURSOR_KEY); if (cur && cur.runId === runId) return cur; return { runId, pageUrl:'', nextIndex:0, startedAt:new Date().toISOString() }; }
-async function saveCursor(cursor){ if (redisDisabled) return; await RSET(CURSOR_KEY, cursor, { ex: 60*60 }); }
-async function clearCursor(){ if (redisDisabled) return; await RDEL(CURSOR_KEY); }
+/* ================== Bundle ETA writer ======================== */
+/** Writes or clears product metafields:
+ *  - custom.bundle_next_ship_date   (type: date)
+ *  - custom.bundle_next_ship_source (single_line_text_field)
+ */
+async function setBundleNextShipDate(productGid, isoDateOrNull, source) {
+  if (!isoDateOrNull) {
+    // Delete both metafields if present
+    const q = `
+      query($id: ID!) {
+        product(id: $id) {
+          id
+          dateMf: metafield(namespace:"custom", key:"bundle_next_ship_date")   { id }
+          srcMf:  metafield(namespace:"custom", key:"bundle_next_ship_source") { id }
+        }
+      }`;
+    const d = await fetchShopifyGQL(q, { id: productGid });
+    const ids = [d?.product?.dateMf?.id, d?.product?.srcMf?.id].filter(Boolean);
+    if (ids.length) {
+      const del = `
+        mutation($ids:[ID!]!) {
+          metafieldsDelete(ids:$ids) { deletedIds userErrors { field message } }
+        }`;
+      try { await fetchShopifyGQL(del, { ids }); } catch {}
+    }
+    return;
+  }
 
-/* ----------------- Time-bounded catalog slice ----------------- */
+  const dateOnly = isoDateOrNull.slice(0, 10); // metafield type "date" needs YYYY-MM-DD
+  const srcText = source ? `${source.handle || ''} | ${source.variantGid || ''} | ${dateOnly}`.trim() : 'computed';
+
+  const m = `
+    mutation setBundleDate($owner: ID!, $date: String!, $source: String) {
+      metafieldsSet(metafields: [
+        { ownerId:$owner, namespace:"custom", key:"bundle_next_ship_date",  type:"date", value:$date },
+        { ownerId:$owner, namespace:"custom", key:"bundle_next_ship_source", type:"single_line_text_field", value:$source }
+      ]) {
+        userErrors { field message }
+      }
+    }`;
+  await fetchShopifyGQL(m, { owner: productGid, date: dateOnly, source: srcText });
+}
+
+/* ==================== Catalog slice ========================== */
 async function runCatalogSlice({ runId, verbose=false }){
   if (!ENV.SHOPIFY_STORE) throw new Error('Missing env: SHOPIFY_STORE');
   if (!ENV.ADMIN_API_TOKEN) throw new Error('Missing env: SHOPIFY_ADMIN_API_KEY');
@@ -442,33 +434,30 @@ async function runCatalogSlice({ runId, verbose=false }){
       const title = product.title;
       const handle = product.handle;
       const tagsCSV = String(product.tags || '');
-      const isBundle = hasBundleTag(tagsCSV);
+      const bundleTagged = hasBundleTag(tagsCSV);
 
-      if (isBundle) {
-        // REST total is only a fallback; clamp to avoid negatives
-        const restTotal = (product.variants || []).reduce(
-          (acc, v) => acc + Math.max(0, Number(v?.inventory_quantity ?? 0)),
-          0
-        );
+      // Always try to summarize via GraphQL; tells us if it's a native bundle
+      const summary = await getBundleStatusFromGraphQL(pid);
+      const isNativeBundle = !!summary.ok && !!summary.hasComponents;
+      const treatAsBundle = bundleTagged || isNativeBundle;
+
+      if (treatAsBundle) {
+        // REST fallback for totals (clamped)
+        const restTotal = (product.variants || []).reduce((acc, v) => acc + Math.max(0, Number(v?.inventory_quantity ?? 0)), 0);
         const prevTotal = await getPrevTotal(pid);
 
         let finalStatus=null, totalBuildable=0;
-        const summary = await getBundleStatusFromGraphQL(pid);
         if (summary.ok){ finalStatus = summary.finalStatus; totalBuildable = Number(summary.totalBuildable||0); }
         else {
-          // If GraphQL not available, treat any all-zeros as OOS; otherwise OK.
           finalStatus = ((product.variants||[]).length>0 && (product.variants||[]).every(v=>Math.max(0, Number(v?.inventory_quantity??0))===0)) ? 'out-of-stock' : 'ok';
           totalBuildable = restTotal;
         }
 
-        // ✅ NEW: persist earliest bundle ETA as a product metafield
+        // Persist earliest ETA metafield ONLY when truly out-of-stock
         try {
           const productGid = `gid://shopify/Product/${pid}`;
-          await setBundleNextShipDate(
-            productGid,
-            summary.ok ? (summary.earliestISO || null) : null,
-            summary.earliestSource || undefined
-          );
+          const iso = (finalStatus === 'out-of-stock' && summary.ok && summary.earliestISO) ? summary.earliestISO : null;
+          await setBundleNextShipDate(productGid, iso, summary.earliestSource || undefined);
         } catch (e) {
           console.error(`bundle_next_ship_date set failed for ${title} (${pid})`, e?.message || e);
         }
@@ -481,7 +470,8 @@ async function runCatalogSlice({ runId, verbose=false }){
         const prevStatus = prevObj?.current || prevStatusFromTags || null;
         await setStatus(pid, prevStatus, finalStatus);
 
-        if (prevStatusFromTags !== finalStatus) {
+        // Only mutate tags if product is explicitly tagged as bundle
+        if (bundleTagged && prevStatusFromTags !== finalStatus) {
           await updateProductTags(pid, tagsCSV, finalStatus);
           tagsUpdated++;
         }
@@ -519,7 +509,7 @@ async function runCatalogSlice({ runId, verbose=false }){
   return { done, processed, tagsUpdated, notificationsSent, smsNotificationsSent, notificationErrors, profileUpdates, nextCursor:{ ...nextCursor, runId }, sliceMs: Date.now()-t0, redisDisabled };
 }
 
-/* ----------------- Notify (skips when redis disabled) ----------------- */
+/* =================== Notify (Klaviyo) ======================== */
 async function notifyPending({ allSubs, pending, pid, title, handle, isBundle }){
   if (redisDisabled) return { notificationsSent:0, smsNotificationsSent:0, notificationErrors:0, profileUpdates:0 };
   let notificationsSent=0, smsNotificationsSent=0, notificationErrors=0, profileUpdates=0;
@@ -564,12 +554,44 @@ async function notifyPending({ allSubs, pending, pid, title, handle, isBundle })
   return { notificationsSent, smsNotificationsSent, notificationErrors, profileUpdates };
 }
 
-/* ----------------- GET handler ----------------- */
+/* ========================= Cursor ============================ */
+async function loadCursor(runId){ if (redisDisabled) return { runId, pageUrl:'', nextIndex:0, startedAt:new Date().toISOString() }; const cur = await RGET(CURSOR_KEY); if (cur && cur.runId === runId) return cur; return { runId, pageUrl:'', nextIndex:0, startedAt:new Date().toISOString() }; }
+async function saveCursor(cursor){ if (redisDisabled) return; await RSET(CURSOR_KEY, cursor, { ex: 60*60 }); }
+async function clearCursor(){ if (redisDisabled) return; await RDEL(CURSOR_KEY); }
+
+/* ========================= GET =============================== */
 export async function GET(req){
   try {
     const url = new URL(req.url);
     const q = (k) => (url.searchParams.get(k) || '').toLowerCase();
 
+    /* ---- Public probe (read-only, no admin writes) ---- */
+    if (q('action') === 'probe_public') {
+      const token = url.searchParams.get('token') || '';
+      if (ENV.PUBLIC_PROBE_TOKEN && token !== ENV.PUBLIC_PROBE_TOKEN) {
+        return NextResponse.json({ error: 'unauthorized' }, { status: 401 });
+      }
+      const handle = url.searchParams.get('handle');
+      if (!handle) return NextResponse.json({ error: 'missing handle' }, { status: 400 });
+
+      const lookup = await fetchShopifyGQL(`query($h:String!){ productByHandle(handle:$h){ id handle } }`, { h: handle });
+      const gid = lookup?.productByHandle?.id;
+      if (!gid) return NextResponse.json({ error: 'not_found' }, { status: 404 });
+      const pid = Number(String(gid).split('/').pop());
+
+      const summary = await getBundleStatusFromGraphQL(pid);
+      const payload = {
+        handle,
+        hasComponents: !!summary?.hasComponents,
+        finalStatus: summary?.finalStatus || null,
+        earliestISO: summary?.earliestISO || null,
+        earliestPretty: summary?.earliestISO ? new Date(summary.earliestISO).toISOString().slice(0,10) : null,
+        source: summary?.earliestSource || null
+      };
+      return NextResponse.json(payload);
+    }
+
+    /* ---- Self test ---- */
     if (q('action') === 'selftest') {
       const out = {
         env_ok: true,
@@ -588,24 +610,26 @@ export async function GET(req){
       return NextResponse.json(out);
     }
 
+    /* ---- Status ---- */
+    if (q('action') === 'status') {
+      const ttl = await RTTL(LOCK_KEY);
+      const holder = await RGET(LOCK_KEY);
+      const cursor = await RGET(CURSOR_KEY);
+      return NextResponse.json({ locked: ttl > 0, ttl, holder, cursor, redisDisabled });
+    }
+
+    /* ---- Auth for mutating runs ---- */
     const authed = await ensureCronAuth(req);
     if (!authed) return unauthorized();
 
+    /* ---- Slice run ---- */
     const verbose = ['1','true','yes'].includes(q('verbose'));
     const loop = (!redisDisabled) && ['1','true','yes'].includes(q('loop'));
-    const action = q('action');
 
     let runId = url.searchParams.get('runId');
     if (!runId) {
       const cur = await RGET(CURSOR_KEY);
       runId = cur?.runId || randomUUID();
-    }
-
-    if (action === 'status') {
-      const ttl = await RTTL(LOCK_KEY);
-      const holder = await RGET(LOCK_KEY);
-      const cursor = await RGET(CURSOR_KEY);
-      return NextResponse.json({ locked: ttl > 0, ttl, holder, cursor, redisDisabled });
     }
 
     const ok = await acquireOrValidateLock(runId);
