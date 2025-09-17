@@ -210,6 +210,51 @@ async function fetchShopifyGQL(query, variables={}){
   }
 }
 
+/* ----------------- Bundle ETA writer ----------------- */
+/** Writes or clears:
+ *  - custom.bundle_next_ship_date   (type: date)
+ *  - custom.bundle_next_ship_source (type: single_line_text_field)
+ */
+async function setBundleNextShipDate(productGid, isoDateOrNull, source) {
+  if (!isoDateOrNull) {
+    // Fetch current metafield IDs to delete by ID
+    const q = `
+      query($id: ID!) {
+        product(id: $id) {
+          id
+          dateMf:  metafield(namespace:"custom", key:"bundle_next_ship_date")   { id }
+          srcMf:   metafield(namespace:"custom", key:"bundle_next_ship_source") { id }
+        }
+      }`;
+    const d = await fetchShopifyGQL(q, { id: productGid });
+    const ids = [d?.product?.dateMf?.id, d?.product?.srcMf?.id].filter(Boolean);
+    if (ids.length) {
+      const del = `
+        mutation($ids:[ID!]!) {
+          metafieldsDelete(ids:$ids) { deletedIds userErrors { field message } }
+        }`;
+      try { await fetchShopifyGQL(del, { ids }); } catch {}
+    }
+    return;
+  }
+
+  const dateOnly = isoDateOrNull.slice(0, 10); // type "date" needs YYYY-MM-DD
+  const srcText = source
+    ? `${source.handle || ''} | ${source.variantGid || ''} | ${dateOnly}`.trim()
+    : 'computed';
+
+  const m = `
+    mutation setBundleDate($owner: ID!, $date: String!, $source: String) {
+      metafieldsSet(metafields: [
+        { ownerId:$owner, namespace:"custom", key:"bundle_next_ship_date",  type:"date", value:$date },
+        { ownerId:$owner, namespace:"custom", key:"bundle_next_ship_source", type:"single_line_text_field", value:$source }
+      ]) {
+        userErrors { field message }
+      }
+    }`;
+  await fetchShopifyGQL(m, { owner: productGid, date: dateOnly, source: srcText });
+}
+
 function extractNextUrlFromLinkHeader(linkHeader){
   if (!linkHeader) return '';
   const parts = linkHeader.split(',');
@@ -285,7 +330,10 @@ async function getBundleStatusFromGraphQL(productId){
                   quantity
                   productVariant {
                     id
+                    availableForSale
+                    inventoryPolicy
                     sellableOnlineQuantity
+                    metafield(namespace:"custom", key:"restock_date") { value }  # variant-level ETA
                     product { handle }
                   }
                 }
@@ -297,9 +345,12 @@ async function getBundleStatusFromGraphQL(productId){
     }
   `;
   const gid = `gid://shopify/Product/${productId}`;
-  const data = await fetchShopifyGQL(query, { id: gid, vv: 100, cp: 50 });
+  const data = await fetchShopifyGQL(query, { id: gid, vv: 100, cp: 100 });
   const edges = data?.product?.variants?.edges || [];
   const variantResults = [];
+
+  let earliestISO = null;
+  let earliestSource = null;
 
   for (const e of edges) {
     const comps = e?.node?.productVariantComponents?.nodes || [];
@@ -310,14 +361,27 @@ async function getBundleStatusFromGraphQL(productId){
     let minBuildable = Infinity;
 
     for (const c of comps) {
-      const rawHave = Number(c?.productVariant?.sellableOnlineQuantity ?? 0);
-      const have = Math.max(0, rawHave);                  // clamp negatives to 0
-      const need = Math.max(1, Number(c?.quantity ?? 1)); // at least 1 per component
+      const pv = c?.productVariant;
+      if (!pv) continue;
 
-      if (have <= 0) anyZeroOrNeg = true;                 // ≤ 0 -> OOS
-      else if (have < need) anyInsufficient = true;       // (0, need) -> understocked
+      const have = Math.max(0, Number(pv.sellableOnlineQuantity ?? 0));
+      const need = Math.max(1, Number(c?.quantity ?? 1));
+
+      if (have <= 0) anyZeroOrNeg = true;
+      else if (have < need) anyInsufficient = true;
 
       minBuildable = Math.min(minBuildable, Math.floor(have / need));
+
+      // Track earliest ETA among components that are effectively OOS/backorder
+      const isOOS = (pv.availableForSale === false) || (pv.inventoryPolicy === 'CONTINUE' && have <= 0);
+      const raw = pv.metafield?.value; // "YYYY-MM-DD" or ISO
+      if (isOOS && raw) {
+        const iso = raw.length === 10 ? `${raw}T00:00:00Z` : raw;
+        if (!earliestISO || new Date(iso) < new Date(earliestISO)) {
+          earliestISO = iso;
+          earliestSource = { handle: pv.product?.handle, variantGid: pv.id, date: iso };
+        }
+      }
     }
 
     const buildable = Number.isFinite(minBuildable) ? Math.max(0, minBuildable) : 0;
@@ -325,7 +389,9 @@ async function getBundleStatusFromGraphQL(productId){
     variantResults.push({ buildable, status });
   }
 
-  if (!variantResults.length) return { ok:false, variantResults:[], totalBuildable:0, finalStatus:null };
+  if (!variantResults.length) {
+    return { ok:false, variantResults:[], totalBuildable:0, finalStatus:null, earliestISO:null, earliestSource:null };
+  }
 
   let finalStatus = 'ok';
   let totalBuildable = 0;
@@ -333,7 +399,7 @@ async function getBundleStatusFromGraphQL(productId){
     totalBuildable += r.buildable;
     finalStatus = worstStatus(finalStatus, r.status);
   }
-  return { ok:true, variantResults, totalBuildable, finalStatus };
+  return { ok:true, variantResults, totalBuildable, finalStatus, earliestISO, earliestSource };
 }
 
 /* ----------------- Cursor (no-op if redis disabled) ----------------- */
@@ -393,6 +459,18 @@ async function runCatalogSlice({ runId, verbose=false }){
           // If GraphQL not available, treat any all-zeros as OOS; otherwise OK.
           finalStatus = ((product.variants||[]).length>0 && (product.variants||[]).every(v=>Math.max(0, Number(v?.inventory_quantity??0))===0)) ? 'out-of-stock' : 'ok';
           totalBuildable = restTotal;
+        }
+
+        // ✅ NEW: persist earliest bundle ETA as a product metafield
+        try {
+          const productGid = `gid://shopify/Product/${pid}`;
+          await setBundleNextShipDate(
+            productGid,
+            summary.ok ? (summary.earliestISO || null) : null,
+            summary.earliestSource || undefined
+          );
+        } catch (e) {
+          console.error(`bundle_next_ship_date set failed for ${title} (${pid})`, e?.message || e);
         }
 
         const increased = prevTotal == null ? false : totalBuildable > prevTotal;
