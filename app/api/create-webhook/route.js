@@ -1,8 +1,4 @@
 // app/api/create-webhook/route.js
-// Read-only endpoint: earliest component date for native Shopify bundles
-// Uses variant/product metafield custom.restock_date
-// CORS + 429 backoff + handle OR id support
-
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 export const maxDuration = 300;
@@ -10,11 +6,11 @@ export const maxDuration = 300;
 import { NextResponse } from 'next/server';
 
 const ENV = {
-  SHOPIFY_STORE:        process.env.SHOPIFY_STORE,            // e.g. yourstore.myshopify.com
-  ADMIN_API_TOKEN:      process.env.SHOPIFY_ADMIN_API_KEY,    // Admin API token
-  SHOPIFY_API_VERSION:  process.env.SHOPIFY_API_VERSION || '2025-01',
-  PUBLIC_PROBE_TOKEN:   process.env.PUBLIC_PROBE_TOKEN || '',  // optional gate
-  PUBLIC_STORE_DOMAIN:  process.env.PUBLIC_STORE_DOMAIN || '', // e.g. yourstore.myshopify.com or custom domain
+  SHOPIFY_STORE:        process.env.SHOPIFY_STORE || '',
+  ADMIN_API_TOKEN:      process.env.SHOPIFY_ADMIN_API_KEY || '',
+  SHOPIFY_API_VERSION:  process.env.SHOPIFY_API_VERSION || '2025-07', // pick a known-good
+  PUBLIC_PROBE_TOKEN:   process.env.PUBLIC_PROBE_TOKEN || '',
+  PUBLIC_STORE_DOMAIN:  process.env.PUBLIC_STORE_DOMAIN || '', // your storefront host for CORS
 };
 
 /* ------------------------------- CORS ------------------------------- */
@@ -27,7 +23,6 @@ function corsHeaders(originHeader) {
     'Access-Control-Allow-Methods': 'GET,OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Max-Age': '86400',
-    // tiny CDN cache to soften bursts; adjust if you want
     'Cache-Control': 'public, s-maxage=60, stale-while-revalidate=300',
   };
 }
@@ -35,12 +30,23 @@ export async function OPTIONS(req) {
   return new NextResponse(null, { status: 204, headers: corsHeaders(req.headers.get('origin')) });
 }
 
+/* --------------------- Store domain normalization -------------------- */
+function normalizeMyShopifyDomain(v) {
+  if (!v) return '';
+  let s = String(v).trim();
+  s = s.replace(/^https?:\/\//, ''); // drop protocol
+  s = s.replace(/\/.*$/, '');        // drop any path
+  return s;
+}
+function adminGraphqlUrl() {
+  const host = normalizeMyShopifyDomain(ENV.SHOPIFY_STORE);
+  return `https://${host}/admin/api/${ENV.SHOPIFY_API_VERSION}/graphql.json`;
+}
+
 /* ------------------------- Shopify Admin GQL ------------------------ */
 async function fetchShopifyGQLRetry(query, variables = {}, maxAttempts = 3) {
-  if (!ENV.SHOPIFY_STORE || !ENV.ADMIN_API_TOKEN) {
-    throw new Error('Missing SHOPIFY_STORE or SHOPIFY_ADMIN_API_KEY');
-  }
-  const url = `https://${ENV.SHOPIFY_STORE}/admin/api/${ENV.SHOPIFY_API_VERSION}/graphql.json`;
+  const url = adminGraphqlUrl();
+  if (!ENV.ADMIN_API_TOKEN) throw new Error('Missing SHOPIFY_ADMIN_API_KEY');
   let attempt = 0;
   while (true) {
     const res = await fetch(url, {
@@ -63,7 +69,6 @@ async function fetchShopifyGQLRetry(query, variables = {}, maxAttempts = 3) {
       attempt++;
       continue;
     }
-
     throw new Error(`Shopify GraphQL: ${res.status} ${res.statusText} :: ${JSON.stringify(json.errors || json)}`);
   }
 }
@@ -112,7 +117,6 @@ const Q_BY_HANDLE = `
     }
   }
 `;
-
 const Q_BY_ID = `
   query ProductBundlesById($id:ID!, $vv:Int!, $cp:Int!) {
     product(id:$id) {
@@ -143,15 +147,6 @@ const Q_BY_ID = `
 `;
 
 /* -------------------- Summarizer (native bundles) ------------------- */
-async function getBundleSummaryByHandle(handle) {
-  const data = await fetchShopifyGQLRetry(Q_BY_HANDLE, { handle, vv:100, cp:100 });
-  return summarize(data?.productByHandle);
-}
-async function getBundleSummaryById(productId) {
-  const gid = `gid://shopify/Product/${productId}`;
-  const data = await fetchShopifyGQLRetry(Q_BY_ID, { id: gid, vv:100, cp:100 });
-  return summarize(data?.product);
-}
 function summarize(prod) {
   const edges = prod?.variants?.edges || [];
   let hasComponents = false;
@@ -174,7 +169,7 @@ function summarize(prod) {
       const have = Math.max(0, Number(pv.sellableOnlineQuantity ?? 0));
       const need = Math.max(1, Number(c?.quantity ?? 1));
       const policy = String(pv.inventoryPolicy || '').toUpperCase();
-      const isOOS = (pv.availableForSale === false) || (have <= 0 && (policy === 'DENY' || policy === 'CONTINUE'));
+      const isOOS = (pv.availableForSale === false) || (have <= 0 && (policy === 'DENY' || 'CONTINUE'));
       const isConstraining = isOOS || (have < need);
 
       if (have <= 0) anyZeroOrNeg = true; else if (have < need) anyInsufficient = true;
@@ -206,11 +201,22 @@ function summarize(prod) {
   return { ok:true, hasComponents, finalStatus, totalBuildable, earliestISO: chosenISO, earliestSource: chosenSource };
 }
 
+async function getBundleSummaryByHandle(handle) {
+  const data = await fetchShopifyGQLRetry(Q_BY_HANDLE, { handle, vv:100, cp:100 });
+  return summarize(data?.productByHandle);
+}
+async function getBundleSummaryById(productId) {
+  const gid = `gid://shopify/Product/${productId}`;
+  const data = await fetchShopifyGQLRetry(Q_BY_ID, { id: gid, vv:100, cp:100 });
+  return summarize(data?.product);
+}
+
 /* -------------------------------- GET ------------------------------- */
 export async function GET(req) {
   const headers = corsHeaders(req.headers.get('origin'));
   try {
     const url = new URL(req.url);
+    const action = (url.searchParams.get('action') || '').trim();
     const handle = (url.searchParams.get('handle') || '').trim();
     const idParam = (url.searchParams.get('id') || '').trim();
     const token  = (url.searchParams.get('token') || '').trim();
@@ -218,12 +224,39 @@ export async function GET(req) {
     if (ENV.PUBLIC_PROBE_TOKEN && token !== ENV.PUBLIC_PROBE_TOKEN) {
       return NextResponse.json({ error:'unauthorized' }, { status:401, headers });
     }
+
+    // DIAGNOSTIC MODE: /api/create-webhook?action=diag
+    if (action === 'diag') {
+      const host = normalizeMyShopifyDomain(ENV.SHOPIFY_STORE);
+      const urlUsed = `https://${host}/admin/api/${ENV.SHOPIFY_API_VERSION}/graphql.json`;
+      // Try a minimal query to confirm auth + URL
+      let ping = null, err = null;
+      try {
+        const data = await fetchShopifyGQLRetry(`query{ shop { id name } }`, {});
+        ping = data?.shop || null;
+      } catch (e) {
+        err = String(e?.message || e);
+      }
+      return NextResponse.json({
+        env: {
+          SHOPIFY_STORE_raw: ENV.SHOPIFY_STORE,
+          SHOPIFY_STORE_normalized: host,
+          SHOPIFY_API_VERSION: ENV.SHOPIFY_API_VERSION,
+          ADMIN_TOKEN_present: !!ENV.ADMIN_API_TOKEN,
+        },
+        urlUsed,
+        ping,
+        error: err,
+      }, { headers });
+    }
+
     if (!handle && !idParam) {
       return NextResponse.json({
         error:'missing handle or id',
         usage:[
           '/api/create-webhook?handle=<PRODUCT_HANDLE>[&token=...]',
-          '/api/create-webhook?id=<PRODUCT_ID>[&token=...]'
+          '/api/create-webhook?id=<PRODUCT_ID>[&token=...]',
+          '/api/create-webhook?action=diag[&token=...]'
         ]
       }, { status:400, headers });
     }
@@ -231,11 +264,11 @@ export async function GET(req) {
     let summary;
     if (handle) summary = await getBundleSummaryByHandle(handle);
     else {
-      const idNum = Number(idParam);
-      if (!Number.isFinite(idNum) || idNum <= 0) {
+      const n = Number(idParam);
+      if (!Number.isFinite(n) || n <= 0) {
         return NextResponse.json({ error:'bad id', usage:'/api/create-webhook?id=12345' }, { status:400, headers });
       }
-      summary = await getBundleSummaryById(idNum);
+      summary = await getBundleSummaryById(n);
     }
 
     const earliestPretty = summary.earliestISO ? new Date(summary.earliestISO).toISOString().slice(0,10) : null;
@@ -253,5 +286,5 @@ export async function GET(req) {
   }
 }
 
-// Keep your POST here if this route also creates webhooks:
+// Keep your webhook POST if needed:
 // export async function POST(req) { ... }
