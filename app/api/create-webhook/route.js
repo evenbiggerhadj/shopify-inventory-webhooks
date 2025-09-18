@@ -1,7 +1,7 @@
 // app/api/create-webhook/route.js
 // Read-only endpoint: earliest component date for native Shopify bundles
 // Uses variant/product metafield custom.restock_date
-// CORS enabled so Shopify theme can call from storefront domain.
+// CORS + 429 backoff + handle OR id support
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -9,56 +9,66 @@ export const maxDuration = 300;
 
 import { NextResponse } from 'next/server';
 
-/* ============================ Env ============================ */
 const ENV = {
-  SHOPIFY_STORE:        process.env.SHOPIFY_STORE,            // yourstore.myshopify.com
+  SHOPIFY_STORE:        process.env.SHOPIFY_STORE,            // e.g. yourstore.myshopify.com
   ADMIN_API_TOKEN:      process.env.SHOPIFY_ADMIN_API_KEY,    // Admin API token
   SHOPIFY_API_VERSION:  process.env.SHOPIFY_API_VERSION || '2025-01',
   PUBLIC_PROBE_TOKEN:   process.env.PUBLIC_PROBE_TOKEN || '',  // optional gate
-  PUBLIC_STORE_DOMAIN:  process.env.PUBLIC_STORE_DOMAIN || '', // e.g. yourstore.com or yourstore.myshopify.com
+  PUBLIC_STORE_DOMAIN:  process.env.PUBLIC_STORE_DOMAIN || '', // e.g. yourstore.myshopify.com or custom domain
 };
 
-/* ========================== CORS ============================= */
+/* ------------------------------- CORS ------------------------------- */
 function corsHeaders(originHeader) {
-  // Allow only your storefront origin if provided; else fallback to '*'
-  const allowOrigin =
-    ENV.PUBLIC_STORE_DOMAIN
-      ? `https://${ENV.PUBLIC_STORE_DOMAIN.replace(/^https?:\/\//,'')}`
-      : (originHeader || '*');
-
+  const allowOrigin = ENV.PUBLIC_STORE_DOMAIN
+    ? `https://${ENV.PUBLIC_STORE_DOMAIN.replace(/^https?:\/\//,'')}`
+    : (originHeader || '*');
   return {
     'Access-Control-Allow-Origin': allowOrigin,
     'Access-Control-Allow-Methods': 'GET,OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Max-Age': '86400',
+    // tiny CDN cache to soften bursts; adjust if you want
+    'Cache-Control': 'public, s-maxage=60, stale-while-revalidate=300',
   };
 }
 export async function OPTIONS(req) {
   return new NextResponse(null, { status: 204, headers: corsHeaders(req.headers.get('origin')) });
 }
 
-/* ===================== Shopify Admin GQL ===================== */
-async function fetchShopifyGQL(query, variables = {}) {
+/* ------------------------- Shopify Admin GQL ------------------------ */
+async function fetchShopifyGQLRetry(query, variables = {}, maxAttempts = 3) {
   if (!ENV.SHOPIFY_STORE || !ENV.ADMIN_API_TOKEN) {
     throw new Error('Missing SHOPIFY_STORE or SHOPIFY_ADMIN_API_KEY');
   }
   const url = `https://${ENV.SHOPIFY_STORE}/admin/api/${ENV.SHOPIFY_API_VERSION}/graphql.json`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'X-Shopify-Access-Token': String(ENV.ADMIN_API_TOKEN),
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok || json.errors) {
+  let attempt = 0;
+  while (true) {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'X-Shopify-Access-Token': String(ENV.ADMIN_API_TOKEN),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ query, variables }),
+    });
+    let json = {};
+    try { json = await res.json(); } catch {}
+    const ok = res.ok && !json.errors;
+    if (ok) return json.data;
+
+    if (res.status === 429 && attempt < maxAttempts - 1) {
+      const ra = Number(res.headers.get('retry-after') || 0);
+      const wait = ra ? ra * 1000 : Math.floor(1200 * Math.pow(1.8, attempt) + Math.random() * 200);
+      await new Promise(r => setTimeout(r, wait));
+      attempt++;
+      continue;
+    }
+
     throw new Error(`Shopify GraphQL: ${res.status} ${res.statusText} :: ${JSON.stringify(json.errors || json)}`);
   }
-  return json.data;
 }
 
-/* ========================= Helpers =========================== */
+/* ----------------------------- Helpers ------------------------------ */
 function worstStatus(a, b) { const RANK = { ok:0, understocked:1, 'out-of-stock':2 }; return (RANK[a] >= RANK[b]) ? a : b; }
 function pickDateFromVariantNode(pv) {
   const candidates = [ pv?.mf_restock?.value, pv?.product?.pmf_restock?.value ].filter(Boolean);
@@ -73,31 +83,26 @@ function pickDateFromVariantNode(pv) {
   return pool[0].iso;
 }
 
-/* ============ Bundle summarizer (native components) =========== */
-async function getBundleSummaryByProductId(productId) {
-  const query = `
-    query ProductBundles($id: ID!, $vv: Int!, $cp: Int!) {
-      product(id: $id) {
-        id
-        handle
-        variants(first: $vv) {
-          edges {
-            node {
-              id
-              productVariantComponents(first: $cp) {
-                nodes {
-                  quantity
-                  productVariant {
-                    id
-                    availableForSale
-                    inventoryPolicy
-                    sellableOnlineQuantity
-                    mf_restock: metafield(namespace:"custom", key:"restock_date") { value }
-                    product {
-                      handle
-                      pmf_restock: metafield(namespace:"custom", key:"restock_date") { value }
-                    }
-                  }
+/* --------- GraphQL queries: by HANDLE (1 call) or by ID (1 call) ---- */
+const Q_BY_HANDLE = `
+  query ProductBundlesByHandle($handle:String!, $vv:Int!, $cp:Int!) {
+    productByHandle(handle:$handle) {
+      id
+      handle
+      variants(first:$vv) {
+        edges {
+          node {
+            id
+            productVariantComponents(first:$cp) {
+              nodes {
+                quantity
+                productVariant {
+                  id
+                  availableForSale
+                  inventoryPolicy
+                  sellableOnlineQuantity
+                  mf_restock: metafield(namespace:"custom", key:"restock_date") { value }
+                  product { handle pmf_restock: metafield(namespace:"custom", key:"restock_date") { value } }
                 }
               }
             }
@@ -105,15 +110,53 @@ async function getBundleSummaryByProductId(productId) {
         }
       }
     }
-  `;
-  const gid = `gid://shopify/Product/${productId}`;
-  const data = await fetchShopifyGQL(query, { id: gid, vv: 100, cp: 100 });
+  }
+`;
 
-  const edges = data?.product?.variants?.edges || [];
+const Q_BY_ID = `
+  query ProductBundlesById($id:ID!, $vv:Int!, $cp:Int!) {
+    product(id:$id) {
+      id
+      handle
+      variants(first:$vv) {
+        edges {
+          node {
+            id
+            productVariantComponents(first:$cp) {
+              nodes {
+                quantity
+                productVariant {
+                  id
+                  availableForSale
+                  inventoryPolicy
+                  sellableOnlineQuantity
+                  mf_restock: metafield(namespace:"custom", key:"restock_date") { value }
+                  product { handle pmf_restock: metafield(namespace:"custom", key:"restock_date") { value } }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
+/* -------------------- Summarizer (native bundles) ------------------- */
+async function getBundleSummaryByHandle(handle) {
+  const data = await fetchShopifyGQLRetry(Q_BY_HANDLE, { handle, vv:100, cp:100 });
+  return summarize(data?.productByHandle);
+}
+async function getBundleSummaryById(productId) {
+  const gid = `gid://shopify/Product/${productId}`;
+  const data = await fetchShopifyGQLRetry(Q_BY_ID, { id: gid, vv:100, cp:100 });
+  return summarize(data?.product);
+}
+function summarize(prod) {
+  const edges = prod?.variants?.edges || [];
   let hasComponents = false;
   let finalStatus = 'ok';
   let totalBuildable = 0;
-
   let earliestISO_constraining = null, earliestSource_constraining = null;
   let earliestISO_any = null,          earliestSource_any = null;
 
@@ -160,11 +203,10 @@ async function getBundleSummaryByProductId(productId) {
 
   const chosenISO = earliestISO_constraining || earliestISO_any;
   const chosenSource = earliestSource_constraining || earliestSource_any;
-
   return { ok:true, hasComponents, finalStatus, totalBuildable, earliestISO: chosenISO, earliestSource: chosenSource };
 }
 
-/* ============================ GET ============================ */
+/* -------------------------------- GET ------------------------------- */
 export async function GET(req) {
   const headers = corsHeaders(req.headers.get('origin'));
   try {
@@ -176,22 +218,7 @@ export async function GET(req) {
     if (ENV.PUBLIC_PROBE_TOKEN && token !== ENV.PUBLIC_PROBE_TOKEN) {
       return NextResponse.json({ error:'unauthorized' }, { status:401, headers });
     }
-    let productId = null;
-    if (idParam) {
-      const n = Number(idParam);
-      if (!Number.isFinite(n) || n <= 0) {
-        return NextResponse.json({ error:'bad id', usage:'/api/create-webhook?id=12345' }, { status:400, headers });
-      }
-      productId = n;
-    } else if (handle) {
-      const lookup = await fetchShopifyGQL(
-        `query($h:String!){ productByHandle(handle:$h){ id handle } }`,
-        { h: handle }
-      );
-      const gid = lookup?.productByHandle?.id;
-      if (!gid) return NextResponse.json({ error:'not_found' }, { status:404, headers });
-      productId = Number(String(gid).split('/').pop());
-    } else {
+    if (!handle && !idParam) {
       return NextResponse.json({
         error:'missing handle or id',
         usage:[
@@ -201,12 +228,20 @@ export async function GET(req) {
       }, { status:400, headers });
     }
 
-    const summary = await getBundleSummaryByProductId(productId);
+    let summary;
+    if (handle) summary = await getBundleSummaryByHandle(handle);
+    else {
+      const idNum = Number(idParam);
+      if (!Number.isFinite(idNum) || idNum <= 0) {
+        return NextResponse.json({ error:'bad id', usage:'/api/create-webhook?id=12345' }, { status:400, headers });
+      }
+      summary = await getBundleSummaryById(idNum);
+    }
+
     const earliestPretty = summary.earliestISO ? new Date(summary.earliestISO).toISOString().slice(0,10) : null;
 
     return NextResponse.json({
       handle: handle || null,
-      productId,
       hasComponents: !!summary.hasComponents,
       finalStatus: summary.finalStatus,
       earliestISO: summary.earliestISO,
@@ -218,5 +253,5 @@ export async function GET(req) {
   }
 }
 
-// If this file previously handled POST for webhook creation, keep your existing:
+// Keep your POST here if this route also creates webhooks:
 // export async function POST(req) { ... }
