@@ -356,6 +356,76 @@ async function getBundleStatusFromGraphQL(productId){
   return { ok:true, hasComponents, variantResults, totalBuildable, finalStatus, earliestISO, earliestSource };
 }
 
+/* ================== Bundle components (per-component ETA) ==== */
+// Reads each component on a bundle variant and pulls the ETA from the
+// component VARIANT metafield custom.restock_date, falling back to PRODUCT.
+async function getBundleComponents(pid:number){
+  const query = `
+    query($id: ID!, $vv:Int!, $cp:Int!) {
+      product(id:$id){
+        id handle title
+        variants(first:$vv){
+          edges{
+            node{
+              id title
+              productVariantComponents(first:$cp){
+                nodes{
+                  quantity
+                  productVariant{
+                    id title sku
+                    availableForSale
+                    inventoryPolicy
+                    sellableOnlineQuantity
+                    metafield(namespace:"custom", key:"restock_date"){ value }
+                    product{
+                      handle title
+                      metafield(namespace:"custom", key:"restock_date"){ value }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }`;
+  const gid = `gid://shopify/Product/${pid}`;
+  const data = await fetchShopifyGQL(query, { id: gid, vv: 100, cp: 100 });
+
+  const out:any[] = [];
+  for (const e of (data?.product?.variants?.edges || [])) {
+    for (const c of (e?.node?.productVariantComponents?.nodes || [])) {
+      const pv = c?.productVariant; if (!pv) continue;
+      const need = Math.max(1, Number(c?.quantity ?? 1));
+      const have = Math.max(0, Number(pv.sellableOnlineQuantity ?? 0));
+      const policy = String(pv.inventoryPolicy || '').toUpperCase();
+      const isOOS = (pv.availableForSale === false) || (have <= 0 && (policy === 'DENY' || policy === 'CONTINUE'));
+
+      // VARIANT metafield first; then PRODUCT metafield fallback
+      const raw = pv.metafield?.value || pv.product?.metafield?.value || null;
+      const iso = raw ? (raw.length === 10 ? `${raw}T00:00:00Z` : raw) : null;
+
+      out.push({
+        component: {
+          variant_gid: pv.id,
+          variant_title: pv.title || '',
+          sku: pv.sku || '',
+          product_handle: pv.product?.handle || '',
+          product_title: pv.product?.title || '',
+        },
+        required_qty: need,
+        available_qty: have,
+        inventory_policy: policy,
+        status: isOOS ? (have<=0 ? 'out-of-stock' : 'understocked') : 'ok',
+        restock_iso: iso,
+        restock_pretty: iso ? new Date(iso).toISOString().slice(0,10) : null,
+      });
+    }
+  }
+  return out;
+}
+
+
 /* ================== Bundle ETA writer ======================== */
 /** Writes or clears product metafields:
  *  - custom.bundle_next_ship_date   (type: date)
@@ -589,6 +659,28 @@ export async function GET(req){
         source: summary?.earliestSource || null
       };
       return NextResponse.json(payload);
+    }
+    /* ---- Per-component list (public, read-only) ---- */
+    if (q('action') === 'components') {
+      const token = url.searchParams.get('token') || '';
+      if (ENV.PUBLIC_PROBE_TOKEN && token !== ENV.PUBLIC_PROBE_TOKEN) {
+        return NextResponse.json({ error: 'unauthorized' }, { status: 401 });
+      }
+      const handle = url.searchParams.get('handle');
+      if (!handle) return NextResponse.json({ error:'missing handle' }, { status:400 });
+
+      const lookup = await fetchShopifyGQL(
+        `query($h:String!){ productByHandle(handle:$h){ id handle } }`,
+        { h: handle }
+      );
+      const gid = lookup?.productByHandle?.id;
+      if (!gid) return NextResponse.json({ error: 'not_found' }, { status: 404 });
+      const pid = Number(String(gid).split('/').pop());
+
+      const components = await getBundleComponents(pid);
+      // Only surface pain points on the PDP
+      const filtered = components.filter(c => c.status !== 'ok');
+      return NextResponse.json({ handle, count: filtered.length, components: filtered });
     }
 
     /* ---- Self test ---- */
