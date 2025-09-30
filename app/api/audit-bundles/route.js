@@ -6,6 +6,21 @@ import { NextResponse, after } from 'next/server';
 import { Redis } from '@upstash/redis';
 import { randomUUID } from 'crypto';
 
+/* === CORS helper for public endpoints === */
+function cors(json, status = 200) {
+  return new NextResponse(JSON.stringify(json), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*', // or your storefront domain
+      'Access-Control-Allow-Methods': 'GET,OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Cache-Control': 'no-store',
+      'Vary': 'Origin',
+    },
+  });
+}
+
 /* ============================ Env ============================ */
 const ENV = {
   SHOPIFY_STORE:       process.env.SHOPIFY_STORE,
@@ -658,7 +673,7 @@ export async function GET(req){
         earliestPretty: summary?.earliestISO ? new Date(summary.earliestISO).toISOString().slice(0,10) : null,
         source: summary?.earliestSource || null
       };
-      return NextResponse.json(payload);
+return cors(payload);
     }
     /* ---- Per-component list (public, read-only) ---- */
     if (q('action') === 'components') {
@@ -680,7 +695,7 @@ export async function GET(req){
       const components = await getBundleComponents(pid);
       // Only surface pain points on the PDP
       const filtered = components.filter(c => c.status !== 'ok');
-      return NextResponse.json({ handle, count: filtered.length, components: filtered });
+return cors({ handle, count: filtered.length, components: filtered });
     }
 
     /* ---- Self test ---- */
