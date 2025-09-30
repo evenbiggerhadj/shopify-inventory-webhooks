@@ -359,7 +359,7 @@ async function getBundleStatusFromGraphQL(productId){
 /* ================== Bundle components (per-component ETA) ==== */
 // Reads each component on a bundle variant and pulls the ETA from the
 // component VARIANT metafield custom.restock_date, falling back to PRODUCT.
-async function getBundleComponents(pid:number){
+async function getBundleComponents(pid){
   const query = `
     query($id: ID!, $vv:Int!, $cp:Int!) {
       product(id:$id){
@@ -392,7 +392,7 @@ async function getBundleComponents(pid:number){
   const gid = `gid://shopify/Product/${pid}`;
   const data = await fetchShopifyGQL(query, { id: gid, vv: 100, cp: 100 });
 
-  const out:any[] = [];
+  const out = [];
   for (const e of (data?.product?.variants?.edges || [])) {
     for (const c of (e?.node?.productVariantComponents?.nodes || [])) {
       const pv = c?.productVariant; if (!pv) continue;
