@@ -1,4 +1,4 @@
-// app/api/back-in-stock/route.js — WAITLIST signup (Klaviyo + Redis (best-effort) + product props + event)
+// app/api/back-in-stock/route.js
 import { NextResponse } from "next/server";
 import { Redis } from "@upstash/redis";
 
@@ -7,7 +7,6 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
 /* ----------------- Redis (best-effort) ----------------- */
-// Support multiple env naming schemes so deployments don’t randomly break
 const REDIS_URL =
   process.env.KV_REST_API_URL ||
   process.env.KV_URL ||
@@ -15,10 +14,9 @@ const REDIS_URL =
   "";
 
 const REDIS_TOKEN =
-  // IMPORTANT: write token must be present or redis.set() will throw
   process.env.KV_REST_API_TOKEN ||
   process.env.KV_TOKEN ||
-  process.env.KV_REST_API_READ_ONLY_TOKEN || // last resort (read-only) — writes will fail, but we handle it now
+  process.env.KV_REST_API_READ_ONLY_TOKEN || // last resort (writes may fail)
   "";
 
 const redis =
@@ -32,7 +30,7 @@ const redis =
 
 /* ----------------- Env ----------------- */
 const KLAVIYO_API_KEY = process.env.KLAVIYO_API_KEY; // required
-const WAITLIST_LIST_ID = process.env.KLAVIYO_LIST_ID; // required (BIS form list)
+const WAITLIST_LIST_ID = process.env.KLAVIYO_LIST_ID; // required
 const PUBLIC_STORE_DOMAIN =
   process.env.PUBLIC_STORE_DOMAIN || "armadillotough.com";
 
@@ -57,10 +55,6 @@ function cors(resp, origin = "*") {
   return resp;
 }
 
-/**
- * Accept JSON, x-www-form-urlencoded, and multipart/form-data.
- * This is the common reason Shopify theme forms “suddenly stop working”.
- */
 async function readBody(request) {
   const ct = (request.headers.get("content-type") || "").toLowerCase();
 
@@ -90,14 +84,9 @@ function toE164(raw) {
   if (!raw) return null;
   let v = String(raw).trim().replace(/[^\d+]/g, "");
   if (v.startsWith("+")) return /^\+\d{8,15}$/.test(v) ? v : null;
-
-  // Nigeria helpers (keep if you need them)
-  if (/^0\d{10}$/.test(v)) return "+234" + v.slice(1);
-  if (/^(70|80|81|90|91)\d{8}$/.test(v)) return "+234" + v;
-
-  // US 10 digits (optional fallback)
-  if (/^\d{10}$/.test(v)) return "+1" + v;
-
+  if (/^0\d{10}$/.test(v)) return "+234" + v.slice(1); // NG helper (optional)
+  if (/^(70|80|81|90|91)\d{8}$/.test(v)) return "+234" + v; // NG helper (optional)
+  if (/^\d{10}$/.test(v)) return "+1" + v; // US fallback
   return null;
 }
 
@@ -111,12 +100,10 @@ async function safeRedisPing() {
   }
 }
 
-/* ----------------- CORS preflight ----------------- */
 export async function OPTIONS(request) {
   return cors(new NextResponse(null, { status: 204 }), pickOrigin(request));
 }
 
-/* ----------------- POST — create/merge waitlist entry ----------------- */
 export async function POST(request) {
   const origin = pickOrigin(request);
 
@@ -210,7 +197,7 @@ export async function POST(request) {
       source: source || "shopify_form",
     };
 
-    // Best-effort Redis: DO NOT LET REDIS FAIL THE WHOLE REQUEST
+    // Best-effort Redis
     let redis_ok = false;
     let subscriber_count = null;
 
@@ -253,82 +240,47 @@ export async function POST(request) {
         await Promise.all(writes);
         subscriber_count = merged.length;
       } catch (e) {
-        // This is the fix: Redis can fail (archived DB, wrong token, read-only token) but request continues
         redis_ok = false;
         console.error("[/api/back-in-stock] redis write failed:", e?.message || e);
       }
-    } else {
-      console.error("[/api/back-in-stock] redis ping failed:", ping.reason);
     }
 
     // 1) Klaviyo list subscribe (authoritative)
-    let klaviyo_success = false,
-      klaviyo_status = 0,
-      klaviyo_body = "";
-
-    try {
-      const out = await subscribeProfilesToList({
-        listId: WAITLIST_LIST_ID,
-        email,
-        phoneE164,
-        sms: !!smsFlag,
-      });
-      klaviyo_success = out.ok;
-      klaviyo_status = out.status;
-      klaviyo_body = out.body;
-    } catch (e) {
-      klaviyo_success = false;
-      klaviyo_status = 0;
-      klaviyo_body = e?.message || String(e);
-      console.error("[/api/back-in-stock] klaviyo subscribe failed:", klaviyo_body);
-    }
+    const out = await subscribeProfilesToList({
+      listId: WAITLIST_LIST_ID,
+      email,
+      phoneE164,
+      sms: !!smsFlag,
+    });
 
     // 2) Stamp profile props (best-effort)
-    let profile_update_success = false,
-      profile_update_status = 0;
-
-    try {
-      const out = await updateProfileProperties({
-        email,
-        properties: {
-          last_waitlist_product_name: productTitle,
-          last_waitlist_product_url: productUrl,
-          last_waitlist_related_section_url: related_section_url || "",
-          last_waitlist_product_handle: productHandle,
-          last_waitlist_product_id: productId,
-          last_waitlist_source: source || "shopify_form",
-          last_waitlist_at: new Date().toISOString(),
-        },
-      });
-      profile_update_success = out.ok;
-      profile_update_status = out.status;
-    } catch (e) {
-      console.error("[/api/back-in-stock] profile update failed:", e?.message || e);
-    }
+    updateProfileProperties({
+      email,
+      properties: {
+        last_waitlist_product_name: productTitle,
+        last_waitlist_product_url: productUrl,
+        last_waitlist_related_section_url: related_section_url || "",
+        last_waitlist_product_handle: productHandle,
+        last_waitlist_product_id: productId,
+        last_waitlist_source: source || "shopify_form",
+        last_waitlist_at: new Date().toISOString(),
+      },
+    }).catch(() => {});
 
     // 3) Track event (best-effort)
-    let event_success = false,
-      event_status = 0;
-
-    try {
-      const out = await trackKlaviyoEvent({
-        metricName: "Back In Stock Request",
-        email,
-        phoneE164,
-        properties: {
-          product_id: productId,
-          product_handle: productHandle,
-          product_title: productTitle,
-          product_url: productUrl,
-          related_section_url: related_section_url || "",
-          sms_consent: !!smsFlag,
-        },
-      });
-      event_success = out.ok;
-      event_status = out.status;
-    } catch (e) {
-      console.error("[/api/back-in-stock] event failed:", e?.message || e);
-    }
+    trackKlaviyoEvent({
+      metricName: "Back In Stock Request",
+      email,
+      phoneE164,
+      properties: {
+        product_id: productId,
+        product_handle: productHandle,
+        product_title: productTitle,
+        product_url: productUrl,
+        related_section_url: related_section_url || "",
+        sms_consent: !!smsFlag,
+      },
+    }).catch(() => {});
 
     return cors(
       NextResponse.json({
@@ -338,12 +290,8 @@ export async function POST(request) {
         product_handle: productHandle,
         subscriber_count,
         redis_ok,
-        klaviyo_success,
-        klaviyo_status,
-        profile_update_success,
-        profile_update_status,
-        event_success,
-        event_status,
+        klaviyo_success: out.ok,
+        klaviyo_status: out.status,
       }),
       origin
     );
@@ -359,73 +307,8 @@ export async function POST(request) {
   }
 }
 
-/* ----------------- GET — check waitlist (optional) ----------------- */
-export async function GET(request) {
-  const origin = pickOrigin(request);
-
-  try {
-    const { searchParams } = new URL(request.url);
-    const email = (searchParams.get("email") || "").trim().toLowerCase();
-    const product_id_raw = searchParams.get("product_id");
-    const product_handle = searchParams.get("product_handle");
-
-    if (!email || (!product_id_raw && !product_handle)) {
-      return cors(
-        NextResponse.json(
-          { success: false, error: "Missing email and product_id or product_handle" },
-          { status: 400 }
-        ),
-        origin
-      );
-    }
-
-    const ping = await safeRedisPing();
-    if (!ping.ok) {
-      return cors(
-        NextResponse.json({
-          success: true,
-          subscribed: false,
-          note: "redis unavailable; GET is best-effort",
-        }),
-        origin
-      );
-    }
-
-    const key = product_id_raw
-      ? `subscribers:${String(product_id_raw)}`
-      : `subscribers_handle:${String(product_handle)}`;
-
-    const v = await redis.get(key);
-    const arr = Array.isArray(v)
-      ? v
-      : typeof v === "string"
-      ? (() => {
-          try {
-            return JSON.parse(v);
-          } catch {
-            return [];
-          }
-        })()
-      : [];
-
-    const subscribed = arr.some((x) => (x?.email || "").toLowerCase() === email);
-
-    return cors(NextResponse.json({ success: true, subscribed }), origin);
-  } catch (error) {
-    console.error("[/api/back-in-stock] GET fatal:", error);
-    return cors(
-      NextResponse.json({ success: false, error: error?.message || "Error" }, { status: 500 }),
-      origin
-    );
-  }
-}
-
 /* ----------------- Klaviyo helpers ----------------- */
 async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
-  if (!KLAVIYO_API_KEY) throw new Error("KLAVIYO_API_KEY missing");
-  if (!listId) throw new Error("List ID missing");
-  if (!email) throw new Error("Email missing");
-
   const subscriptions = { email: { marketing: { consent: "SUBSCRIBED" } } };
   if (sms && phoneE164) subscriptions.sms = { marketing: { consent: "SUBSCRIBED" } };
 
@@ -457,7 +340,7 @@ async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
     {
       method: "POST",
       headers: {
-        Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        Authorization: `Klaviyo-API-Key ${process.env.KLAVIYO_API_KEY}`,
         accept: "application/json",
         "content-type": "application/json",
         revision: "2023-10-15",
@@ -472,16 +355,13 @@ async function subscribeProfilesToList({ listId, email, phoneE164, sms }) {
 }
 
 async function updateProfileProperties({ email, properties }) {
-  if (!KLAVIYO_API_KEY) throw new Error("KLAVIYO_API_KEY missing");
-  if (!email) throw new Error("Email missing");
-
   const filter = `equals(email,"${String(email).replace(/"/g, '\\"')}")`;
   const listRes = await fetch(
     `https://a.klaviyo.com/api/profiles/?filter=${encodeURIComponent(filter)}&page[size]=1`,
     {
       method: "GET",
       headers: {
-        Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+        Authorization: `Klaviyo-API-Key ${process.env.KLAVIYO_API_KEY}`,
         accept: "application/json",
         revision: "2023-10-15",
       },
@@ -506,7 +386,7 @@ async function updateProfileProperties({ email, properties }) {
   const patchRes = await fetch(`https://a.klaviyo.com/api/profiles/${profileId}/`, {
     method: "PATCH",
     headers: {
-      Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+      Authorization: `Klaviyo-API-Key ${process.env.KLAVIYO_API_KEY}`,
       accept: "application/json",
       "content-type": "application/json",
       revision: "2023-10-15",
@@ -520,9 +400,6 @@ async function updateProfileProperties({ email, properties }) {
 }
 
 async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }) {
-  if (!KLAVIYO_API_KEY) throw new Error("KLAVIYO_API_KEY missing");
-  if (!metricName) throw new Error("metricName missing");
-
   const body = {
     data: {
       type: "event",
@@ -546,7 +423,7 @@ async function trackKlaviyoEvent({ metricName, email, phoneE164, properties }) {
   const res = await fetch("https://a.klaviyo.com/api/events/", {
     method: "POST",
     headers: {
-      Authorization: `Klaviyo-API-Key ${KLAVIYO_API_KEY}`,
+      Authorization: `Klaviyo-API-Key ${process.env.KLAVIYO_API_KEY}`,
       accept: "application/json",
       "content-type": "application/json",
       revision: "2023-10-15",
